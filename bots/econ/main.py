@@ -29,6 +29,7 @@ S_THREAT = 2
 S_ECORE = 3
 S_RAID = 4
 S_CLAIM0 = 5
+S_PHASE = 15
 N_CLAIM = 10
 
 # env codes in memory
@@ -45,6 +46,7 @@ ENV_CODE = {
 B_NONE, B_OWN_CONV, B_OWN_OTHER, B_ENEMY_CONV, B_ENEMY_OTHER, B_CORE, B_OWN_HARV = 0, 1, 2, 3, 4, 5, 6
 
 WALKABLE_TYPES = (EntityType.CONVEYOR, EntityType.SPLITTER)
+DANGER_TYPES = (EntityType.SPIKE, EntityType.GUNNER, EntityType.SENTINEL)
 TURRETS = (EntityType.GUNNER, EntityType.SENTINEL, EntityType.LAUNCHER, EntityType.SPIKE)
 
 
@@ -77,6 +79,7 @@ class Player:
         self.fail = {}
         self.orphan_tries = {}
         self.raid_target = None
+        self.bad_sym = set()
 
     # ------------------------------------------------------------------
     def _setup(self, ct: Controller):
@@ -88,6 +91,8 @@ class Player:
         self.env = bytearray(n)
         self.bld = bytearray(n)
         self.bdir = {}  # idx -> Direction for own conveyors
+        self.danger = [0] * n  # tiles hit by known enemy turrets
+        self.turrets = {}  # idx -> (entity id, danger tiles)
         self.seen_round = [-1] * n
         self.core = None
         self.ecore = None
@@ -126,11 +131,29 @@ class Player:
             if env[i] == WALL or env[i] == VOID:
                 continue
             bid = ct.get_tile_building_id(p)
+            if i in self.turrets and self.turrets[i][0] != bid:
+                for t in self.turrets.pop(i)[1]:
+                    self.danger[t] -= 1
             if bid is None:
                 bld[i] = B_NONE
                 continue
             et = ct.get_entity_type(bid)
             own = ct.get_team(bid) == me
+            if not own and i not in self.turrets and et in DANGER_TYPES:
+                tiles = []
+                if et == EntityType.SPIKE:
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            x, y = p.x + dx, p.y + dy
+                            if (dx or dy) and 0 <= x < W and 0 <= y < self.H:
+                                tiles.append(y * W + x)
+                else:
+                    for q in ct.get_attackable_tiles_from(p, ct.get_direction(bid), et):
+                        if 0 <= q.x < W and 0 <= q.y < self.H:
+                            tiles.append(q.y * W + q.x)
+                for t in tiles:
+                    self.danger[t] += 1
+                self.turrets[i] = (bid, tiles)
             if et == EntityType.CORE:
                 if own:
                     bld[i] = B_CORE
@@ -196,6 +219,11 @@ class Player:
         if v > 0 and ct.get_global_ammo() < 400 and ct.can_convert_ammo(v):
             ct.convert_ammo(v)
 
+        phase = ct.read_store(S_PHASE) & 1
+        if r >= 150 and ct.get_global_resources() >= 500:
+            phase = 1
+        ct.write_store(S_PHASE, phase | (2 if ct.get_hp() < ct.get_max_hp() else 0))
+
         if ct.get_action_cooldown() != 0:
             return
         if ct.get_unit_count() >= 48:
@@ -206,6 +234,8 @@ class Player:
         harv = ct.read_store(S_HARV)
         cap = min(14, 4 + area // 100)
         want = min(cap, 3 + harv // 2)
+        if phase:
+            want = min(30, want + ti // 400)
         if threat is not None and self.spawned < want + 2:
             want = self.spawned + 1
         if self.spawned >= want:
@@ -266,6 +296,8 @@ class Player:
         threat = unpack(ct.read_store(S_THREAT))
         if threat is not None and self.defend(ct, pos, threat):
             return
+        if ct.read_store(S_PHASE) & 2 and self.heal_core(ct, pos):
+            return
 
         if self.jobs:
             self.do_jobs(ct, pos)
@@ -296,10 +328,146 @@ class Player:
         if self.target is not None:
             self.go_harvest(ct, pos)
             return
-        # nothing to harvest: raid or explore
+        # nothing to harvest: siege, raid or explore
+        if ct.read_store(S_PHASE) & 1 and self.siege(ct, pos):
+            return
         if ct.get_current_round() > 120 and self.raid(ct, pos):
             return
         self.do_explore(ct, pos)
+
+    # ------------------------------------------------------------------
+    # enemy core location
+    def enemy_core_guess(self):
+        if self.ecore is not None:
+            return self.ecore
+        W, H = self.W, self.H
+        cx, cy = self.core.x, self.core.y
+        cands = []
+        for sym, (gx, gy) in enumerate(((W - 2 - cx, H - 2 - cy), (W - 2 - cx, cy), (cx, H - 2 - cy))):
+            if (gx, gy) == (cx, cy):
+                continue
+            if sym in self.bad_sym:
+                continue
+            cands.append((sym, gx, gy))
+        env = self.env
+        for sym, gx, gy in cands:
+            # rule out by having seen the spot without a core
+            if env[gy * W + gx] != U and self.ecore is None:
+                self.bad_sym.add(sym)
+                continue
+            # rule out by terrain mismatch (cheap sample)
+            bad = False
+            for i in range(0, W * H, 7):
+                e = env[i]
+                if e == U:
+                    continue
+                x, y = i % W, i // W
+                if sym == 0:
+                    mx, my = W - 1 - x, H - 1 - y
+                elif sym == 1:
+                    mx, my = W - 1 - x, y
+                else:
+                    mx, my = x, H - 1 - y
+                m = env[my * W + mx]
+                if m != U and m != e:
+                    bad = True
+                    break
+            if bad:
+                self.bad_sym.add(sym)
+                continue
+            return Position(gx, gy)
+        return None
+
+    def siege(self, ct, pos):
+        ec = self.enemy_core_guess()
+        if ec is None:
+            return False
+        W = self.W
+        foot = [(ec.x + dx, ec.y + dy) for dx in (0, 1) for dy in (0, 1)]
+        d2 = min((pos.x - fx) ** 2 + (pos.y - fy) ** 2 for fx, fy in foot)
+        if d2 > 20 or self.ecore is None:
+            res = self.bfs_first_step(
+                pos, lambda i: min((i % W - fx) ** 2 + (i // W - fy) ** 2 for fx, fy in foot) <= 13
+            )
+            if res is None:
+                return False
+            self.step(ct, pos, res[1])
+            return True
+        ec = self.ecore
+        foot = [(ec.x + dx, ec.y + dy) for dx in (0, 1) for dy in (0, 1)]
+        me = self.me
+        ti = ct.get_global_resources()
+        acd = ct.get_action_cooldown() == 0
+        # 1. heal our damaged siege turrets next to us
+        if acd:
+            for d in CARDINALS:
+                q = pos.add(d)
+                if not self.inb(q.x, q.y):
+                    continue
+                bid = ct.get_tile_building_id(q)
+                if (
+                    bid is not None
+                    and ct.get_team(bid) == me
+                    and ct.get_hp(bid) < ct.get_max_hp(bid)
+                    and ct.can_heal(q)
+                ):
+                    ct.heal(q)
+                    return True
+        # 2. count our gunners around the core, find free ring tiles
+        ring = []
+        own_guns = 0
+        for x in range(ec.x - 1, ec.x + 3):
+            for y in range(ec.y - 1, ec.y + 3):
+                if (x, y) in foot or not self.inb(x, y):
+                    continue
+                i = y * W + x
+                b = self.bld[i]
+                if b == B_OWN_OTHER:
+                    own_guns += 1
+                elif b == B_NONE and self.env[i] in (EMPTY, TI, VO):
+                    ring.append((x, y))
+        ammo = ct.get_global_ammo()
+        want_guns = own_guns < 3 or (ammo >= 40 * own_guns)
+        if ring and want_guns and ti >= ct.get_gunner_cost() + 10:
+            ring.sort(key=lambda t: abs(t[0] - pos.x) + abs(t[1] - pos.y))
+            for gx, gy in ring:
+                if abs(gx - pos.x) + abs(gy - pos.y) == 1:
+                    if not acd:
+                        return True
+                    gp = Position(gx, gy)
+                    best = min(foot, key=lambda f: (f[0] - gx) ** 2 + (f[1] - gy) ** 2)
+                    face = gp.direction_to(Position(best[0], best[1]))
+                    if ct.can_build_gunner(gp, face):
+                        ct.build_gunner(gp, face)
+                        self.bld[gy * W + gx] = B_OWN_OTHER
+                        return True
+            gx, gy = ring[0]
+            if self.move_adjacent_to(ct, pos, gx, gy):
+                return True
+        # 3. attack the core directly if adjacent and rich
+        if acd and ti >= 100:
+            for d in CARDINALS:
+                q = pos.add(d)
+                if (q.x, q.y) in foot and ct.can_fire(q):
+                    ct.fire(q)
+                    return True
+            # attack any adjacent enemy building
+            if self.attack_adjacent(ct, pos):
+                return True
+        # walk next to the core footprint
+        adj = set()
+        for fx, fy in foot:
+            for dx, dy in CARD_DELTA:
+                t = (fx + dx, fy + dy)
+                if t not in foot and self.inb(*t):
+                    adj.add(t[1] * W + t[0])
+        if pos.y * W + pos.x in adj:
+            return True
+        res = self.bfs_first_step(pos, lambda i: i in adj)
+        if res is not None:
+            self.step(ct, pos, res[1])
+            return True
+        return False
 
     def claim(self, ct):
         slot = S_CLAIM0 + ct.get_id() % N_CLAIM
@@ -322,8 +490,15 @@ class Player:
 
     # BFS over walkable tiles from pos; returns dist dict-ish via generator
     def bfs_first_step(self, pos, goal_fn, max_nodes=1200, unknown_ok=True):
-        """BFS from pos; goal_fn(i) -> bool on tile indices.  Returns (goal_i, first_dir) or None."""
+        """BFS from pos avoiding enemy turret zones if possible."""
+        r = self._bfs(pos, goal_fn, max_nodes, unknown_ok, True)
+        if r is None:
+            r = self._bfs(pos, goal_fn, max_nodes, unknown_ok, False)
+        return r
+
+    def _bfs(self, pos, goal_fn, max_nodes, unknown_ok, avoid):
         W, H = self.W, self.H
+        danger = self.danger
         start = pos.y * W + pos.x
         if goal_fn(start):
             return start, Direction.CENTRE
@@ -350,6 +525,8 @@ class Player:
                         continue
                 elif not self.walkable(j):
                     continue
+                if avoid and danger[j] and not goal_fn(j):
+                    continue
                 prev[j] = i
                 if goal_fn(j):
                     c = j
@@ -366,6 +543,7 @@ class Player:
     def step(self, ct, pos, d):
         if d == Direction.CENTRE or ct.get_move_cooldown() != 0:
             return False
+
         if ct.can_move(d):
             ct.move(d)
             return True
@@ -701,6 +879,34 @@ class Player:
                     ct.fire(p)
                     return True
         return False
+
+    def heal_core(self, ct, pos):
+        core = self.core
+        if pos.distance_squared(core) > 50 or ct.get_global_resources() < 5:
+            return False
+        W = self.W
+        adj = set()
+        for dx in (0, 1):
+            for dy in (0, 1):
+                fx, fy = core.x + dx, core.y + dy
+                for ddx, ddy in CARD_DELTA:
+                    x, y = fx + ddx, fy + ddy
+                    if self.inb(x, y) and self.bld[y * W + x] != B_CORE:
+                        adj.add(y * W + x)
+        if pos.y * W + pos.x in adj:
+            if ct.get_action_cooldown() != 0:
+                return True
+            for d in CARDINALS:
+                q = pos.add(d)
+                if self.inb(q.x, q.y) and self.bld[q.y * W + q.x] == B_CORE and ct.can_heal(q):
+                    ct.heal(q)
+                    return True
+            return False
+        res = self.bfs_first_step(pos, lambda i: i in adj)
+        if res is None:
+            return False
+        self.step(ct, pos, res[1])
+        return True
 
     def defend(self, ct, pos, threat):
         core = self.core
