@@ -45,6 +45,7 @@ ENV_CODE = {
 # building codes in memory (0 = none / unknown)
 B_NONE, B_OWN_CONV, B_OWN_OTHER, B_ENEMY_CONV, B_ENEMY_OTHER, B_CORE, B_OWN_HARV = 0, 1, 2, 3, 4, 5, 6
 
+MAX_TRUNK = 4
 WALKABLE_TYPES = (EntityType.CONVEYOR, EntityType.SPLITTER)
 DANGER_TYPES = (EntityType.SPIKE, EntityType.GUNNER, EntityType.SENTINEL)
 TURRETS = (EntityType.GUNNER, EntityType.SENTINEL, EntityType.LAUNCHER, EntityType.SPIKE)
@@ -627,43 +628,60 @@ class Player:
             self.fail[self.target] = self.fail.get(self.target, 0) + 1
 
     def good_conveyors(self):
-        """Set of own conveyor tiles whose chain reaches our core."""
+        """Map own conveyor tile -> trunk end tile, for chains that reach our core."""
         W, H = self.W, self.H
         bld = self.bld
-        state = {}  # i -> True/False
+        state = {}  # i -> end tile index or -1
         for i0 in range(W * H):
             if bld[i0] != B_OWN_CONV or i0 in state:
                 continue
             trail = []
             onpath = set()
             i = i0
-            res = False
+            res = -1
+            last = -1
             while True:
                 if i in state:
                     res = state[i]
                     break
                 b = bld[i]
                 if b == B_CORE:
-                    res = True
+                    res = last
                     break
                 if b != B_OWN_CONV or i in onpath:
-                    res = False
                     break
                 d = self.bdir.get(i)
                 if d is None:
-                    res = False
                     break
                 trail.append(i)
                 onpath.add(i)
+                last = i
                 dx, dy = d.delta()
                 x, y = i % W + dx, i // W + dy
                 if not (0 <= x < W and 0 <= y < H):
-                    res = False
                     break
                 i = y * W + x
             for t in trail:
                 state[t] = res
-        return {i for i, v in state.items() if v}
+        return {i: v for i, v in state.items() if v >= 0}
+
+    def trunk_loads(self, good):
+        W, H = self.W, self.H
+        bld = self.bld
+        load = {}
+        for i in range(W * H):
+            if bld[i] != B_OWN_HARV:
+                continue
+            x, y = i % W, i // W
+            for dx, dy in CARD_DELTA:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < W and 0 <= ny < H:
+                    j = ny * W + nx
+                    if j in good:
+                        t = good[j]
+                        load[t] = load.get(t, 0) + 1
+                        break
+        return load
 
     def plan_chain(self, hx, hy):
         """Cheapest conveyor chain from a harvester at (hx, hy) into the network."""
@@ -676,12 +694,13 @@ class Player:
         bld = self.bld
         env = self.env
         good = self.good_conveyors()
+        load = self.trunk_loads(good)
 
         def sink_ok(j, from_i):
             b = bld[j]
             if b == B_CORE:
                 return True
-            if j in good:
+            if j in good and load.get(good[j], 0) < MAX_TRUNK:
                 dx, dy = self.bdir[j].delta()
                 return (j % W + dx) + (j // W + dy) * W != from_i
             return False
@@ -865,7 +884,7 @@ class Player:
                 self.replan()
 
     # ------------------------------------------------------------------
-    def attack_adjacent(self, ct, pos):
+    def attack_adjacent(self, ct, pos, min_ti=300):
         if ct.get_action_cooldown() != 0:
             return False
         me = self.me
@@ -875,7 +894,7 @@ class Player:
                 continue
             bid = ct.get_tile_building_id(p)
             if bid is not None and ct.get_team(bid) != me and ct.get_entity_type(bid) != EntityType.CORE:
-                if ct.get_global_resources() > 40 and ct.can_fire(p):
+                if ct.get_global_resources() > min_ti and ct.can_fire(p):
                     ct.fire(p)
                     return True
         return False
@@ -944,7 +963,7 @@ class Player:
                             ct.build_spike(s)
                             return True
             # attack adjacent enemy buildings
-            if self.attack_adjacent(ct, pos):
+            if self.attack_adjacent(ct, pos, 20):
                 return True
             # heal adjacent damaged friendly
             for d in CARDINALS:
@@ -962,7 +981,7 @@ class Player:
     def raid(self, ct, pos):
         """Go break enemy conveyors (cheap, cuts their delivery)."""
         W = self.W
-        if ct.get_global_resources() < 60:
+        if ct.get_global_resources() < 300:
             return False
         # find nearest known enemy conveyor
         best = None
