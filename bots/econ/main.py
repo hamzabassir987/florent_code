@@ -47,7 +47,7 @@ ENV_CODE = {
 # building codes in memory (0 = none / unknown)
 B_NONE, B_OWN_CONV, B_OWN_OTHER, B_ENEMY_CONV, B_ENEMY_OTHER, B_CORE, B_OWN_HARV = 0, 1, 2, 3, 4, 5, 6
 
-MAX_TRUNK = 4
+MAX_TRUNK = 3
 WALKABLE_TYPES = (EntityType.CONVEYOR, EntityType.SPLITTER)
 DANGER_TYPES = (EntityType.SPIKE, EntityType.GUNNER, EntityType.SENTINEL)
 TURRETS = (EntityType.GUNNER, EntityType.SENTINEL, EntityType.LAUNCHER, EntityType.SPIKE)
@@ -238,7 +238,7 @@ class Player:
         area = self.W * self.H
         harv = ct.read_store(S_HARV)
         cap = min(14, 4 + area // 100)
-        want = min(cap, 3 + harv // 2)
+        want = min(cap, 4 + harv // 2)
         if phase:
             want = min(30, want + ti // 400)
         if threat is not None and self.spawned < want + 2:
