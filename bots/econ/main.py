@@ -30,7 +30,9 @@ S_ECORE = 3
 S_RAID = 4
 S_CLAIM0 = 5
 S_PHASE = 15
-N_CLAIM = 10
+N_CLAIM = 8
+S_GUARD = 13
+S_GUARD_BEAT = 14
 
 # env codes in memory
 U, EMPTY, WALL, TI, VO, VOID = 0, 1, 2, 3, 4, 5
@@ -81,6 +83,8 @@ class Player:
         self.orphan_tries = {}
         self.raid_target = None
         self.bad_sym = set()
+        self.siege_cool = 0
+        self.mines = set()
 
     # ------------------------------------------------------------------
     def _setup(self, ct: Controller):
@@ -297,6 +301,9 @@ class Player:
         threat = unpack(ct.read_store(S_THREAT))
         if threat is not None and self.defend(ct, pos, threat):
             return
+        if ct.read_store(S_PHASE) & 1 and self.is_guard(ct):
+            self.guard(ct, pos)
+            return
         if ct.read_store(S_PHASE) & 2 and self.heal_core(ct, pos):
             return
 
@@ -330,8 +337,11 @@ class Player:
             self.go_harvest(ct, pos)
             return
         # nothing to harvest: siege, raid or explore
-        if ct.read_store(S_PHASE) & 1 and self.siege(ct, pos):
-            return
+        r = ct.get_current_round()
+        if ct.read_store(S_PHASE) & 1 and r >= self.siege_cool:
+            if self.siege(ct, pos):
+                return
+            self.siege_cool = r + 25
         if ct.get_current_round() > 120 and self.raid(ct, pos):
             return
         self.do_explore(ct, pos)
@@ -898,6 +908,66 @@ class Player:
                     ct.fire(p)
                     return True
         return False
+
+    def is_guard(self, ct):
+        r = ct.get_current_round()
+        gid = ct.read_store(S_GUARD)
+        beat = ct.read_store(S_GUARD_BEAT)
+        me = ct.get_id() & 0xFFFFFF
+        if gid == me:
+            ct.write_store(S_GUARD_BEAT, r)
+            return True
+        if gid == 0 or beat + 3 < r:
+            if not self.jobs and self.target is None:
+                ct.write_store(S_GUARD, me)
+                ct.write_store(S_GUARD_BEAT, r)
+        return False
+
+    def guard(self, ct, pos):
+        core = self.core
+        W = self.W
+        foot = {(core.x + dx, core.y + dy) for dx in (0, 1) for dy in (0, 1)}
+        entry = set()
+        for fx, fy in foot:
+            for dx, dy in CARD_DELTA:
+                t = (fx + dx, fy + dy)
+                if t not in foot:
+                    entry.add(t)
+        if ct.read_store(S_PHASE) & 2 and self.heal_core(ct, pos):
+            return
+        if ct.get_action_cooldown() == 0 and self.attack_adjacent(ct, pos, 20):
+            return
+        ti = ct.get_global_resources()
+        # lay mines on free tiles near the core, away from trunk entries
+        if ti >= 60:
+            cand = []
+            for x, y in ((core.x - 1, core.y - 1), (core.x + 2, core.y - 1), (core.x - 1, core.y + 2), (core.x + 2, core.y + 2)):
+                    if not self.inb(x, y):
+                        continue
+                    i = y * W + x
+                    if self.bld[i] == B_NONE and self.env[i] == EMPTY and (x, y) not in self.mines:
+                        cand.append((abs(x - pos.x) + abs(y - pos.y), x, y))
+            if cand and len(self.mines) < 24:
+                cand.sort()
+                for _, x, y in cand:
+                    if abs(x - pos.x) + abs(y - pos.y) == 1:
+                        if ct.get_action_cooldown() == 0:
+                            mp = Position(x, y)
+                            if ct.can_build_mine(mp):
+                                ct.build_mine(mp)
+                                self.mines.add((x, y))
+                                self.bld[y * W + x] = B_OWN_OTHER
+                            else:
+                                self.mines.add((x, y))  # unbuildable, skip
+                        return
+                _, x, y = cand[0]
+                if self.move_adjacent_to(ct, pos, x, y):
+                    return
+        # idle: stay near the core
+        if pos.distance_squared(core) > 8:
+            res = self.bfs_first_step(pos, lambda i: (i % W - core.x) ** 2 + (i // W - core.y) ** 2 <= 8)
+            if res:
+                self.step(ct, pos, res[1])
 
     def heal_core(self, ct, pos):
         core = self.core

@@ -53,11 +53,30 @@ def mirror(x, y, w, h, sym):
     return x, h - 1 - y  # vertical
 
 
-def gen(rng: random.Random):
+def gen(rng: random.Random, pit=False):
     w = rng.randint(16, 30)
     h = rng.randint(16, 30)
-    sym = rng.choice([0, 1, 2])
+    sym = rng.choice([1, 2]) if pit else rng.choice([0, 1, 2])
     grid = [[EMPTY] * w for _ in range(h)]
+    pit_spec = None
+    if pit:
+        pw = rng.randint(1, 3)
+        if sym == 1:  # left/right islands: void columns in the middle
+            if (w - pw) % 2:
+                pw += 1
+            at = (w - pw) // 2
+            for y in range(h):
+                for x in range(at, at + pw):
+                    grid[y][x] = VOID
+            pit_spec = (0, at, pw)
+        else:
+            if (h - pw) % 2:
+                pw += 1
+            at = (h - pw) // 2
+            for x in range(w):
+                for y in range(at, at + pw):
+                    grid[y][x] = VOID
+            pit_spec = (1, at, pw)
 
     def put(x, y, v):
         grid[y][x] = v
@@ -107,7 +126,7 @@ def gen(rng: random.Random):
         xx, yy = w // 2 + rng.randint(-3, 3), h // 2 + rng.randint(-3, 3)
         if free(xx, yy) and free(*mirror(xx, yy, w, h, sym)):
             put(xx, yy, VOLT)
-    return encode(w, h, grid, core_a, core_b, sym)
+    return encode(w, h, grid, core_a, core_b, sym, pit_spec)
 
 
 if __name__ == "__main__":
@@ -118,3 +137,6 @@ if __name__ == "__main__":
     rng = random.Random(seed)
     for i in range(n):
         (out / f"gen{i:02d}.map26").write_bytes(gen(rng))
+    pits = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    for i in range(pits):
+        (out / f"pit{i:02d}.map26").write_bytes(gen(rng, pit=True))
