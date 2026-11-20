@@ -1,0 +1,6 @@
+# Replays (regenerated with fcode run)
+*.replay26
+__pycache__/
+*.pyc
+.venv/
+venv/
