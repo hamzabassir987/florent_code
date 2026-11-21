@@ -1,7 +1,9 @@
 """Benchmark submission: plays the normal econ bot, and the core additionally
 times 3x3 conv layers (26 -> N channels) on a 30x30 packed grid on the server.
 
-Results are printed to the replay log as lines starting with BENCH:
+The replay records every unit's CPU time per turn (exec_time_us), which is
+the measurement: from about round 26 the core's turns cycle through conv sizes.
+Results are also printed as lines starting with BENCH:
   BENCH round=<r> outs=<N> perf_ms=<wall ms> cpu_before=<us> cpu_after=<us> cpu_ms=<conv cpu ms>
 If a line for some size never appears, that turn hit the 10 ms limit.
 """
@@ -50,9 +52,13 @@ class Player:
             if r == START:
                 random.seed(1)
                 self.g = swar.G(30, 30, 16)
-            elif r == START + 1:
-                self.xs = [self.g.pack([random.randint(0, 15) for _ in range(900)]) for _ in range(CIN)]
-            elif r == START + 2:
+                self.xs = []
+            elif len(self.xs) < CIN:
+                # 2 channels per turn keeps setup turns far below the 10 ms limit
+                for _ in range(2):
+                    if len(self.xs) < CIN:
+                        self.xs.append(self.g.pack([random.randint(0, 15) for _ in range(900)]))
+            else:
                 self.Wp, self.Wn = [], []
                 for co in range(26):
                     p, n = [], []
