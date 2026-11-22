@@ -36,7 +36,7 @@ def lib():
                "fe_n_entities", "fe_find", "fe_entity", "fe_team", "fe_building_at", "fe_bot_at",
                "fe_move", "fe_build", "fe_attack", "fe_heal", "fe_destroy", "fe_self_destruct", "fe_spawn",
                "fe_convert_ammo", "fe_fire", "fe_rotate", "fe_launch", "fe_end_round", "fe_last_moves",
-               "fe_dbg_set_stored", "fe_dbg_set_sides", "fe_dbg_set_team", "fe_dbg_set_hp", "fe_dbg_kill", "fe_dbg_set_last_out"):
+               "fe_dbg_set_stored", "fe_dbg_set_hcd", "fe_dbg_set_sides", "fe_dbg_set_team", "fe_dbg_set_hp", "fe_dbg_kill", "fe_dbg_set_last_out"):
         getattr(L, fn).argtypes = None
     return L
 
@@ -53,8 +53,13 @@ def write_map(r, path):
 
 
 class Verifier:
-    def __init__(self, L, path, verbose=False):
+    def __init__(self, L, path, verbose=False, seed=None):
         self.L, self.path, self.v = L, path, verbose
+        if seed is None:
+            import re
+            m = re.search(r"_s(\d+)\.replay26$", path)
+            seed = int(m.group(1)) if m else None
+        self.seed = seed
         self.stats = collections.Counter()
         self.examples = collections.defaultdict(list)
 
@@ -81,6 +86,8 @@ class Verifier:
         self.g = ctypes.c_void_p(L.fe_new())
         g = self.g
         assert L.fe_load_map(g, mp.encode()), "map load failed"
+        if self.seed is not None:
+            L.fe_reset(g, ctypes.c_ulonglong(self.seed))
         os.unlink(mp)
         idmap = {}                     # replay id -> engine index
         for cid, team, _ in r.cores:
@@ -100,6 +107,7 @@ class Verifier:
         spiked = set()
         dead_check = []
         inl = {}; outl = {}
+        stored_id = {}
         self.fresh = []
 
         for t, turn in enumerate(r.turns):
@@ -209,10 +217,11 @@ class Verifier:
             L.fe_end_round(g)
             # compare resource moves
             n = L.fe_n_entities(g)
-            buf = (ctypes.c_int * (5 * 4096))()
+            buf = (ctypes.c_int * (6 * 4096))()
             m = L.fe_last_moves(g, buf, 4096)
-            emoves = set((buf[5 * j], buf[5 * j + 1], buf[5 * j + 2], buf[5 * j + 3]) for j in range(m))
-            rmoves = set((a[0], a[1], b[0], b[1]) for a, b, _ in (dist or []))
+            exact = self.seed is not None
+            emoves = set((buf[6 * j], buf[6 * j + 1], buf[6 * j + 2], buf[6 * j + 3]) + ((buf[6 * j + 5] & 0xFFFFFFFF,) if exact else ()) for j in range(m))
+            rmoves = set((a[0], a[1], b[0], b[1]) + ((rid,) if exact else ()) for a, b, rid in (dist or []))
             self.stats["moves"] += len(rmoves)
             self.stats["moves mismatched"] += len(rmoves ^ emoves)
             if rmoves ^ emoves:
@@ -238,9 +247,11 @@ class Verifier:
                 elif stored.get(a) is not None:
                     res_of.setdefault(rid, stored[a]); stored.pop(a)
             for a, b, rid in (dist or []):
+                stored_id.pop(a, None)
+            for a, b, rid in (dist or []):
                 dst = at.get(b)
                 if dst is not None and kind.get(dst) in ("conveyor", "splitter"):
-                    stored[b] = res_of.get(rid, 1)
+                    stored[b] = res_of.get(rid, 1); stored_id[b] = rid
             # compare team totals, then resync
             if players:
                 for tm in (0, 1):
@@ -273,11 +284,14 @@ class Verifier:
                 kd = kind.get(rid)
                 if kd in ("conveyor", "splitter", "harvester"):
                     if kd != "harvester":
-                        L.fe_dbg_set_stored(g, p[0], p[1], stored.get(p, 0))
+                        L.fe_dbg_set_stored(g, p[0], p[1], stored.get(p, 0), stored_id.get(p, 0))
+                    elif rid in hlast:
+                        last = hlast[rid]
+                        L.fe_dbg_set_hcd(g, idmap[rid], 0 if last is None else max(0, 3 - (t - last)))
                     i4 = (ctypes.c_int * 4)(*inl.get(p, [-1] * 4)); o4 = (ctypes.c_int * 4)(*outl.get(p, [-1] * 4))
                     L.fe_dbg_set_sides(g, idmap[rid], i4, o4)
                 elif kd == "harvester" and rid in hlast:
-                    L.fe_dbg_set_last_out(g, idmap[rid], hlast[rid] if hlast[rid] is not None else -1000000)
+                    pass
         L.fe_free(g)
         return self
 
@@ -287,6 +301,9 @@ class Verifier:
             last = self.ent(n - 1)
             if last[3:5] == list(e["pos"]) and last[1] == TYPE[e["kind"]]:
                 idmap[e["id"]] = n - 1
+                if self.seed is not None:
+                    if (last[0] & 0xFFFFFFFF) == e["id"]: self.stats["ids ok"] += 1
+                    else: self.note("entity id differs", (e["kind"], "replay", e["id"], "engine", last[0] & 0xFFFFFFFF))
         kind[e["id"]] = e["kind"]; teamof[e["id"]] = e["team"]; hp[e["id"]] = e["hp"]; pos[e["id"]] = e["pos"]
         if e["kind"] != "builder":
             at[e["pos"]] = e["id"]

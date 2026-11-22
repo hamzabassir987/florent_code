@@ -46,11 +46,12 @@ int fe_write_store(Game* g, int t, int i, long long v) { return g->write_store(t
 void fe_end_round(Game* g) { g->end_round(); }
 int fe_last_moves(Game* g, int* out, int max) {
     int n = 0;
-    for (auto& m : g->last_moves) { if (n >= max) break; int* o = out + 5 * n++; o[0] = m.fx; o[1] = m.fy; o[2] = m.tx; o[3] = m.ty; o[4] = m.res; }
+    for (auto& m : g->last_moves) { if (n >= max) break; int* o = out + 6 * n++; o[0] = m.fx; o[1] = m.fy; o[2] = m.tx; o[3] = m.ty; o[4] = m.res; o[5] = int(m.stack_id); }
     return n;
 }
 // ---- debug hooks used by the verifier to resynchronise after a mismatch
-void fe_dbg_set_stored(Game* g, int x, int y, int res) { int b = g->bld[g->idx(x, y)]; if (b >= 0) g->ents[b].stored = (uint8_t)res; }
+void fe_dbg_set_stored(Game* g, int x, int y, int res, int sid) { int b = g->bld[g->idx(x, y)]; if (b >= 0) { g->ents[b].stored = (uint8_t)res; g->ents[b].stack_id = (uint32_t)sid; } }
+void fe_dbg_set_hcd(Game* g, int i, int v) { g->ents[i].hcd = v; }
 void fe_dbg_set_team(Game* g, int t, int ti, int vo, int ammo) { g->teams[t].ti = ti; g->teams[t].vo = vo; g->teams[t].ammo = ammo; }
 void fe_dbg_set_hp(Game* g, int i, int hp) { g->ents[i].hp = hp; }
 void fe_dbg_kill(Game* g, int i) { g->kill(i); }

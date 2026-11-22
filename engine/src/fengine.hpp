@@ -7,7 +7,11 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+#include "rustrng.hpp"
 
 namespace fe {
 
@@ -45,7 +49,9 @@ struct Entity {
     // economy
     uint8_t stored = RNONE;        // conveyor / splitter
     uint8_t res = RNONE;           // harvester product
-    int last_out = -1000000;       // harvester: round of last output
+    uint32_t stack_id = 0;         // conveyor / splitter: id of the stack held
+    int hcd = 0;                   // harvester cooldown (outputs when 0, then 4)
+    int last_out = -1000000;       // unused (kept for ABI)
     std::array<int, 4> in_last{{-1, -1, -1, -1}};   // per side (N,E,S,W): round last received from
     std::array<int, 4> out_last{{-1, -1, -1, -1}};  // harvester / splitter: round last output to
 };
@@ -60,7 +66,7 @@ struct Team {
     int core = -1;                 // entity index
 };
 
-struct Move { int fx, fy, tx, ty; uint8_t res; };
+struct Move { int fx, fy, tx, ty; uint8_t res; uint32_t stack_id; };
 
 class Game {
 public:
@@ -131,6 +137,12 @@ public:
     long next_seq = 0;
     int next_id = 3;
     uint64_t rng = 1;
+    uint64_t seed = 1;
+    StdRng rng_dist;                                   // StdRng(seed): distribution tie-breaks
+    StdRng rng_ids;                                    // StdRng(seed ^ ID_SALT): entity and stack ids
+    std::unordered_map<uint64_t, int> edge_last;       // (src tile, dst tile) -> round last used
+    std::unordered_set<uint32_t> used_ids;             // every entity / stack id ever issued (never reused)
+    uint32_t new_id();                                 // official id rule: redraw until unused
     int core_xy[2][2] = {{0, 0}, {0, 0}};
 };
 

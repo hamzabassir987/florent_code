@@ -97,8 +97,15 @@ bool Game::load_map_bytes(const uint8_t* data, size_t n) {
     return true;
 }
 
-void Game::reset(uint64_t seed) {
+static const uint64_t ID_SALT = 0x1D5EED00C0DEF00Dull;
+
+void Game::reset(uint64_t seed_) {
+    seed = seed_;
     rng = seed ? seed : 1;
+    rng_dist.seed(seed);
+    rng_ids.seed(seed ^ ID_SALT);
+    edge_last.clear();
+    used_ids.clear();
     round = 0; winner = -1; over = false; win_condition.clear();
     ents.clear(); last_moves.clear();
     bld.assign(size_t(W) * H, -1);
@@ -128,7 +135,7 @@ bool Game::passable(int x, int y) const {
 
 int Game::create(int type, int team, int x, int y, int dir) {
     Entity e;
-    e.id = next_id++;
+    e.id = type == CORE ? team + 1 : int(new_id());
     e.type = uint8_t(type); e.team = uint8_t(team); e.dir = uint8_t(dir);
     e.x = x; e.y = y; e.hp = e.max_hp = MAX_HP[type];
     e.seq = next_seq++;
@@ -145,6 +152,13 @@ int Game::create(int type, int team, int x, int y, int dir) {
     teams[team].scale += SCALE_INC[type];
     if (is_unit(type)) teams[team].units++;
     return i;
+}
+
+uint32_t Game::new_id() {
+    for (;;) {
+        uint32_t id = rng_ids.gen_range(3, 1000000000);
+        if (used_ids.insert(id).second) return id;
+    }
 }
 
 void Game::kill(int i) {
@@ -510,118 +524,145 @@ void Game::resign(int team) {
 }
 
 // ------------------------------------------------------------------ distribution
-// Every round, after all units acted. A stack moves one tile. Measured rules:
-//  - a conveyor holds one stack and passes it to the tile in front;
-//  - a receiver takes from at most one source per round, the input side it
-//    used least recently (strict alternation in the replays);
-//  - a harvester outputs every 4 rounds (first on the round it is built) to
-//    its least-recently-used accepting neighbour; if none is free it waits;
-//  - a chain advances as a whole in one round (a vacated tile can be refilled).
+// Reproduces the official engine's Game::distribute_resources (read from its
+// binary and checked against traces of it):
+//  1. Scan tiles row by row. Every building lists its output tiles (conveyor:
+//     front; splitter: front/left/right; harvester: its 4 neighbours) that are
+//     in bounds, on its side of a pit and hold a building; each such edge is
+//     recorded under its target (a target -> sources list, kept in source scan
+//     order) and counted for its source. A building with nothing to send (an
+//     empty conveyor/splitter, a harvester on cooldown, anything else) is idle.
+//  2. Targets in (x, y) order: if the target can take a stack now (a core, or
+//     an empty conveyor/splitter), push every non-idle source's edge that it
+//     accepts. Priority: i32::MAX if the source has one edge and the target one
+//     source, else -(round this edge last moved a stack; 0 if never); plus a
+//     uniform [0,1) draw from StdRng(seed).
+//  3. Pop the highest edge. If the source still has its stack and the target
+//     can still take one, move it (a harvester draws a new stack id and goes on
+//     cooldown 4), record the round for the edge, mark the source idle, and push
+//     the edges of sources waiting on the tile just vacated.
 void Game::distribute() {
     last_moves.clear();
-    struct Src { int e; int x, y; int cand[4]; int nc; };
-    std::vector<Src> srcs;
-    auto accepts = [&](int sx, int sy, int tx, int ty) -> bool {
-        if (!inb(tx, ty)) return false;
-        int t = bld[idx(tx, ty)];
-        if (t < 0) return false;
-        const Entity& d = ents[t];
+    const int NT = W * H;
+    std::vector<char> idle(NT, 1);
+    std::vector<int> outcount(NT, 0);
+    std::vector<std::vector<int>> incoming(NT);
+    auto same_side = [&](int x0, int y0, int x1, int y1) {
+        if (pit_axis < 0 || pit_w <= 0) return true;
+        int a = pit_axis == 0 ? x0 : y0, b = pit_axis == 0 ? x1 : y1;
+        return (a < pit_at) == (b < pit_at);
+    };
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int bi = bld[idx(x, y)];
+            if (bi < 0) continue;
+            const Entity& e = ents[bi];
+            int outs[4]; int n = 0;
+            if (e.type == CONVEYOR) {
+                outs[n++] = e.dir;
+                if (e.stored != RNONE) idle[idx(x, y)] = 0;
+            } else if (e.type == SPLITTER) {
+                outs[n++] = e.dir;
+                outs[n++] = e.dir == N ? int(fe::W) : e.dir - 2;
+                outs[n++] = e.dir == fe::W ? int(N) : e.dir + 2;
+                if (e.stored != RNONE) idle[idx(x, y)] = 0;
+            } else if (e.type == HARVESTER) {
+                outs[n++] = N; outs[n++] = E; outs[n++] = S; outs[n++] = fe::W;
+                if (e.hcd == 0) idle[idx(x, y)] = 0;
+            }
+            int cnt = 0;
+            for (int k = 0; k < n; k++) {
+                int tx = x + DX[outs[k]], ty = y + DY[outs[k]];
+                if (!inb(tx, ty) || !same_side(x, y, tx, ty)) continue;
+                if (bld[idx(tx, ty)] < 0) continue;
+                incoming[idx(tx, ty)].push_back(idx(x, y));
+                cnt++;
+            }
+            outcount[idx(x, y)] = cnt;
+        }
+    }
+    auto can_take = [&](int t) {
+        int b = bld[t];
+        if (b < 0) return false;
+        const Entity& d = ents[b];
+        if (d.type == CORE) return true;
+        return (d.type == CONVEYOR || d.type == SPLITTER) && d.stored == RNONE;
+    };
+    auto accepts = [&](int s, int t) {
+        const Entity& d = ents[bld[t]];
+        int sx = s % W, sy = s / W;
         if (d.type == CORE) return true;
         if (d.type == CONVEYOR) return !(d.x + DX[d.dir] == sx && d.y + DY[d.dir] == sy);
         if (d.type == SPLITTER) return d.x - DX[d.dir] == sx && d.y - DY[d.dir] == sy;
         return false;
     };
-    for (size_t i = 0; i < ents.size(); i++) {
-        const Entity& e = ents[i];
-        if (!e.alive) continue;
-        Src s{int(i), e.x, e.y, {0, 0, 0, 0}, 0};
-        if (e.type == CONVEYOR && e.stored != RNONE) {
-            int tx = e.x + DX[e.dir], ty = e.y + DY[e.dir];
-            if (accepts(e.x, e.y, tx, ty)) { s.cand[0] = idx(tx, ty); s.nc = 1; }
-        } else if (e.type == SPLITTER && e.stored != RNONE) {
-            int ds[3] = {int(e.dir), (e.dir == N ? int(fe::W) : e.dir - 2), (e.dir == fe::W ? int(N) : e.dir + 2)};
-            for (int d : ds) { int tx = e.x + DX[d], ty = e.y + DY[d]; if (accepts(e.x, e.y, tx, ty)) s.cand[s.nc++] = idx(tx, ty); }
-        } else if (e.type == HARVESTER && round - e.last_out >= 4) {
-            for (int d : {int(N), int(E), int(S), int(fe::W)}) { int tx = e.x + DX[d], ty = e.y + DY[d]; if (accepts(e.x, e.y, tx, ty)) s.cand[s.nc++] = idx(tx, ty); }
+    auto ekey = [](int s, int t) { return (uint64_t(uint32_t(s)) << 32) | uint32_t(t); };
+    struct HE { double p; int s, t; };
+    // std::push_heap / pop_heap with the same max-heap sift rules as Rust's BinaryHeap
+    std::vector<HE> heap;
+    auto push = [&](int s, int t) {
+        int prio;
+        if (outcount[s] == 1 && incoming[t].size() == 1) prio = 2147483647;
+        else { auto it = edge_last.find(ekey(s, t)); prio = it == edge_last.end() ? 0 : -it->second; }
+        double p = double(prio) + rng_dist.f64();
+        // Rust BinaryHeap::push: sift_up while strictly greater than the parent
+        heap.push_back({p, s, t});
+        size_t i = heap.size() - 1;
+        HE x = heap[i];
+        while (i > 0) {
+            size_t par = (i - 1) / 2;
+            if (!(x.p > heap[par].p)) break;
+            heap[i] = heap[par]; i = par;
         }
-        if (s.nc) srcs.push_back(s);
-    }
-    std::vector<int> target(srcs.size(), -1);           // chosen tile per source
-    std::vector<char> taken(size_t(W) * H, 0), moving(size_t(W) * H, 0);
-    auto is_core = [&](int t) { int b = bld[t]; return b >= 0 && ents[b].type == CORE; };
-    auto free_tile = [&](int t) {
-        if (is_core(t)) return true;
-        if (taken[t]) return false;
-        const Entity& d = ents[bld[t]];
-        return d.stored == RNONE || moving[t];
+        heap[i] = x;
     };
-    auto side = [&](int fromx, int fromy, int tox, int toy) { return card_index(fromx - tox, fromy - toy); };
-    bool changed = true;
-    std::vector<std::vector<int>> props(size_t(W) * H);
-    std::vector<int> touched;
-    while (changed) {
-        changed = false;
-        touched.clear();
-        for (size_t s = 0; s < srcs.size(); s++) {
-            if (target[s] >= 0) continue;
-            const Src& S = srcs[s];
-            const Entity& se = ents[S.e];
-            int best = -1; long bk = 0;
-            for (int c = 0; c < S.nc; c++) {
-                int t = S.cand[c];
-                if (!free_tile(t)) continue;
-                int sd = card_index(t % W - S.x, t / W - S.y);
-                long key = long(se.out_last[sd]) * 8 + sd;
-                if (best < 0 || key < bk) { best = t; bk = key; }
-            }
-            if (best < 0) continue;
-            if (props[best].empty()) touched.push_back(best);
-            props[best].push_back(int(s));
+    auto pop = [&](HE& out) {
+        if (heap.empty()) return false;
+        // Rust BinaryHeap::pop: swap last into the root, sift_down_to_bottom, then sift_up
+        HE last = heap.back(); heap.pop_back();
+        if (heap.empty()) { out = last; return true; }
+        out = heap[0];
+        size_t end = heap.size(), pos = 0, child = 1;
+        while (child + 1 < end) {
+            if (!(heap[child].p > heap[child + 1].p)) child++;   // pick the greater (right on ties)
+            heap[pos] = heap[child]; pos = child; child = 2 * pos + 1;
         }
-        for (int t : touched) {
-            auto& ps = props[t];
-            if (is_core(t)) {
-                for (int s : ps) { target[s] = t; if (ents[srcs[s].e].type != HARVESTER) moving[idx(srcs[s].x, srcs[s].y)] = 1; }
-            } else {
-                const Entity& d = ents[bld[t]];
-                int best = -1; long bk = 0;
-                for (int s : ps) {
-                    int sd = side(srcs[s].x, srcs[s].y, t % W, t / W);
-                    long key = long(d.in_last[sd]) * 8 + sd;
-                    if (best < 0 || key < bk) { best = s; bk = key; }
-                }
-                target[best] = t; taken[t] = 1;
-                if (ents[srcs[best].e].type != HARVESTER) moving[idx(srcs[best].x, srcs[best].y)] = 1;
-            }
-            ps.clear();
-            changed = true;
+        if (child == end - 1) { heap[pos] = heap[child]; pos = child; }
+        heap[pos] = last;
+        while (pos > 0) {
+            size_t par = (pos - 1) / 2;
+            if (!(last.p > heap[par].p)) break;
+            heap[pos] = heap[par]; pos = par;
         }
-    }
-    // apply simultaneously
-    std::vector<uint8_t> carried(srcs.size(), RNONE);
-    for (size_t s = 0; s < srcs.size(); s++) {
-        if (target[s] < 0) continue;
-        Entity& e = ents[srcs[s].e];
-        int t = target[s];
-        int sd = card_index(t % W - e.x, t / W - e.y);
-        if (e.type == HARVESTER) { carried[s] = e.res; e.last_out = round; }
-        else { carried[s] = e.stored; e.stored = RNONE; }
-        if (sd >= 0) e.out_last[sd] = round;
-    }
-    for (size_t s = 0; s < srcs.size(); s++) {
-        if (target[s] < 0) continue;
-        int t = target[s];
-        Entity& d = ents[bld[t]];
-        last_moves.push_back({srcs[s].x, srcs[s].y, t % W, t / W, carried[s]});
+        heap[pos] = last;
+        return true;
+    };
+    for (int x = 0; x < W; x++)
+        for (int y = 0; y < H; y++) {
+            int t = idx(x, y);
+            if (incoming[t].empty() || !can_take(t)) continue;
+            for (int s : incoming[t])
+                if (!idle[s] && accepts(s, t)) push(s, t);
+        }
+    HE e;
+    while (pop(e)) {
+        if (idle[e.s] || !can_take(e.t)) continue;
+        Entity& src = ents[bld[e.s]];
+        uint8_t res; uint32_t sid;
+        if (src.type == HARVESTER) { res = src.res; sid = new_id(); src.hcd = 4; }
+        else { res = src.stored; sid = src.stack_id; src.stored = RNONE; src.stack_id = 0; }
+        Entity& d = ents[bld[e.t]];
+        last_moves.push_back({e.s % W, e.s / W, e.t % W, e.t / W, res, sid});
         if (d.type == CORE) {
             Team& tm = teams[d.team];
-            if (carried[s] == RTI) { tm.ti += STACK; tm.ti_collected += STACK; }
+            if (res == RTI) { tm.ti += STACK; tm.ti_collected += STACK; }
             else { tm.vo += STACK; tm.vo_collected += STACK; }
-        } else {
-            d.stored = carried[s];
-            int sd = side(srcs[s].x, srcs[s].y, d.x, d.y);
-            if (sd >= 0) d.in_last[sd] = round;
-        }
+        } else { d.stored = res; d.stack_id = sid; }
+        edge_last[ekey(e.s, e.t)] = round;
+        idle[e.s] = 1;
+        if (can_take(e.s))
+            for (int s2 : incoming[e.s])
+                if (!idle[s2] && accepts(s2, e.s)) push(s2, e.s);
     }
 }
 
@@ -633,6 +674,7 @@ void Game::end_round() {
         if (!e.alive) continue;
         if (e.acd > 0) e.acd--;
         if (e.mcd > 0) e.mcd--;
+        if (e.hcd > 0) e.hcd--;
         e.acted = e.moved = false;
     }
     for (auto& t : teams) { t.converted = false; t.store = t.store_next; }
