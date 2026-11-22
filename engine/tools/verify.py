@@ -38,7 +38,7 @@ def lib():
                "fe_convert_ammo", "fe_fire", "fe_rotate", "fe_launch", "fe_end_round", "fe_last_moves",
                "fe_can_move", "fe_can_build", "fe_can_attack", "fe_can_heal", "fe_can_destroy", "fe_can_spawn",
                "fe_can_convert", "fe_can_fire", "fe_can_rotate", "fe_can_launch",
-               "fe_dbg_set_stored", "fe_dbg_set_hcd", "fe_dbg_set_sides", "fe_dbg_set_team", "fe_dbg_set_hp", "fe_dbg_kill", "fe_dbg_set_last_out"):
+               "fe_win_condition", "fe_dbg_set_stored", "fe_dbg_set_hcd", "fe_dbg_set_sides", "fe_dbg_set_team", "fe_dbg_set_hp", "fe_dbg_kill", "fe_dbg_set_last_out"):
         getattr(L, fn).argtypes = None
     return L
 
@@ -163,6 +163,21 @@ class Verifier:
                         else:
                             rc = L.fe_move(g, idmap.get(bid, -1), d)
                             self.check(rc, "move", t, (bid, frm, to))
+                    pos[bid] = to
+                elif k == "fell":
+                    bid, frm, to = u[1], u[2], u[3]
+                    launcher = None
+                    for w in ev[i + 1:i + 8]:
+                        if w[0] == "acd" and kind.get(w[1]) == "launcher":
+                            launcher = w[1]; break
+                    if launcher is None:
+                        for w in ev[max(0, i - 6):i]:
+                            if w[0] == "acd" and kind.get(w[1]) == "launcher":
+                                launcher = w[1]
+                    rc = L.fe_launch(g, idmap.get(launcher, -1), frm[0], frm[1], to[0], to[1])
+                    self.check(rc, "launch (fell)", t, u)
+                    if rc == 0 and self.ent(idmap[bid])[7]:
+                        self.note("engine: thrown bot did not fall", (t, u))
                     pos[bid] = to
                 elif k == "attack":
                     rc = L.fe_attack(g, idmap.get(u[1], -1), *u[2]); self.check(rc, "attack", t, u)
@@ -296,8 +311,18 @@ class Verifier:
                     L.fe_dbg_set_sides(g, idmap[rid], i4, o4)
                 elif kd == "harvester" and rid in hlast:
                     pass
+        want = (getattr(r, "winner", None), getattr(r, "win_condition", None))
+        got = (L.fe_winner(g), self.L_wincond(g))
+        if want[0] is not None:
+            if (want[0], want[1]) == got: self.stats["winner ok"] += 1
+            else: self.note("WINNER differs", ("replay", want, "engine", got))
         L.fe_free(g)
         return self
+
+    def L_wincond(self, g):
+        buf = ctypes.create_string_buffer(64)
+        self.L.fe_win_condition(g, buf, 64)
+        return buf.value.decode()
 
     QDIR = {"CENTRE": 0, "NORTH": 1, "NORTHEAST": 2, "EAST": 3, "SOUTHEAST": 4, "SOUTH": 5,
             "SOUTHWEST": 6, "WEST": 7, "NORTHWEST": 8, "-": 0}

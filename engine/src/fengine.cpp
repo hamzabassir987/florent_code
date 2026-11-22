@@ -722,14 +722,17 @@ void Game::end_round() {
     round++;
     if (round >= MAX_TURNS && winner < 0) {
         auto harv = [&](int team) { int n = 0; for (auto& e : ents) if (e.alive && e.team == team && e.type == HARVESTER) n++; return n; };
-        int a = teams[0].ti_collected, b = teams[1].ti_collected;
-        if (a != b) { winner = a > b ? 0 : 1; win_condition = "titanium_collected"; return; }
-        a = harv(0); b = harv(1);
-        if (a != b) { winner = a > b ? 0 : 1; win_condition = "harvesters"; return; }
-        a = teams[0].ti; b = teams[1].ti;
-        if (a != b) { winner = a > b ? 0 : 1; win_condition = "titanium_stored"; return; }
-        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-        winner = int(rng & 1); win_condition = "coinflip";
+        int a0 = teams[0].ti_collected, b0 = teams[1].ti_collected;
+        int a1 = harv(0), b1 = harv(1);
+        int a2 = teams[0].ti, b2 = teams[1].ti;
+        if (a0 != b0) { winner = a0 > b0 ? 0 : 1; win_condition = "titanium_collected"; }
+        else if (a1 != b1) { winner = a1 > b1 ? 0 : 1; win_condition = "harvesters"; }
+        else if (a2 != b2) { winner = a2 > b2 ? 0 : 1; win_condition = "titanium_stored"; }
+        else {
+            // NOTE: the official coin flip's random source is not verified (never seen in replays)
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            winner = int(rng & 1); win_condition = "coinflip";
+        }
     }
     if (winner >= 0) over = true;
 }

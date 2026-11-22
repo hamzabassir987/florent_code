@@ -10,6 +10,7 @@ int fe_width(Game* g) { return g->W; }
 int fe_height(Game* g) { return g->H; }
 int fe_round(Game* g) { return g->round; }
 int fe_winner(Game* g) { return g->winner; }
+void fe_win_condition(Game* g, char* out, int n) { int k = 0; for (char c : g->win_condition) { if (k + 1 >= n) break; out[k++] = c; } out[k] = 0; }
 int fe_n_entities(Game* g) { return int(g->ents.size()); }
 int fe_find(Game* g, int id) { return g->find(id); }
 // id,type,team,x,y,hp,max_hp,alive,dir,acd,mcd,stored,res

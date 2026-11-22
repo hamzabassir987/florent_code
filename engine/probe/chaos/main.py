@@ -41,7 +41,13 @@ class Player:
         near = [Position(me.x + dx, me.y + dy) for dx in range(-3, 4) for dy in range(-3, 4)]
         near = [p for p in near if 0 <= p.x < W and 0 <= p.y < H]
         if r % 2 == 0:
-            # ---- questions only
+            self.ask(ct, R, t, me, near)
+            return
+        self.act(ct, R, t, me, near, r, W, H)
+        self.ask(ct, R, t, me, near)   # questions after acting: cooldowns, one-action-per-round
+
+    def ask(self, ct, R, t, me, near):
+        if True:
             if t == EntityType.BUILDER_BOT:
                 for d in DIRS:
                     self.q("move", (d.name,), self.safe(ct.can_move, d))
@@ -69,8 +75,8 @@ class Player:
                 for b in bots:
                     for tp in R.sample(near, min(4, len(near))):
                         self.q("launch", (b.x, b.y, tp.x, tp.y), self.safe(ct.can_launch, b, tp) is True)
-            return
-        # ---- act (random legal action)
+
+    def act(self, ct, R, t, me, near, r, W, H):
         try:
             if t == EntityType.CORE:
                 if ct.get_global_voltium() > 0 and R.random() < 0.5:
@@ -96,7 +102,8 @@ class Player:
                                 if ct.can_build(et, p, d):
                                     opts.append((et, p, d))
                     if opts:
-                        et, p, d = R.choice(opts)
+                        fav = [o for o in opts if o[0] in (EntityType.LAUNCHER, EntityType.MINE, EntityType.HARVESTER, EntityType.SPLITTER)]
+                        et, p, d = R.choice(fav if fav and R.random() < 0.5 else opts)
                         ct.build(et, p, d)
                 elif x < 0.88:
                     ps = [p for p in adj if ct.can_heal(p)]
