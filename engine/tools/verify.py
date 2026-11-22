@@ -38,7 +38,7 @@ def lib():
                "fe_convert_ammo", "fe_fire", "fe_rotate", "fe_launch", "fe_end_round", "fe_last_moves",
                "fe_can_move", "fe_can_build", "fe_can_attack", "fe_can_heal", "fe_can_destroy", "fe_can_spawn",
                "fe_can_convert", "fe_can_fire", "fe_can_rotate", "fe_can_launch",
-               "fe_win_condition", "fe_dbg_set_stored", "fe_dbg_set_hcd", "fe_dbg_set_sides", "fe_dbg_set_team", "fe_dbg_set_hp", "fe_dbg_kill", "fe_dbg_set_last_out"):
+               "fe_win_condition", "fe_vis_tiles", "fe_vis_ids", "fe_vis_tile", "fe_dbg_set_stored", "fe_dbg_set_hcd", "fe_dbg_set_sides", "fe_dbg_set_team", "fe_dbg_set_hp", "fe_dbg_kill", "fe_dbg_set_last_out"):
         getattr(L, fn).argtypes = None
     return L
 
@@ -113,7 +113,7 @@ class Verifier:
         self.fresh = []
 
         for t, turn in enumerate(r.turns):
-            ev = [u for u in turn if u[0] not in ("line", "dot") and (u[0] != "output" or (u[4] and "Q " in u[4]))]
+            ev = [u for u in turn if u[0] not in ("line", "dot") and (u[0] != "output" or (u[4] and ("Q " in u[4] or "V " in u[4])))]
             players = None
             dist = None
             i = 0
@@ -215,7 +215,7 @@ class Verifier:
                     if p and at.get(p) == rid:
                         at.pop(p); stored.pop(p, None)
                     hp.pop(rid, None)
-                elif k == "output" and u[4] and "Q " in u[4]:
+                elif k == "output" and u[4] and ("Q " in u[4] or "V " in u[4]):
                     self.queries(u[1], u[4], idmap, t)
                 elif k == "distribute":
                     dist = u[1]
@@ -337,6 +337,9 @@ class Verifier:
             return
         D, T = self.QDIR, self.QTYPE
         for line in text.splitlines():
+            if line.startswith("V "):
+                self.vision_check(a, line, t)
+                continue
             if not line.startswith("Q "):
                 continue
             parts = line.split()
@@ -361,6 +364,42 @@ class Verifier:
                 e = self.ent(a)
                 self.note(f"LEGALITY {key}: official {int(want)} engine {int(got)} ({ERR[rc] if 0 <= rc < len(ERR) else rc})",
                           (t, line, "unit at", tuple(e[3:5]), "acd", e[9], "mcd", e[10]))
+
+    ENV_NAMES = {"EMPTY": 0, "WALL": 1, "ORE_TITANIUM": 2, "ORE_VOLTIUM": 4, "VOID": 5}
+
+    def vision_check(self, a, line, t):
+        L, g = self.L, self.g
+        p = line.split()
+        if p[1] == "tiles":
+            r2 = -1 if p[2] == "d" else int(p[2])
+            want = p[3].split(",") if len(p) > 3 else []
+            buf = (ctypes.c_int * 4000)()
+            n = L.fe_vis_tiles(g, a, r2, buf, 2000)
+            got = [f"{buf[2 * k]}:{buf[2 * k + 1]}" for k in range(n)]
+            self.cmp("vision tiles", got, want, t, line)
+        elif p[1] in ("ents", "blds", "units"):
+            r2 = -1 if p[2] == "d" else int(p[2])
+            want = [int(x) for x in p[3].split(",")] if len(p) > 3 else []
+            buf = (ctypes.c_int * 4000)()
+            n = L.fe_vis_ids(g, a, r2, {"ents": 0, "blds": 1, "units": 2}[p[1]], buf, 4000)
+            got = [buf[k] & 0xFFFFFFFF for k in range(n)]
+            self.cmp("vision " + p[1], got, want, t, line)
+        elif p[1] == "tile":
+            x, y = int(p[2]), int(p[3])
+            o = (ctypes.c_int * 5)()
+            L.fe_vis_tile(g, a, x, y, o)
+            got = [o[0], o[1], o[2] & 0xFFFFFFFF if o[2] != -1 else -1, o[3] & 0xFFFFFFFF if o[3] != -1 else -1, o[4]]
+            want = [int(p[4]), int(p[5]), int(p[6]), int(p[7]), self.ENV_NAMES[p[8]]]
+            for name, gv, wv in zip(("empty", "passable", "building id", "bot id", "env"), got, want):
+                self.cmp("vision tile " + name, gv, wv, t, line)
+
+    def cmp(self, key, got, want, t, line):
+        if got == want:
+            self.stats[key + " ok"] += 1
+        elif isinstance(got, list) and sorted(got) == sorted(want):
+            self.note(key + ": ORDER differs", (t, "official", want[:12], "engine", got[:12]))
+        else:
+            self.note(key + " DIFFERS", (t, line[:120], "engine", got if not isinstance(got, list) else got[:12]))
 
     def adopt(self, e, idmap, kind, teamof, hp, pos, at, engine_new=True):
         n = self.L.fe_n_entities(self.g)

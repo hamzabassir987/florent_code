@@ -26,6 +26,21 @@ known seeds): **zero differences** in
 - titanium, Voltium, ammo and collected totals every round;
 - the winner and the win condition.
 
+## Vision (what a unit's Controller shows it)
+
+- A unit sees tiles within its vision radius² (core 36 measured from its
+  nearest footprint tile; builder 20, gunner 13, sentinel 32, launcher 26,
+  spike 8). `get_nearby_tiles` lists them row by row; a smaller `dist_sq`
+  narrows the radius.
+- `get_nearby_entities / buildings / units` walk those tiles in the same order:
+  the building on a tile (a core once), then the builder bot on it. The unit
+  itself is included.
+- Enemy mines are invisible: not listed, `get_tile_building_id` gives None,
+  `is_tile_empty` is true, `is_tile_passable` follows the terrain.
+- `is_tile_passable` is false on a tile holding any builder bot (the unit's own
+  tile included). `is_tile_empty`: no visible building and not wall/void.
+- Checked against the official API on 1.63 M answers (order included).
+
 ## Randomness
 
 - Two Rust `rand 0.8` `StdRng` (ChaCha12) generators, ported bit for bit

@@ -42,9 +42,28 @@ class Player:
         near = [p for p in near if 0 <= p.x < W and 0 <= p.y < H]
         if r % 2 == 0:
             self.ask(ct, R, t, me, near)
+            if r % 6 == 0:
+                self.vision(ct, R)
             return
         self.act(ct, R, t, me, near, r, W, H)
         self.ask(ct, R, t, me, near)   # questions after acting: cooldowns, one-action-per-round
+        if r % 6 == 3:
+            self.vision(ct, R)
+
+    def vision(self, ct, R):
+        """What the official API shows this unit: lists in the order returned."""
+        for r2 in (None, 5):
+            tag = "d" if r2 is None else str(r2)
+            tiles = ct.get_nearby_tiles() if r2 is None else ct.get_nearby_tiles(r2)
+            print("V tiles", tag, ",".join(f"{p.x}:{p.y}" for p in tiles))
+            for name, fn in (("ents", ct.get_nearby_entities), ("blds", ct.get_nearby_buildings), ("units", ct.get_nearby_units)):
+                ids = fn() if r2 is None else fn(r2)
+                print("V", name, tag, ",".join(str(i) for i in ids))
+        tiles = ct.get_nearby_tiles()
+        for p in R.sample(tiles, min(12, len(tiles))):
+            b = ct.get_tile_building_id(p); u = ct.get_tile_builder_bot_id(p)
+            print("V tile", p.x, p.y, int(ct.is_tile_empty(p)), int(ct.is_tile_passable(p)),
+                  b if b is not None else -1, u if u is not None else -1, ct.get_tile_env(p).name)
 
     def ask(self, ct, R, t, me, near):
         if True:

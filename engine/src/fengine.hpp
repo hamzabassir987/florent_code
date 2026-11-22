@@ -131,8 +131,16 @@ public:
     // attack pattern of a turret placed at (x,y) facing dir
     void attack_tiles(int type, int x, int y, int dir, std::vector<std::pair<int,int>>& out) const;
 
-    // ---- vision
+    // ---- vision: what unit `a` is shown by the official Controller API
     bool in_vision(int a, int x, int y) const;
+    int dist2_from(int a, int x, int y) const;                    // core: from its nearest footprint tile
+    void nearby_tiles(int a, int r2, std::vector<int>& out) const;  // tile indices, row-major
+    // kind 0: entities, 1: buildings, 2: units; ids in the official order
+    void nearby_ids(int a, int r2, int kind, std::vector<int>& out) const;
+    bool visible_building(int a, int b) const;                     // enemy mines are hidden
+    int  tile_building(int a, int x, int y) const;                  // entity index or -1, as seen by a
+    bool tile_empty(int a, int x, int y) const;
+    bool tile_passable(int a, int x, int y) const;
 
     // ---- internals (public for the verifier)
     int create(int type, int team, int x, int y, int dir);

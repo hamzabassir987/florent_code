@@ -193,16 +193,65 @@ std::vector<int> Game::turn_order() const {
 }
 
 // ------------------------------------------------------------------ vision
-bool Game::in_vision(int a, int x, int y) const {
+int Game::dist2_from(int a, int x, int y) const {
     const Entity& e = ents[a];
-    int r2 = VISION[e.type];
     if (e.type == CORE) {  // from the nearest footprint tile
         int dx = x < e.x ? e.x - x : (x > e.x + 1 ? x - e.x - 1 : 0);
         int dy = y < e.y ? e.y - y : (y > e.y + 1 ? y - e.y - 1 : 0);
-        return dx * dx + dy * dy <= r2;
+        return dx * dx + dy * dy;
     }
     int dx = x - e.x, dy = y - e.y;
-    return dx * dx + dy * dy <= r2;
+    return dx * dx + dy * dy;
+}
+
+bool Game::in_vision(int a, int x, int y) const { return dist2_from(a, x, y) <= VISION[ents[a].type]; }
+
+void Game::nearby_tiles(int a, int r2, std::vector<int>& out) const {
+    out.clear();
+    int v = VISION[ents[a].type];
+    if (r2 < 0 || r2 > v) r2 = v;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (dist2_from(a, x, y) <= r2) out.push_back(idx(x, y));
+}
+
+bool Game::visible_building(int a, int b) const {
+    return !(ents[b].type == MINE && ents[b].team != ents[a].team);
+}
+
+int Game::tile_building(int a, int x, int y) const {
+    int b = bld[idx(x, y)];
+    return (b >= 0 && visible_building(a, b)) ? b : -1;
+}
+
+bool Game::tile_empty(int a, int x, int y) const {
+    int e = env[idx(x, y)];
+    return e != WALL && e != VOID && tile_building(a, x, y) < 0;
+}
+
+bool Game::tile_passable(int a, int x, int y) const {
+    int e = env[idx(x, y)];
+    if (e == WALL || e == VOID || bot[idx(x, y)] >= 0) return false;
+    int b = tile_building(a, x, y);
+    return b < 0 || is_walkable(ents[b].type);
+}
+
+void Game::nearby_ids(int a, int r2, int kind, std::vector<int>& out) const {
+    out.clear();
+    std::vector<int> tiles;
+    nearby_tiles(a, r2, tiles);
+    std::vector<char> seen_core(2, 0);
+    for (int t : tiles) {
+        int x = t % W, y = t / W;
+        int b = tile_building(a, x, y), u = bot[t];
+        if (b >= 0) {
+            bool core = ents[b].type == CORE;
+            bool dup = core && seen_core[ents[b].team];
+            if (core) seen_core[ents[b].team] = 1;
+            if (!dup && (kind == 0 || kind == 1 || (kind == 2 && is_unit(ents[b].type)))) out.push_back(ents[b].id);
+        }
+        if (u >= 0 && (kind == 0 || kind == 2)) out.push_back(ents[u].id);
+    }
 }
 
 // ------------------------------------------------------------------ helpers

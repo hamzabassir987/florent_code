@@ -53,6 +53,22 @@ int fe_can_convert(Game* g, int c, int amount) { return g->can_convert(c, amount
 int fe_can_fire(Game* g, int a, int x, int y) { return g->can_fire(a, x, y); }
 int fe_can_rotate(Game* g, int a, int d) { return g->can_rotate(a, d); }
 int fe_can_launch(Game* g, int a, int bx, int by, int tx, int ty) { return g->can_launch(a, bx, by, tx, ty); }
+int fe_vis_tiles(Game* g, int a, int r2, int* out, int max) {
+    std::vector<int> v; g->nearby_tiles(a, r2, v); int n = 0;
+    for (int t : v) { if (n >= max) break; out[2 * n] = t % g->W; out[2 * n + 1] = t / g->W; n++; }
+    return n;
+}
+int fe_vis_ids(Game* g, int a, int r2, int kind, int* out, int max) {
+    std::vector<int> v; g->nearby_ids(a, r2, kind, v); int n = 0;
+    for (int id : v) { if (n >= max) break; out[n++] = id; }
+    return n;
+}
+// empty, passable, building id (-1), bot id (-1), env
+void fe_vis_tile(Game* g, int a, int x, int y, int* o) {
+    int b = g->tile_building(a, x, y), u = g->bot[g->idx(x, y)];
+    o[0] = g->tile_empty(a, x, y); o[1] = g->tile_passable(a, x, y);
+    o[2] = b >= 0 ? g->ents[b].id : -1; o[3] = u >= 0 ? g->ents[u].id : -1; o[4] = g->env[g->idx(x, y)];
+}
 int fe_write_store(Game* g, int t, int i, long long v) { return g->write_store(t, i, v); }
 void fe_end_round(Game* g) { g->end_round(); }
 int fe_last_moves(Game* g, int* out, int max) {
