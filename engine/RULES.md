@@ -45,7 +45,12 @@ known seeds): **zero differences** in
   writes become visible, round + 1.
 - A destroyed core decides the game; the round still plays out. After round
   1000: titanium delivered, then harvesters alive, then titanium stored, then
-  a coin flip.
+  a coin flip: `gen::<bool>()` on the distribution generator (top bit of its
+  next `next_u32`), true = team A (24/24 seeds checked).
+- The map's "economy" game-mode flag has no effect on the rules (identical
+  games with and without it).
+- At most 50 units per team (core, builders, turrets): spawns and unit
+  builds are refused at the cap (checked holding the cap for 600 rounds).
 
 ## Costs
 
@@ -78,7 +83,10 @@ known seeds): **zero differences** in
   enemy core.
 - Launcher: throws a builder from one of its 8 neighbours to a tile within
   distance² 26 that is not wall or void; cooldown 1.
-- Mine: the first enemy builder arriving on it takes 40, the mine is gone.
+- Mine: the first enemy builder arriving on it (walking, thrown, or spawned
+  by its core onto it) takes 40 and the mine is gone. To the enemy the tile
+  looks empty and passable and the mine is not listed, but the enemy still
+  cannot build on that tile.
 
 ## Resources (exact official algorithm)
 

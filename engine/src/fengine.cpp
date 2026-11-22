@@ -729,9 +729,8 @@ void Game::end_round() {
         else if (a1 != b1) { winner = a1 > b1 ? 0 : 1; win_condition = "harvesters"; }
         else if (a2 != b2) { winner = a2 > b2 ? 0 : 1; win_condition = "titanium_stored"; }
         else {
-            // NOTE: the official coin flip's random source is not verified (never seen in replays)
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            winner = int(rng & 1); win_condition = "coinflip";
+            // official: rng.gen::<bool>() on the distribution generator (top bit of next_u32), true = A
+            winner = (rng_dist.next_u32() >> 31) ? 0 : 1; win_condition = "coinflip";
         }
     }
     if (winner >= 0) over = true;
