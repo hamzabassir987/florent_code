@@ -215,6 +215,14 @@ class Verifier:
             rmoves = set((a[0], a[1], b[0], b[1]) for a, b, _ in (dist or []))
             self.stats["moves"] += len(rmoves)
             self.stats["moves mismatched"] += len(rmoves ^ emoves)
+            if rmoves ^ emoves:
+                def lab(m):
+                    a, b = (m[0], m[1]), (m[2], m[3])
+                    ka = kind.get(at.get(a)); kb = kind.get(at.get(b))
+                    da = self.ent(idmap[at[a]])[8] if a in at and at[a] in idmap else None
+                    db = self.ent(idmap[at[b]])[8] if b in at and at[b] in idmap else None
+                    return f"{a}{ka}{DIRS[da] if da is not None and ka in ('conveyor','splitter') else ''}->{b}{kb}{DIRS[db] if db is not None and kb in ('conveyor','splitter') else ''}"
+                self.note("move diff", (t, "replay only:", [lab(m) for m in rmoves - emoves], "engine only:", [lab(m) for m in emoves - rmoves]))
             # ground truth stored, harvester timing, side history
             SIDE = {(0, -1): 0, (1, 0): 1, (0, 1): 2, (-1, 0): 3}
             for a, b, rid in (dist or []):
