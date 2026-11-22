@@ -282,6 +282,8 @@ int Game::can_build(int a, int type, int x, int y, int dir) const {
     int en = env[idx(x, y)];
     if (en == WALL || en == VOID) return E_BLOCKED;
     if (bld[idx(x, y)] >= 0) return E_BLOCKED;
+    // official: only a conveyor or splitter may be built under a builder bot
+    if (bot[idx(x, y)] >= 0 && type != CONVEYOR && type != SPLITTER) return E_BLOCKED;
     if (type == HARVESTER && en != ORE_TI && en != ORE_VO) return E_NOT_ORE;
     if (type == CONVEYOR || type == SPLITTER) { if (!cardinal(dir)) return E_BAD_DIR; }
     else if (type == GUNNER || type == SENTINEL) { if (dir == C || dir > NW) return E_BAD_DIR; }
@@ -307,29 +309,45 @@ int Game::build(int a, int type, int x, int y, int dir) {
     return OK;
 }
 
-int Game::attack(int a, int x, int y) {
+int Game::can_attack(int a, int x, int y) const {
     int r = builder_can_act(*this, a);
     if (r) return r;
-    Entity& e = ents[a];
+    const Entity& e = ents[a];
     if (!inb(x, y) || !orth_adjacent(e, x, y)) return E_RANGE;
-    int b = bld[idx(x, y)];   // measured: attacking an empty tile is legal (and still costs 2 Ti)
+    if (bld[idx(x, y)] < 0) return E_NO_TARGET;   // official can_fire: needs a building
     if (teams[e.team].ti < 2) return E_FUNDS;
-    teams[e.team].ti -= 2;
-    e.acd = 1; e.acted = true;
-    if (b >= 0) damage(b, 2);
     return OK;
 }
 
-int Game::heal(int a, int x, int y) {
-    int r = builder_can_act(*this, a);
+int Game::attack(int a, int x, int y) {
+    int r = can_attack(a, x, y);
     if (r) return r;
     Entity& e = ents[a];
+    int b = bld[idx(x, y)];
+    teams[e.team].ti -= 2;
+    e.acd = 1; e.acted = true;
+    damage(b, 2);
+    return OK;
+}
+
+int Game::can_heal(int a, int x, int y) const {
+    int r = builder_can_act(*this, a);
+    if (r) return r;
+    const Entity& e = ents[a];
     if (!inb(x, y) || !orth_adjacent(e, x, y)) return E_RANGE;
     int b = bld[idx(x, y)], u = bot[idx(x, y)];
     bool any = (b >= 0 && ents[b].team == e.team && ents[b].hp < ents[b].max_hp) ||
                (u >= 0 && ents[u].team == e.team && ents[u].hp < ents[u].max_hp);
     if (!any) return E_NO_TARGET;
     if (teams[e.team].ti < 1) return E_FUNDS;
+    return OK;
+}
+
+int Game::heal(int a, int x, int y) {
+    int r = can_heal(a, x, y);
+    if (r) return r;
+    Entity& e = ents[a];
+    int b = bld[idx(x, y)], u = bot[idx(x, y)];
     teams[e.team].ti -= 1;
     e.acd = 1; e.acted = true;
     for (int t : {b, u})
@@ -337,14 +355,21 @@ int Game::heal(int a, int x, int y) {
     return OK;
 }
 
-int Game::destroy(int a, int x, int y) {
-    if (a < 0 || !ents[a].alive) return E_DEAD;
+int Game::can_destroy(int a, int x, int y) const {
+    if (a < 0 || a >= int(ents.size()) || !ents[a].alive) return E_DEAD;
+    if (over) return E_GAME_OVER;
     const Entity& e = ents[a];
     if (e.type != BUILDER) return E_WRONG_TYPE;
     if (!inb(x, y) || !orth_adjacent(e, x, y)) return E_RANGE;
     int b = bld[idx(x, y)];
     if (b < 0 || ents[b].team != e.team || ents[b].type == CORE) return E_NO_TARGET;
-    kill(b);
+    return OK;
+}
+
+int Game::destroy(int a, int x, int y) {
+    int r = can_destroy(a, x, y);
+    if (r) return r;
+    kill(bld[idx(x, y)]);
     return OK;
 }
 
@@ -381,12 +406,20 @@ int Game::spawn(int c, int x, int y) {
     return OK;
 }
 
-int Game::convert_ammo(int c, int amount) {
-    if (c < 0 || !ents[c].alive) return E_DEAD;
+int Game::can_convert(int c, int amount) const {
+    if (c < 0 || c >= int(ents.size()) || !ents[c].alive) return E_DEAD;
+    if (over) return E_GAME_OVER;
     if (ents[c].type != CORE) return E_WRONG_TYPE;
-    Team& t = teams[ents[c].team];
+    const Team& t = teams[ents[c].team];
     if (t.converted) return E_ONCE_PER_TURN;
     if (amount <= 0 || amount > t.vo) return E_FUNDS;
+    return OK;
+}
+
+int Game::convert_ammo(int c, int amount) {
+    int r = can_convert(c, amount);
+    if (r) return r;
+    Team& t = teams[ents[c].team];
     t.vo -= amount; t.ammo += 2 * amount; t.converted = true;
     return OK;
 }
@@ -465,13 +498,21 @@ int Game::fire(int a, int x, int y) {
     return OK;
 }
 
-int Game::rotate(int a, int dir) {
-    if (a < 0 || !ents[a].alive) return E_DEAD;
-    Entity& e = ents[a];
+int Game::can_rotate(int a, int dir) const {
+    if (a < 0 || a >= int(ents.size()) || !ents[a].alive) return E_DEAD;
+    if (over) return E_GAME_OVER;
+    const Entity& e = ents[a];
     if (e.type != GUNNER) return E_WRONG_TYPE;
     if (e.acd > 0) return E_COOLDOWN;
-    if (dir == C || dir > NW) return E_BAD_DIR;
+    if (dir == C || dir > NW || dir == e.dir) return E_BAD_DIR;   // must be a different compass direction
     if (teams[e.team].ti < 10) return E_FUNDS;
+    return OK;
+}
+
+int Game::rotate(int a, int dir) {
+    int r = can_rotate(a, dir);
+    if (r) return r;
+    Entity& e = ents[a];
     teams[e.team].ti -= 10;
     e.dir = uint8_t(dir); e.acd = 1;
     return OK;
@@ -490,7 +531,7 @@ int Game::can_launch(int a, int bx, int by, int tx, int ty) const {
     if (dx * dx + dy * dy > 26) return E_RANGE;
     if (bot[idx(tx, ty)] >= 0) return E_BLOCKED;
     int en = env[idx(tx, ty)];
-    if (en == WALL) return E_BLOCKED;
+    if (en == WALL || en == VOID) return E_BLOCKED;   // official: never aimed at a void tile
     int b = bld[idx(tx, ty)];
     if (b >= 0 && !is_walkable(ents[b].type)) return E_BLOCKED;
     return OK;

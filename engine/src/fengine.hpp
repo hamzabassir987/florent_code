@@ -122,6 +122,11 @@ public:
     int can_fire(int a, int x, int y) const;
     int can_spawn(int core, int x, int y) const;
     int can_launch(int a, int bx, int by, int tx, int ty) const;
+    int can_attack(int a, int x, int y) const;
+    int can_heal(int a, int x, int y) const;
+    int can_destroy(int a, int x, int y) const;
+    int can_rotate(int a, int dir) const;
+    int can_convert(int core, int amount) const;
 
     // attack pattern of a turret placed at (x,y) facing dir
     void attack_tiles(int type, int x, int y, int dir, std::vector<std::pair<int,int>>& out) const;

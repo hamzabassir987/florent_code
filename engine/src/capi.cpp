@@ -42,6 +42,16 @@ int fe_convert_ammo(Game* g, int c, int amount) { return g->convert_ammo(c, amou
 int fe_fire(Game* g, int a, int x, int y) { return g->fire(a, x, y); }
 int fe_rotate(Game* g, int a, int d) { return g->rotate(a, d); }
 int fe_launch(Game* g, int a, int bx, int by, int tx, int ty) { return g->launch(a, bx, by, tx, ty); }
+int fe_can_move(Game* g, int a, int d) { return g->can_move(a, d); }
+int fe_can_build(Game* g, int a, int t, int x, int y, int d) { return g->can_build(a, t, x, y, d); }
+int fe_can_attack(Game* g, int a, int x, int y) { return g->can_attack(a, x, y); }
+int fe_can_heal(Game* g, int a, int x, int y) { return g->can_heal(a, x, y); }
+int fe_can_destroy(Game* g, int a, int x, int y) { return g->can_destroy(a, x, y); }
+int fe_can_spawn(Game* g, int c, int x, int y) { return g->can_spawn(c, x, y); }
+int fe_can_convert(Game* g, int c, int amount) { return g->can_convert(c, amount); }
+int fe_can_fire(Game* g, int a, int x, int y) { return g->can_fire(a, x, y); }
+int fe_can_rotate(Game* g, int a, int d) { return g->can_rotate(a, d); }
+int fe_can_launch(Game* g, int a, int bx, int by, int tx, int ty) { return g->can_launch(a, bx, by, tx, ty); }
 int fe_write_store(Game* g, int t, int i, long long v) { return g->write_store(t, i, v); }
 void fe_end_round(Game* g) { g->end_round(); }
 int fe_last_moves(Game* g, int* out, int max) {

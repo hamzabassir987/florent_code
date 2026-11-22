@@ -36,6 +36,8 @@ def lib():
                "fe_n_entities", "fe_find", "fe_entity", "fe_team", "fe_building_at", "fe_bot_at",
                "fe_move", "fe_build", "fe_attack", "fe_heal", "fe_destroy", "fe_self_destruct", "fe_spawn",
                "fe_convert_ammo", "fe_fire", "fe_rotate", "fe_launch", "fe_end_round", "fe_last_moves",
+               "fe_can_move", "fe_can_build", "fe_can_attack", "fe_can_heal", "fe_can_destroy", "fe_can_spawn",
+               "fe_can_convert", "fe_can_fire", "fe_can_rotate", "fe_can_launch",
                "fe_dbg_set_stored", "fe_dbg_set_hcd", "fe_dbg_set_sides", "fe_dbg_set_team", "fe_dbg_set_hp", "fe_dbg_kill", "fe_dbg_set_last_out"):
         getattr(L, fn).argtypes = None
     return L
@@ -111,7 +113,7 @@ class Verifier:
         self.fresh = []
 
         for t, turn in enumerate(r.turns):
-            ev = [u for u in turn if u[0] not in ("output", "line", "dot")]
+            ev = [u for u in turn if u[0] not in ("line", "dot") and (u[0] != "output" or (u[4] and "Q " in u[4]))]
             players = None
             dist = None
             i = 0
@@ -198,6 +200,8 @@ class Verifier:
                     if p and at.get(p) == rid:
                         at.pop(p); stored.pop(p, None)
                     hp.pop(rid, None)
+                elif k == "output" and u[4] and "Q " in u[4]:
+                    self.queries(u[1], u[4], idmap, t)
                 elif k == "distribute":
                     dist = u[1]
                 elif k == "players":
@@ -294,6 +298,44 @@ class Verifier:
                     pass
         L.fe_free(g)
         return self
+
+    QDIR = {"CENTRE": 0, "NORTH": 1, "NORTHEAST": 2, "EAST": 3, "SOUTHEAST": 4, "SOUTH": 5,
+            "SOUTHWEST": 6, "WEST": 7, "NORTHWEST": 8, "-": 0}
+    QTYPE = {"BUILDER_BOT": 0, "CORE": 1, "GUNNER": 2, "SENTINEL": 3, "LAUNCHER": 4, "SPIKE": 5,
+             "CONVEYOR": 6, "SPLITTER": 7, "HARVESTER": 8, "BARRIER": 9, "MINE": 10}
+
+    def queries(self, uid, text, idmap, t):
+        """Ask the engine every legality question the official engine answered."""
+        L, g = self.L, self.g
+        a = idmap.get(uid)
+        if a is None:
+            return
+        D, T = self.QDIR, self.QTYPE
+        for line in text.splitlines():
+            if not line.startswith("Q "):
+                continue
+            parts = line.split()
+            name, args, want = parts[1], parts[2:-2], parts[-1] == "1"
+            n = [int(x) for x in args if x.lstrip("-").isdigit()]
+            if name == "move": rc = L.fe_can_move(g, a, D[args[0]])
+            elif name == "build": rc = L.fe_can_build(g, a, T[args[0]], n[0], n[1], D[args[3]])
+            elif name == "heal": rc = L.fe_can_heal(g, a, n[0], n[1])
+            elif name == "destroy": rc = L.fe_can_destroy(g, a, n[0], n[1])
+            elif name == "attack": rc = L.fe_can_attack(g, a, n[0], n[1])
+            elif name == "spawn": rc = L.fe_can_spawn(g, a, n[0], n[1])
+            elif name == "convert": rc = L.fe_can_convert(g, a, n[0])
+            elif name == "fire": rc = L.fe_can_fire(g, a, n[0], n[1])
+            elif name == "rotate": rc = L.fe_can_rotate(g, a, D[args[0]])
+            elif name == "launch": rc = L.fe_can_launch(g, a, n[0], n[1], n[2], n[3])
+            else: continue
+            got = rc == 0
+            key = name + (" " + args[0] if name == "build" else "")
+            if got == want:
+                self.stats["legality ok"] += 1
+            else:
+                e = self.ent(a)
+                self.note(f"LEGALITY {key}: official {int(want)} engine {int(got)} ({ERR[rc] if 0 <= rc < len(ERR) else rc})",
+                          (t, line, "unit at", tuple(e[3:5]), "acd", e[9], "mcd", e[10]))
 
     def adopt(self, e, idmap, kind, teamof, hp, pos, at, engine_new=True):
         n = self.L.fe_n_entities(self.g)
