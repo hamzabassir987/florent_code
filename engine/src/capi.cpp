@@ -1,0 +1,59 @@
+// Plain C interface over fe::Game, for ctypes (verifier) and other languages.
+#include "fengine.hpp"
+using fe::Game;
+extern "C" {
+Game* fe_new() { return new Game(); }
+void fe_free(Game* g) { delete g; }
+int fe_load_map(Game* g, const char* path) { return g->load_map(path) ? 1 : 0; }
+void fe_reset(Game* g, unsigned long long seed) { g->reset(seed); }
+int fe_width(Game* g) { return g->W; }
+int fe_height(Game* g) { return g->H; }
+int fe_round(Game* g) { return g->round; }
+int fe_winner(Game* g) { return g->winner; }
+int fe_n_entities(Game* g) { return int(g->ents.size()); }
+int fe_find(Game* g, int id) { return g->find(id); }
+// id,type,team,x,y,hp,max_hp,alive,dir,acd,mcd,stored,res
+void fe_entity(Game* g, int i, int* o) {
+    const fe::Entity& e = g->ents[i];
+    int v[13] = {e.id, e.type, e.team, e.x, e.y, e.hp, e.max_hp, e.alive, e.dir, e.acd, e.mcd, e.stored, e.res};
+    for (int k = 0; k < 13; k++) o[k] = v[k];
+}
+// ti,vo,ammo,ti_collected,vo_collected,scale,units,core_index
+void fe_team(Game* g, int t, int* o) {
+    const fe::Team& m = g->teams[t];
+    int v[8] = {m.ti, m.vo, m.ammo, m.ti_collected, m.vo_collected, m.scale, m.units, m.core};
+    for (int k = 0; k < 8; k++) o[k] = v[k];
+}
+int fe_building_at(Game* g, int x, int y) { return g->inb(x, y) ? g->bld[g->idx(x, y)] : -1; }
+int fe_bot_at(Game* g, int x, int y) { return g->inb(x, y) ? g->bot[g->idx(x, y)] : -1; }
+int fe_turn_order(Game* g, int* out, int max) {
+    auto v = g->turn_order(); int n = 0;
+    for (int i : v) { if (n >= max) break; out[n++] = i; }
+    return n;
+}
+int fe_move(Game* g, int a, int d) { return g->move(a, d); }
+int fe_build(Game* g, int a, int t, int x, int y, int d) { return g->build(a, t, x, y, d); }
+int fe_attack(Game* g, int a, int x, int y) { return g->attack(a, x, y); }
+int fe_heal(Game* g, int a, int x, int y) { return g->heal(a, x, y); }
+int fe_destroy(Game* g, int a, int x, int y) { return g->destroy(a, x, y); }
+int fe_self_destruct(Game* g, int a) { return g->self_destruct(a); }
+int fe_spawn(Game* g, int c, int x, int y) { return g->spawn(c, x, y); }
+int fe_convert_ammo(Game* g, int c, int amount) { return g->convert_ammo(c, amount); }
+int fe_fire(Game* g, int a, int x, int y) { return g->fire(a, x, y); }
+int fe_rotate(Game* g, int a, int d) { return g->rotate(a, d); }
+int fe_launch(Game* g, int a, int bx, int by, int tx, int ty) { return g->launch(a, bx, by, tx, ty); }
+int fe_write_store(Game* g, int t, int i, long long v) { return g->write_store(t, i, v); }
+void fe_end_round(Game* g) { g->end_round(); }
+int fe_last_moves(Game* g, int* out, int max) {
+    int n = 0;
+    for (auto& m : g->last_moves) { if (n >= max) break; int* o = out + 5 * n++; o[0] = m.fx; o[1] = m.fy; o[2] = m.tx; o[3] = m.ty; o[4] = m.res; }
+    return n;
+}
+// ---- debug hooks used by the verifier to resynchronise after a mismatch
+void fe_dbg_set_stored(Game* g, int x, int y, int res) { int b = g->bld[g->idx(x, y)]; if (b >= 0) g->ents[b].stored = (uint8_t)res; }
+void fe_dbg_set_team(Game* g, int t, int ti, int vo, int ammo) { g->teams[t].ti = ti; g->teams[t].vo = vo; g->teams[t].ammo = ammo; }
+void fe_dbg_set_hp(Game* g, int i, int hp) { g->ents[i].hp = hp; }
+void fe_dbg_kill(Game* g, int i) { g->kill(i); }
+void fe_dbg_set_sides(Game* g, int i, const int* in4, const int* out4) { for (int k = 0; k < 4; k++) { g->ents[i].in_last[k] = in4[k]; g->ents[i].out_last[k] = out4[k]; } }
+void fe_dbg_set_last_out(Game* g, int i, int r) { g->ents[i].last_out = r; }
+}
