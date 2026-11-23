@@ -29,7 +29,7 @@
 // (rl/tools/make_replay.py turns it into an official .replay26).
 //
 //   neural_train ITERATIONS OUT.pt MAP [MAP...]
-//   env: GAMES (950) ROUNDS (150) MINIBATCH (2048) VALUE_KEEP (0.1)
+//   env: GAMES (950) ROUNDS (150) N_MINI (15 minibatches a pass) VALUE_KEEP (0.1)
 //        RECORD_P (0.05: share of decisions kept for PPO; ~17 KB each) INIT (checkpoint) START_ITER (0) FROZEN (checkpoint)
 //        THREADS (all) DEVICE (cuda if available | cpu) SNAP_EVERY (400)
 //        SAVE_EVERY (10) ENTROPY_FILE (./entropy_file)
@@ -73,8 +73,8 @@ constexpr double KL_STOP = 0.03;
 constexpr double CLIP_POL = 1.0, CLIP_VAL = 1.0;    // gradient-norm clip per model
 constexpr float VALUE_COEF = 0.5f;
 constexpr float PROMOTE = 0.85f;
-constexpr int CRITIC_BATCH = 4096;                   // rows per critic forward
-constexpr int CRITIC_QUEUE = 20000;                  // queued critic rows before an early flush
+constexpr int CRITIC_BATCH = 12000;                  // rows per critic forward
+constexpr int CRITIC_QUEUE = 40000;                 // queued critic rows before an early flush
 
 // ===========================================================================
 // LOG FORMATTING
@@ -417,7 +417,7 @@ int main(int argc, char** argv) {
     Setup S;
     S.maps.assign(argv + 3, argv + argc);
     const int G = env_int("GAMES", 950), R = env_int("ROUNDS", 150);
-    const int MB = env_int("MINIBATCH", 2048);
+    const int N_MINI = env_int("N_MINI", 15);      // minibatches per pass (reference pipeline: 15)
     S.value_keep = env_float("VALUE_KEEP", 0.1f);
     S.record_p = env_float("RECORD_P", 0.05f);
     const int start_iter = env_int("START_ITER", 0);
@@ -472,7 +472,7 @@ int main(int argc, char** argv) {
         long np = 0, nv = 0;
         for (auto& t : pol_params) np += t.numel();
         for (auto& t : val_params) nv += t.numel();
-        std::cout << "train: " << S.maps.size() << " maps, " << G << " games x " << R << " rounds an iteration, minibatch " << MB
+        std::cout << "train: " << S.maps.size() << " maps, " << G << " games x " << R << " rounds an iteration, " << N_MINI << " minibatches a pass"
                   << ", device " << (dev.is_cuda() ? "cuda" : "cpu") << ", " << T << " threads\n"
                   << "train: params policy " << np << ", value " << nv << ", value rows kept " << S.value_keep
                   << ", decisions recorded " << S.record_p << "\n"
@@ -576,9 +576,36 @@ int main(int argc, char** argv) {
         std::iota(order.begin(), order.end(), 0);
         std::mt19937 shuf(uint32_t(it) * 2654435761u);
         const long D = fe::ACTOR_SPATIAL + fe::ACTOR_SCALARS;
+        // As the reference pipeline: each pass splits the rollout into N_MINI
+        // minibatches; each policy step is followed by one value step on the
+        // matching share of the kept team-rounds.
+        const size_t MB = std::max<size_t>(1, (samples.size() + N_MINI - 1) / N_MINI);
+        const size_t VB = std::max<size_t>(1, (kept.size() + N_MINI - 1) / N_MINI);
+        std::vector<int> vo(kept.size()); std::iota(vo.begin(), vo.end(), 0);
+        auto value_step = [&](size_t j) {
+            const size_t v0 = j * VB;
+            if (v0 >= vo.size()) return;
+            const long CD = fe::CRITIC_SPATIAL + fe::CRITIC_SCALARS;
+            const long n = long(std::min(vo.size(), v0 + VB) - v0);
+            auto x = torch::empty({n, CD}, torch::kFloat32);
+            float* xp = x.data_ptr<float>();
+            std::vector<float> tgt(n);
+            for (long b = 0; b < n; b++) {
+                const ValueRow& vr = kept[vo[v0 + b]];
+                critic_input(xp + b * CD, vr.sp, vr.sc);
+                tgt[b] = vr.ret;
+            }
+            auto vl = torch::mse_loss(net->value(x.to(dev)), torch::tensor(tgt).to(dev));
+            opt_val.zero_grad();
+            (VALUE_COEF * vl).backward();
+            clip_norm(val_params, CLIP_VAL, 1);
+            opt_val.step();
+            vl_sum += vl.item<double>(); v_steps++;
+        };
         for (int ep = 0; ep < EPOCHS && !kl_stop; ep++) {
             std::shuffle(order.begin(), order.end(), shuf);
-            for (size_t s0 = 0; s0 < order.size() && !kl_stop; s0 += MB) {
+            std::shuffle(vo.begin(), vo.end(), shuf);
+            for (size_t s0 = 0, j = 0; s0 < order.size() && !kl_stop; s0 += MB, j++) {
                 const size_t s1 = std::min(order.size(), s0 + MB);
                 torch::Tensor pol_loss = torch::zeros({}, dev), kl_acc = torch::zeros({}, dev);
                 std::vector<torch::Tensor> h_sum(NUM_HEAD_IDS);
@@ -649,30 +676,7 @@ int main(int argc, char** argv) {
                 opt_pol.step();
                 pl_sum += pl.item<double>(); ent_sum += ent_mean / std::max(1, present);
                 kl_sum += kl; nrec += n_here; clipped += clip_here; n_steps++;
-            }
-            // value: the kept team-rounds, one pass per epoch
-            if (!kl_stop && !kept.empty()) {
-                std::vector<int> vo(kept.size()); std::iota(vo.begin(), vo.end(), 0);
-                std::shuffle(vo.begin(), vo.end(), shuf);
-                const int VB = std::min(MB, 1024);
-                const long CD = fe::CRITIC_SPATIAL + fe::CRITIC_SCALARS;
-                for (size_t v0 = 0; v0 < vo.size(); v0 += VB) {
-                    const long n = long(std::min(vo.size(), v0 + VB) - v0);
-                    auto x = torch::empty({n, CD}, torch::kFloat32);
-                    float* xp = x.data_ptr<float>();
-                    std::vector<float> tgt(n);
-                    for (long b = 0; b < n; b++) {
-                        const ValueRow& vr = kept[vo[v0 + b]];
-                        critic_input(xp + b * CD, vr.sp, vr.sc);
-                        tgt[b] = vr.ret;
-                    }
-                    auto vl = torch::mse_loss(net->value(x.to(dev)), torch::tensor(tgt).to(dev));
-                    opt_val.zero_grad();
-                    (VALUE_COEF * vl).backward();
-                    clip_norm(val_params, CLIP_VAL, 1);
-                    opt_val.step();
-                    vl_sum += vl.item<double>(); v_steps++;
-                }
+                value_step(j);
             }
         }
         const auto t_upd = std::chrono::steady_clock::now();
