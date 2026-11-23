@@ -30,6 +30,7 @@
 //
 //   neural_train ITERATIONS OUT.pt MAP [MAP...]
 //   env: GAMES (950) ROUNDS (150) N_MINI (15 minibatches a pass) VALUE_KEEP (0.1)
+//        MICRO (512 rows per forward/backward) CRITIC_BATCH (1024 rows per critic inference)
 //        RECORD_P (0.05: share of decisions kept for PPO; ~17 KB each) INIT (checkpoint) START_ITER (0) FROZEN (checkpoint)
 //        THREADS (all) DEVICE (cuda if available | cpu) SNAP_EVERY (400)
 //        SAVE_EVERY (10) ENTROPY_FILE (./entropy_file)
@@ -73,7 +74,8 @@ constexpr double KL_STOP = 0.03;
 constexpr double CLIP_POL = 1.0, CLIP_VAL = 1.0;    // gradient-norm clip per model
 constexpr float VALUE_COEF = 0.5f;
 constexpr float PROMOTE = 0.85f;
-constexpr int CRITIC_BATCH = 12000;                  // rows per critic forward
+static int CRITIC_BATCH = 1024;                      // rows per critic inference forward (env CRITIC_BATCH)
+static int MICRO = 512;                              // rows per forward/backward when training (env MICRO)
 constexpr int CRITIC_QUEUE = 40000;                 // queued critic rows before an early flush
 
 // ===========================================================================
@@ -252,6 +254,31 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
     }
 }
 
+// Compact uploads: the critic's one-hot board as uint8, its scalars as int32;
+// the float conversion happens on the device (Teacher::value_split).
+static void critic_upload(const std::vector<const std::vector<uint8_t>*>& sps, const std::vector<const std::vector<int32_t>*>& scs,
+                          torch::Device dev, torch::Tensor& tsp, torch::Tensor& tsc) {
+    const long n = long(sps.size());
+    tsp = torch::empty({n, fe::CRITIC_SPATIAL}, torch::kUInt8);
+    tsc = torch::empty({n, fe::CRITIC_SCALARS}, torch::kInt32);
+    uint8_t* a = tsp.data_ptr<uint8_t>(); int32_t* b = tsc.data_ptr<int32_t>();
+    for (long i = 0; i < n; i++) {
+        std::memcpy(a + i * fe::CRITIC_SPATIAL, sps[i]->data(), fe::CRITIC_SPATIAL);
+        std::memcpy(b + i * fe::CRITIC_SCALARS, scs[i]->data(), sizeof(int32_t) * fe::CRITIC_SCALARS);
+    }
+    tsp = tsp.to(dev); tsc = tsc.to(dev);
+}
+// The actor's input as stored and as played: spatial clamped to 0..255 (uint8),
+// scalars to int16. The rollout plays on exactly what PPO later trains on.
+static void actor_compact(const std::vector<float>& obs, uint8_t* sp, int16_t* sc, long& oob) {
+    for (int i = 0; i < fe::ACTOR_SPATIAL; i++) {
+        float v = obs[i];
+        if (v < 0 || v > 255) { oob++; v = std::clamp(v, 0.f, 255.f); }
+        sp[i] = uint8_t(v);
+    }
+    for (int i = 0; i < fe::ACTOR_SCALARS; i++) sc[i] = int16_t(std::clamp(obs[fe::ACTOR_SPATIAL + i], -32768.f, 32767.f));
+}
+
 static int sample_masked(const float* l, const std::vector<uint8_t>& mask, std::mt19937_64& rng, float& lp) {
     double mx = -1e30;
     for (size_t i = 0; i < mask.size(); i++) if (mask[i]) mx = std::max(mx, double(l[i]));
@@ -283,12 +310,8 @@ static void play_decision(Slot& s, const Setup& S, bool train) {
         smp.policy = s.policy; smp.team = m.game.ents[a].team;
         smp.seg = int(s.segs.size()) - 1; smp.rnd = int(s.segs.back().rounds.size()) - 1;
         smp.sp.resize(fe::ACTOR_SPATIAL);
-        for (int i = 0; i < fe::ACTOR_SPATIAL; i++) {
-            float v = s.obs[i];
-            if (v < 0 || v > 255) { s.oob++; v = std::clamp(v, 0.f, 255.f); }
-            smp.sp[i] = uint8_t(v);
-        }
-        for (int i = 0; i < fe::ACTOR_SCALARS; i++) smp.sc[i] = int16_t(std::clamp(s.obs[fe::ACTOR_SPATIAL + i], -32768.f, 32767.f));
+        long dummy = 0;
+        actor_compact(s.obs, smp.sp.data(), smp.sc.data(), dummy);
         for (auto& hr : d.records) smp.recs.push_back({hr.head, hr.choice, hr.mask, hr.logp});
         s.samples.push_back(std::move(smp));
     }
@@ -300,25 +323,19 @@ struct PlayStats { long steps = 0; double t_encode = 0, t_forward = 0, t_act = 0
 // Kept value rows (for the value loss): the critic input and the return.
 struct ValueRow { std::vector<uint8_t> sp; std::vector<int32_t> sc; float ret = 0; int slot, seg, rnd; };
 
-static void critic_input(float* r, const std::vector<uint8_t>& sp, const std::vector<int32_t>& sc) {
-    for (int j = 0; j < fe::CRITIC_SPATIAL; j++) r[j] = sp[j];
-    for (int j = 0; j < fe::CRITIC_SCALARS; j++) r[fe::CRITIC_SPATIAL + j] = float(sc[j]);
-}
-
 // Evaluate every queued critic row and write the values back; rows marked to
 // keep move to `kept`.
 static void flush_critic(std::vector<Slot>& slots, Teacher& net, torch::Device dev, std::vector<ValueRow>& kept, PlayStats& st) {
     auto c0 = std::chrono::steady_clock::now();
     std::vector<std::pair<int, CriticRow*>> all;
     for (int i = 0; i < int(slots.size()); i++) for (auto& cr : slots[i].crit) all.push_back({i, &cr});
-    torch::NoGradGuard ng;
-    const long CD = fe::CRITIC_SPATIAL + fe::CRITIC_SCALARS;
+    c10::InferenceMode im;
     for (size_t lo = 0; lo < all.size(); lo += CRITIC_BATCH) {
         const size_t hi = std::min(all.size(), lo + CRITIC_BATCH);
-        auto x = torch::empty({long(hi - lo), CD}, torch::kFloat32);
-        float* xp = x.data_ptr<float>();
-        for (size_t k = lo; k < hi; k++) critic_input(xp + (k - lo) * CD, all[k].second->sp, all[k].second->sc);
-        auto v = net->value(x.to(dev)).to(torch::kCPU).contiguous();
+        std::vector<const std::vector<uint8_t>*> sps; std::vector<const std::vector<int32_t>*> scs;
+        for (size_t k = lo; k < hi; k++) { sps.push_back(&all[k].second->sp); scs.push_back(&all[k].second->sc); }
+        torch::Tensor tsp, tsc; critic_upload(sps, scs, dev, tsp, tsc);
+        auto v = net->value_split(tsp, tsc).to(torch::kCPU).contiguous();
         const float* vp = v.data_ptr<float>();
         for (size_t k = lo; k < hi; k++) {
             CriticRow& cr = *all[k].second;
@@ -345,8 +362,7 @@ static PlayStats play(std::vector<Slot>& slots, const Setup& S, const std::vecto
     PlayStats st;
     const int G = int(slots.size());
     for (auto& s : slots) { s.paused = false; s.played = 0; }
-    torch::NoGradGuard ng;
-    const long D = fe::ACTOR_SPATIAL + fe::ACTOR_SCALARS;
+    c10::InferenceMode im;
     for (;;) {
         auto t0 = clk::now();
         #pragma omp parallel for schedule(static, 1)
@@ -365,10 +381,12 @@ static PlayStats play(std::vector<Slot>& slots, const Setup& S, const std::vecto
                 if (idx.empty()) continue;
                 any = true;
                 const long n = long(idx.size());
-                auto x = torch::empty({n, D}, torch::kFloat32);
-                float* xp = x.data_ptr<float>();
-                for (long j = 0; j < n; j++) std::memcpy(xp + j * D, slots[idx[j]].obs.data(), sizeof(float) * D);
-                auto l = (*nets[k])->logits(p, x.to(dev)).to(torch::kCPU).contiguous();
+                auto tsp = torch::empty({n, fe::ACTOR_SPATIAL}, torch::kUInt8);
+                auto tsc = torch::empty({n, fe::ACTOR_SCALARS}, torch::kInt16);
+                for (long j = 0; j < n; j++)
+                    actor_compact(slots[idx[j]].obs, tsp.data_ptr<uint8_t>() + j * fe::ACTOR_SPATIAL,
+                                  tsc.data_ptr<int16_t>() + j * fe::ACTOR_SCALARS, slots[idx[j]].oob);
+                auto l = (*nets[k])->logits_split(p, tsp.to(dev), tsc.to(dev)).to(torch::kCPU).contiguous();
                 const long L = l.size(1);
                 const float* lp = l.data_ptr<float>();
                 for (long j = 0; j < n; j++) slots[idx[j]].logits.assign(lp + j * L, lp + (j + 1) * L);
@@ -419,6 +437,8 @@ int main(int argc, char** argv) {
     S.maps.assign(argv + 3, argv + argc);
     const int G = env_int("GAMES", 950), R = env_int("ROUNDS", 150);
     const int N_MINI = env_int("N_MINI", 15);      // minibatches per pass (reference pipeline: 15)
+    MICRO = std::max(1, env_int("MICRO", 512));
+    CRITIC_BATCH = std::max(1, env_int("CRITIC_BATCH", 1024));
     S.value_keep = env_float("VALUE_KEEP", 0.1f);
     S.record_p = env_float("RECORD_P", 0.05f);
     const int start_iter = env_int("START_ITER", 0);
@@ -473,7 +493,7 @@ int main(int argc, char** argv) {
         long np = 0, nv = 0;
         for (auto& t : pol_params) np += t.numel();
         for (auto& t : val_params) nv += t.numel();
-        std::cout << "train: " << S.maps.size() << " maps, " << G << " games x " << R << " rounds an iteration, " << N_MINI << " minibatches a pass"
+        std::cout << "train: " << S.maps.size() << " maps, " << G << " games x " << R << " rounds an iteration, " << N_MINI << " minibatches a pass, micro-batch " << MICRO << ", critic batch " << CRITIC_BATCH
                   << ", device " << (dev.is_cuda() ? "cuda" : "cpu") << ", " << T << " threads\n"
                   << "train: params policy " << np << ", value " << nv << ", value rows kept " << S.value_keep
                   << ", decisions recorded " << S.record_p << "\n"
@@ -563,6 +583,13 @@ int main(int argc, char** argv) {
         const auto t_roll = std::chrono::steady_clock::now();
 
         // ---- PPO update
+        // Memory: every forward/backward runs on at most MICRO rows; the
+        // gradients of a minibatch's chunks add up before its one optimizer
+        // step (the loss is a sum over records divided by the minibatch's
+        // record count, so the step is the same as one big batch). The
+        // per-head target entropy needs each head's mean entropy over the
+        // whole minibatch, so a no-grad pass measures it (and the KL, checked
+        // before any step) first.
         net->train();
         double pl_sum = 0, vl_sum = 0, ent_sum = 0, kl_sum = 0; int n_steps = 0, v_steps = 0;
         long nrec = 0, clipped = 0;
@@ -576,107 +603,117 @@ int main(int argc, char** argv) {
         std::vector<int> order(samples.size());
         std::iota(order.begin(), order.end(), 0);
         std::mt19937 shuf(uint32_t(it) * 2654435761u);
-        const long D = fe::ACTOR_SPATIAL + fe::ACTOR_SCALARS;
         // As the reference pipeline: each pass splits the rollout into N_MINI
         // minibatches; each policy step is followed by one value step on the
         // matching share of the kept team-rounds.
         const size_t MB = std::max<size_t>(1, (samples.size() + N_MINI - 1) / N_MINI);
         const size_t VB = std::max<size_t>(1, (kept.size() + N_MINI - 1) / N_MINI);
         std::vector<int> vo(kept.size()); std::iota(vo.begin(), vo.end(), 0);
+
+        // One chunk (rows of one policy): per-head sums. With `grad`, returns
+        // the chunk's loss term (scaled by the minibatch's totals).
+        struct HeadSums { double H[NUM_HEAD_IDS] = {}; long cnt[NUM_HEAD_IDS] = {}; double surr = 0, kl = 0; long n = 0, clip = 0; };
+        auto chunk = [&](int p, const int* rows, long nr, bool grad, HeadSums& hs,
+                         long n_total, const double* h_mean, int present) -> torch::Tensor {
+            auto tsp = torch::empty({nr, fe::ACTOR_SPATIAL}, torch::kUInt8);
+            auto tsc = torch::empty({nr, fe::ACTOR_SCALARS}, torch::kInt16);
+            for (long b = 0; b < nr; b++) {
+                const Sample& sm = samples[rows[b]];
+                std::memcpy(tsp.data_ptr<uint8_t>() + b * fe::ACTOR_SPATIAL, sm.sp.data(), fe::ACTOR_SPATIAL);
+                std::memcpy(tsc.data_ptr<int16_t>() + b * fe::ACTOR_SCALARS, sm.sc.data(), sizeof(int16_t) * fe::ACTOR_SCALARS);
+            }
+            auto logits = net->logits_split(p, tsp.to(dev), tsc.to(dev));
+            torch::Tensor loss = torch::zeros({}, dev);
+            for (int head : policy_heads(p)) {
+                const int n = HEAD_SIZE[head];
+                std::vector<long> rr, ch; std::vector<uint8_t> mk; std::vector<float> olp, adv;
+                for (long b = 0; b < nr; b++)
+                    for (auto& rec : samples[rows[b]].recs)
+                        if (rec.head == head) {
+                            rr.push_back(b); ch.push_back(rec.choice);
+                            mk.insert(mk.end(), rec.mask.begin(), rec.mask.end());
+                            olp.push_back(rec.old_logp); adv.push_back(samples[rows[b]].adv);
+                        }
+                if (rr.empty()) continue;
+                const long k = long(rr.size());
+                auto hl = logits.index_select(0, torch::tensor(rr, torch::kLong).to(dev)).narrow(1, head_offset(p, head), n);
+                auto mask = torch::from_blob(mk.data(), {k, n}, torch::kUInt8).to(dev).to(torch::kBool);
+                auto lsm = torch::log_softmax(hl.masked_fill(~mask, -1e9f), 1);
+                auto new_lp = lsm.gather(1, torch::tensor(ch, torch::kLong).view({k, 1}).to(dev)).squeeze(1);
+                auto log_ratio = new_lp - torch::tensor(olp).to(dev);
+                auto A = torch::tensor(adv).to(dev);
+                auto ratio = torch::exp(log_ratio);
+                auto surr = torch::min(ratio * A, torch::clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * A).sum();
+                auto H = -(lsm.exp().masked_fill(~mask, 0.f) * lsm.masked_fill(~mask, 0.f)).sum();
+                if (grad) {
+                    // -surr / N  -  (1/present) * coef_h * H_chunk / (cnt_h * Hmean_h)
+                    loss = loss - surr / double(n_total)
+                         - H * (K.head_entropy[head] / (double(hs.cnt[head]) * (h_mean[head] + 1e-8) * std::max(1, present)));
+                } else {
+                    hs.surr += surr.item<double>();
+                    hs.kl += ((ratio - 1) - log_ratio).sum().item<double>();      // KL(old || new) estimate
+                    hs.H[head] += H.item<double>(); hs.cnt[head] += k; hs.n += k;
+                    hs.clip += ((ratio - 1).abs() > CLIP_EPS).sum().item<long>();
+                }
+            }
+            return loss;
+        };
         auto value_step = [&](size_t j) {
             const size_t v0 = j * VB;
             if (v0 >= vo.size()) return;
-            const long CD = fe::CRITIC_SPATIAL + fe::CRITIC_SCALARS;
-            const long n = long(std::min(vo.size(), v0 + VB) - v0);
-            auto x = torch::empty({n, CD}, torch::kFloat32);
-            float* xp = x.data_ptr<float>();
-            std::vector<float> tgt(n);
-            for (long b = 0; b < n; b++) {
-                const ValueRow& vr = kept[vo[v0 + b]];
-                critic_input(xp + b * CD, vr.sp, vr.sc);
-                tgt[b] = vr.ret;
-            }
-            auto vl = torch::mse_loss(net->value(x.to(dev)), torch::tensor(tgt).to(dev));
+            const size_t v1 = std::min(vo.size(), v0 + VB);
+            const double n_all = double(v1 - v0);
             opt_val.zero_grad();
-            (VALUE_COEF * vl).backward();
+            double vl_tot = 0;
+            for (size_t c0 = v0; c0 < v1; c0 += MICRO) {
+                const size_t c1 = std::min(v1, c0 + MICRO);
+                std::vector<const std::vector<uint8_t>*> sps; std::vector<const std::vector<int32_t>*> scs; std::vector<float> tgt;
+                for (size_t b = c0; b < c1; b++) { const ValueRow& vr = kept[vo[b]]; sps.push_back(&vr.sp); scs.push_back(&vr.sc); tgt.push_back(vr.ret); }
+                torch::Tensor tsp, tsc; critic_upload(sps, scs, dev, tsp, tsc);
+                auto se = (net->value_split(tsp, tsc) - torch::tensor(tgt).to(dev)).pow(2).sum();
+                (VALUE_COEF * se / n_all).backward();                          // chunk share of the mean
+                vl_tot += se.item<double>();
+            }
             clip_norm(val_params, CLIP_VAL, 1);
             opt_val.step();
-            vl_sum += vl.item<double>(); v_steps++;
+            vl_sum += vl_tot / n_all; v_steps++;
         };
         for (int ep = 0; ep < EPOCHS && !kl_stop; ep++) {
             std::shuffle(order.begin(), order.end(), shuf);
             std::shuffle(vo.begin(), vo.end(), shuf);
             for (size_t s0 = 0, j = 0; s0 < order.size() && !kl_stop; s0 += MB, j++) {
                 const size_t s1 = std::min(order.size(), s0 + MB);
-                torch::Tensor pol_loss = torch::zeros({}, dev), kl_acc = torch::zeros({}, dev);
-                std::vector<torch::Tensor> h_sum(NUM_HEAD_IDS);
-                std::vector<long> h_cnt(NUM_HEAD_IDS, 0);
-                long n_here = 0, clip_here = 0;
-                for (int p = 0; p < NUM_POLICIES; p++) {
-                    std::vector<int> idx;
-                    for (size_t k = s0; k < s1; k++) if (samples[order[k]].policy == p) idx.push_back(order[k]);
-                    if (idx.empty()) continue;
-                    auto x = torch::empty({(long)idx.size(), D}, torch::kFloat32);
-                    float* xp = x.data_ptr<float>();
-                    for (size_t b = 0; b < idx.size(); b++) {
-                        const Sample& sm = samples[idx[b]];
-                        float* r = xp + b * D;
-                        for (int j = 0; j < fe::ACTOR_SPATIAL; j++) r[j] = sm.sp[j];
-                        for (int j = 0; j < fe::ACTOR_SCALARS; j++) r[fe::ACTOR_SPATIAL + j] = sm.sc[j];
-                    }
-                    auto logits = net->logits(p, x.to(dev));
-                    for (int head : policy_heads(p)) {
-                        const int n = HEAD_SIZE[head];
-                        std::vector<long> rr, ch; std::vector<uint8_t> mk; std::vector<float> olp, adv;
-                        for (size_t b = 0; b < idx.size(); b++)
-                            for (auto& rec : samples[idx[b]].recs)
-                                if (rec.head == head) {
-                                    rr.push_back(long(b)); ch.push_back(rec.choice);
-                                    mk.insert(mk.end(), rec.mask.begin(), rec.mask.end());
-                                    olp.push_back(rec.old_logp); adv.push_back(samples[idx[b]].adv);
-                                }
-                        if (rr.empty()) continue;
-                        const long k = long(rr.size());
-                        auto hl = logits.index_select(0, torch::tensor(rr, torch::kLong).to(dev)).narrow(1, head_offset(p, head), n);
-                        auto mask = torch::from_blob(mk.data(), {k, n}, torch::kUInt8).clone().to(torch::kBool).to(dev);
-                        auto lsm = torch::log_softmax(hl.masked_fill(~mask, -1e9f), 1);
-                        auto new_lp = lsm.gather(1, torch::tensor(ch, torch::kLong).view({k, 1}).to(dev)).squeeze(1);
-                        auto log_ratio = new_lp - torch::tensor(olp).to(dev);
-                        auto A = torch::tensor(adv).to(dev);
-                        auto ratio = torch::exp(log_ratio);
-                        auto surr = torch::min(ratio * A, torch::clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * A);
-                        pol_loss = pol_loss - surr.sum();
-                        kl_acc = kl_acc + ((ratio - 1) - log_ratio).detach().sum();   // KL(old || new) estimate
-                        auto probs = lsm.exp().masked_fill(~mask, 0.f);
-                        auto H = -(probs * lsm.masked_fill(~mask, 0.f)).sum();       // summed over this head's records
-                        h_sum[head] = h_sum[head].defined() ? h_sum[head] + H : H;
-                        h_cnt[head] += k;
-                        n_here += k;
-                        clip_here += ((ratio - 1).abs() > CLIP_EPS).sum().item<long>();
-                    }
+                std::vector<int> by_pol[NUM_POLICIES];
+                for (size_t k = s0; k < s1; k++) by_pol[samples[order[k]].policy].push_back(order[k]);
+                // pass 1 (no grad): entropy per head, KL, clipping, surrogate
+                HeadSums hs;
+                {
+                    torch::NoGradGuard ng;
+                    for (int p = 0; p < NUM_POLICIES; p++)
+                        for (size_t c = 0; c < by_pol[p].size(); c += MICRO)
+                            chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), false, hs, 0, nullptr, 0);
                 }
-                if (!n_here) continue;
-                const double kl = kl_acc.item<double>() / double(n_here);
+                if (!hs.n) continue;
+                const double kl = hs.kl / double(hs.n);
                 if (ep > 0 && kl > KL_STOP) { kl_stop = true; stop_ep = ep; stop_kl = kl; break; }
-                // per-head target entropy: coef * H / H.detach(), averaged over the heads present
-                torch::Tensor ent_loss = torch::zeros({}, dev);
-                double ent_mean = 0; int present = 0;
+                double h_mean[NUM_HEAD_IDS] = {}; int present = 0; double ent_mean = 0;
                 for (int h = 0; h < NUM_HEAD_IDS; h++) {
-                    if (!h_cnt[h]) continue;
-                    auto hm = h_sum[h] / double(h_cnt[h]);
-                    const double hv = hm.item<double>();
-                    ent_loss = ent_loss + hm * (K.head_entropy[h] / (hv + 1e-8));
-                    ent_mean += hv; present++;
-                    if (ep == 0) { head_ent[h] += hv * h_cnt[h]; head_n[h] += h_cnt[h]; }
+                    if (!hs.cnt[h]) continue;
+                    h_mean[h] = hs.H[h] / double(hs.cnt[h]);
+                    ent_mean += h_mean[h]; present++;
+                    if (ep == 0) { head_ent[h] += hs.H[h]; head_n[h] += hs.cnt[h]; }
                 }
-                ent_loss = ent_loss / double(std::max(1, present));
-                auto pl = pol_loss / double(n_here);
+                // pass 2: forward + backward per chunk, gradients accumulate
                 opt_pol.zero_grad();
-                (pl - ent_loss).backward();
+                for (int p = 0; p < NUM_POLICIES; p++)
+                    for (size_t c = 0; c < by_pol[p].size(); c += MICRO) {
+                        auto loss = chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), true, hs, hs.n, h_mean, present);
+                        if (loss.requires_grad()) loss.backward();
+                    }
                 clip_norm(pol_params, CLIP_POL, 0);
                 opt_pol.step();
-                pl_sum += pl.item<double>(); ent_sum += ent_mean / std::max(1, present);
-                kl_sum += kl; nrec += n_here; clipped += clip_here; n_steps++;
+                pl_sum += -hs.surr / double(hs.n); ent_sum += ent_mean / std::max(1, present);
+                kl_sum += kl; nrec += hs.n; clipped += hs.clip; n_steps++;
                 value_step(j);
             }
         }

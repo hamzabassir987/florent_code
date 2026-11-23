@@ -56,12 +56,13 @@ struct ResBlockImpl : torch::nn::Module {
         pw2 = register_module("pw2", torch::nn::Conv2d(torch::nn::Conv2dOptions(c, c, 1)));
         dw2 = register_module("dw2", torch::nn::Conv2d(torch::nn::Conv2dOptions(c, c, 3).padding(1).groups(c)));
     }
+    // in-place ReLUs / residual add: each conv output is reused, not copied
     torch::Tensor forward(torch::Tensor x) {
-        auto z = torch::relu(pw->forward(x));
-        z = torch::relu(dw->forward(z));
-        z = torch::relu(pw2->forward(z));
+        auto z = pw->forward(x).relu_();
+        z = dw->forward(z).relu_();
+        z = pw2->forward(z).relu_();
         z = dw2->forward(z);
-        return torch::relu(x + z);
+        return z.add_(x).relu_();
     }
 };
 TORCH_MODULE(ResBlock);
@@ -80,10 +81,10 @@ struct ActorImpl : torch::nn::Module {
     }
     // spatial: [B, 59, 17, 17] already scaled; scalars: [B, 40] already scaled
     torch::Tensor forward(torch::Tensor spatial, torch::Tensor scalars) {
-        auto h = torch::relu(stem->forward(spatial));
+        auto h = stem->forward(spatial).relu_();
         for (auto& b : *blocks) h = b->as<ResBlock>()->forward(h);
         auto centre = h.index({torch::indexing::Slice(), torch::indexing::Slice(), fe::HALF, fe::HALF});
-        auto f = torch::relu(fc->forward(torch::cat({centre, scalars}, 1)));
+        auto f = fc->forward(torch::cat({centre, scalars}, 1)).relu_();
         return out->forward(f);
     }
 };
@@ -106,10 +107,10 @@ struct CriticImpl : torch::nn::Module {
     }
     torch::Tensor forward(torch::Tensor spatial, torch::Tensor scalars) {
         static const int POOL[3] = {2, 2, 4};
-        auto h = torch::relu(stem->forward(spatial));
+        auto h = stem->forward(spatial).relu_();
         for (int b = 0; b < 3; b++)
             h = torch::max_pool2d(blocks[b]->as<ResBlock>()->forward(h), {POOL[b], POOL[b]}, {POOL[b], POOL[b]});
-        auto f = torch::relu(hidden->forward(torch::cat({h.flatten(1), scalars}, 1)));
+        auto f = hidden->forward(torch::cat({h.flatten(1), scalars}, 1)).relu_();
         return value->forward(f).squeeze(1);
     }
 };
@@ -132,6 +133,18 @@ struct TeacherImpl : torch::nn::Module {
         auto sp = raw.narrow(1, 0, fe::ACTOR_SPATIAL).view({raw.size(0), fe::ACTOR_CH, fe::PATCH, fe::PATCH}) * ch_scale;
         auto sc = raw.narrow(1, fe::ACTOR_SPATIAL, fe::ACTOR_SCALARS) * sc_scale;
         return actors[p]->as<Actor>()->forward(sp, sc);
+    }
+    // Compact inputs, already on the device: spatial uint8 [B, ACTOR_SPATIAL],
+    // scalars any integer type [B, ACTOR_SCALARS]; converted to float here.
+    torch::Tensor logits_split(int p, const torch::Tensor& sp, const torch::Tensor& sc) {
+        auto x = sp.to(torch::kFloat32).view({sp.size(0), fe::ACTOR_CH, fe::PATCH, fe::PATCH}).mul_(ch_scale);
+        auto y = sc.to(torch::kFloat32).mul_(sc_scale);
+        return actors[p]->as<Actor>()->forward(x, y);
+    }
+    torch::Tensor value_split(const torch::Tensor& sp, const torch::Tensor& sc) {
+        auto x = sp.to(torch::kFloat32).view({sp.size(0), fe::CRITIC_CH, fe::CRITIC_PAD, fe::CRITIC_PAD});
+        auto y = sc.to(torch::kFloat32).mul_(crit_scale);
+        return critic->forward(x, y);
     }
     // raw: [B, CRITIC_SPATIAL + CRITIC_SCALARS]
     torch::Tensor value(torch::Tensor raw) {
