@@ -1,0 +1,26 @@
+# Live training knobs: re-read by neural_train (and distill) every iteration.
+# See rl/train/entropy_file.hpp.
+lr 0.0003
+epochs 3
+game_rounds 1000
+ore_radius -1
+
+# entropy coefficient per head
+core_spawn 0.01
+core_convert 0.01
+builder_mode 0.01
+builder_move 0.01
+builder_build_type 0.01
+builder_build_tile 0.01
+builder_build_dir 0.01
+builder_attack 0.01
+builder_heal 0.01
+builder_destroy 0.01
+gunner_mode 0.01
+gunner_fire 0.01
+gunner_rotate 0.01
+sentinel_mode 0.01
+sentinel_fire 0.01
+launcher_mode 0.01
+launcher_bot 0.01
+launcher_dest 0.01

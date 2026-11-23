@@ -11,9 +11,11 @@
 // rounds of each, bootstrapping from the critic at the cut. Terminal reward
 // only (+1 / -1 / 0). Self-play: one network plays both teams.
 //
-//   neural_train ITERATIONS OUT.pt [maps...]   (env: GAMES, ROUNDS, EPOCHS, LR, INIT;
-//    curriculum: MAX_TURNS round limit, ORE_RADIUS ore distance from cores)
+//   neural_train ITERATIONS OUT.pt [maps...]   (env: GAMES, ROUNDS, INIT, ENTROPY_FILE;
+//    live knobs in the entropy file, see entropy_file.hpp)
 #include <torch/torch.h>
+#include "entropy_file.hpp"
+#include <iomanip>
 
 #include <algorithm>
 #include <chrono>
@@ -73,17 +75,22 @@ int main(int argc, char** argv) {
     const int iterations = std::atoi(argv[1]);
     const std::string out = argv[2];
     std::vector<std::string> maps(argv + 3, argv + argc);
-    const int G = env_int("GAMES", 4), R = env_int("ROUNDS", 32), EPOCHS = env_int("EPOCHS", 3);
+    const int G = env_int("GAMES", 4), R = env_int("ROUNDS", 32);
     const int MB = env_int("MINIBATCH", 256);
-    const float LR = env_float("LR", 3e-4f), ENT = env_float("ENT", 0.01f), VF = env_float("VF", 0.5f);
-    // curriculum: round limit (official 1000); ore farther than this from both cores is removed (-1: keep all)
-    const int MAX_TURNS = env_int("MAX_TURNS", 1000), ORE_RADIUS = env_int("ORE_RADIUS", -1);
+    const float VF = env_float("VF", 0.5f);
+    // Live knobs (entropy_file.hpp): per-head entropy, lr, epochs, game_rounds,
+    // ore_radius. Env LR / ENT / EPOCHS only set the starting values.
+    const std::string KNOB_PATH = std::getenv("ENTROPY_FILE") ? std::getenv("ENTROPY_FILE") : "entropy_file";
+    Knobs K;
+    K.lr = env_float("LR", 3e-4f); K.epochs = env_int("EPOCHS", 3);
+    for (auto& e : K.head_entropy) e = env_float("ENT", 0.01f);
+    if (!read_entropy_file(KNOB_PATH, K)) std::cout << "no " << KNOB_PATH << ": defaults\n";
     torch::set_num_threads(env_int("THREADS", 4));
     torch::manual_seed(7);
 
     Teacher net;
     if (const char* init = std::getenv("INIT")) { torch::load(net, init); std::cout << "loaded " << init << "\n"; }
-    torch::optim::Adam opt(net->parameters(), torch::optim::AdamOptions(LR));
+    torch::optim::Adam opt(net->parameters(), torch::optim::AdamOptions(K.lr));
 
     std::mt19937 master(12345);
     std::vector<Game> games(G);
@@ -92,14 +99,18 @@ int main(int argc, char** argv) {
         g.m = Match();
         if (!g.m.load(mp, master())) { std::cerr << "bad map " << mp << "\n"; std::exit(3); }
         g.m.reset();
-        g.m.game.max_turns = MAX_TURNS;
-        g.m.game.limit_ore(ORE_RADIUS);
+        g.m.game.max_turns = K.game_rounds;
+        g.m.game.limit_ore(K.ore_radius);
         g.rng.seed(master());
     };
     for (auto& g : games) new_game(g);
     long finished = 0, a_wins = 0;
 
     for (int it = 1; it <= iterations; it++) {
+        read_entropy_file(KNOB_PATH, K);
+        for (auto& pg : opt.param_groups()) static_cast<torch::optim::AdamOptions&>(pg.options()).lr(K.lr);
+        for (auto& g : games) g.m.game.max_turns = K.game_rounds;   // running games too
+        const int EPOCHS = K.epochs;
         auto t0 = std::chrono::steady_clock::now();
         std::vector<DecisionRow> rows;
         std::vector<RoundRow> rounds;
@@ -204,13 +215,14 @@ int main(int argc, char** argv) {
         // ---- PPO update
         net->train();
         double pl_sum = 0, vl_sum = 0, ent_sum = 0, ratio_dev0 = -1; long nrec = 0, clipped = 0;
+        double head_ent[NUM_HEAD_IDS] = {}; long head_n[NUM_HEAD_IDS] = {};   // first epoch, per head
         std::vector<int> order(rows.size());
         for (size_t i = 0; i < order.size(); i++) order[i] = int(i);
         for (int ep = 0; ep < EPOCHS; ep++) {
             std::shuffle(order.begin(), order.end(), master);
             for (size_t s = 0; s < order.size(); s += MB) {
                 size_t e = std::min(order.size(), s + MB);
-                torch::Tensor pol_loss = torch::zeros({}), ent_loss = torch::zeros({});
+                torch::Tensor pol_loss = torch::zeros({}), ent_loss = torch::zeros({}), ent_bonus = torch::zeros({});
                 long n_here = 0;
                 for (int p = 0; p < NUM_POLICIES; p++) {
                     std::vector<int> idx;
@@ -245,7 +257,10 @@ int main(int argc, char** argv) {
                         auto surr = torch::min(ratio * A, torch::clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * A);
                         pol_loss = pol_loss - surr.sum();
                         auto probs = lsm.exp().masked_fill(~mask, 0.f);
-                        ent_loss = ent_loss - (probs * lsm.masked_fill(~mask, 0.f)).sum();
+                        auto h_sum = -(probs * lsm.masked_fill(~mask, 0.f)).sum();   // this head's entropy, summed
+                        ent_loss = ent_loss + h_sum;
+                        ent_bonus = ent_bonus + K.head_entropy[head] * h_sum;
+                        if (ep == 0) { head_ent[head] += h_sum.item<double>(); head_n[head] += k; }
                         n_here += k;
                         if (ep == 0 && s == 0) {
                             if (ratio_dev0 < 0) ratio_dev0 = 0;
@@ -256,7 +271,7 @@ int main(int argc, char** argv) {
                 }
                 if (!n_here) continue;
                 auto pl = pol_loss / double(n_here), ent = ent_loss / double(n_here);
-                auto loss = pl - ENT * ent;
+                auto loss = pl - ent_bonus / double(n_here);
                 opt.zero_grad();
                 loss.backward();
                 torch::nn::utils::clip_grad_norm_(net->parameters(), 0.5);
@@ -291,7 +306,13 @@ int main(int argc, char** argv) {
                   << " policy_loss " << pl_sum << " entropy " << (nrec ? ent_sum : 0)
                   << " value_loss " << vl_sum / std::max(1, EPOCHS)
                   << " clipped " << clipped << " games_done " << finished << " A_wins " << a_wins
-                  << " rollout_ms " << int(ms_roll) << " update_ms " << int(ms_upd) << std::endl;
+                  << " rollout_ms " << int(ms_roll) << " update_ms " << int(ms_upd)
+                  << " lr " << K.lr << " epochs " << EPOCHS << " game_rounds " << K.game_rounds
+                  << " ore_radius " << K.ore_radius << std::endl;
+        std::cout << "  head entropy (mean | coef):";
+        for (int h = 0; h < NUM_HEAD_IDS; h++)
+            if (head_n[h]) std::cout << " " << HEAD_NAMES[h] << " " << std::setprecision(3) << head_ent[h] / head_n[h] << "|" << K.head_entropy[h];
+        std::cout << std::setprecision(6) << std::endl;
         if (it % env_int("SAVE_EVERY", 25) == 0 || it == iterations) torch::save(net, out);
     }
     std::cout << "TRAIN COMPLETE checkpoint=" << out << std::endl;

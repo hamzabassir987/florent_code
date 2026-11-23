@@ -13,6 +13,7 @@
 // Writes the student checkpoint, the JSON export for bots/econ/student.py, and
 // optionally test vectors (quantized input -> integer logits) for exactness.
 #include <torch/torch.h>
+#include "entropy_file.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -99,8 +100,10 @@ int main(int argc, char** argv) {
         resumed = true;
     }
     torch::optim::Adam opt(st->parameters(), torch::optim::AdamOptions(env_float("LR", 3e-3f)));
-    // curriculum: same meaning as in neural_train
-    const int MAX_TURNS = env_int("MAX_TURNS", 1000), ORE_RADIUS = env_int("ORE_RADIUS", -1);
+    // game_rounds / ore_radius from the same entropy file as neural_train (re-read every iteration)
+    const std::string KNOB_PATH = std::getenv("ENTROPY_FILE") ? std::getenv("ENTROPY_FILE") : "entropy_file";
+    Knobs K{}; K.lr = 0; K.epochs = 1;
+    read_entropy_file(KNOB_PATH, K);
     std::mt19937 master(99);
     std::vector<Match> games(G);
     std::vector<std::mt19937> grng(G);
@@ -108,13 +111,15 @@ int main(int argc, char** argv) {
         games[i] = Match();
         games[i].load(maps[master() % maps.size()], master());
         games[i].reset();
-        games[i].game.max_turns = MAX_TURNS;
-        games[i].game.limit_ore(ORE_RADIUS);
+        games[i].game.max_turns = K.game_rounds;
+        games[i].game.limit_ore(K.ore_radius);
         grng[i].seed(master());
     };
     for (int i = 0; i < G; i++) new_game(i);
 
     for (int it = 1; it <= iters; it++) {
+        read_entropy_file(KNOB_PATH, K);
+        for (auto& m : games) m.game.max_turns = K.game_rounds;
         bool teacher_plays = it == 1 && !resumed;
         std::vector<Sample> data;
         long agree = 0, compared = 0;
