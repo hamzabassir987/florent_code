@@ -123,8 +123,10 @@ int main(int argc, char** argv) {
                     int type = m.game.ents[a].type;
                     if (type == fe::SPIKE) { Candidate c; if (spike_action(m.game, a, c)) m.act(a, c); continue; }
                     int p = policy_of_type(type);
-                    if (p < 0 || !has_choice(m.game, a)) continue;
-                    std::vector<float> obs; m.actor_observation(a, obs);
+                    if (p < 0) continue;
+                    m.observe(a);                            // memory updates every turn, as deployed
+                    if (!has_choice(m.game, a)) continue;
+                    std::vector<float> obs; m.encode_only(a, obs);
                     Sample s; s.policy = p; s.raw.assign(obs.begin(), obs.end());
                     s.q.resize(s.raw.size()); quantize_actor(s.raw.data(), s.q.data());
                     torch::Tensor tl, sl;

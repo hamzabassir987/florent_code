@@ -60,6 +60,14 @@ class Api:
         self.T = {i: getattr(EntityType, n) for i, n in enumerate(TYPE_NAMES)}
         self.Tinv = {v: k for k, v in self.T.items()}
 
+        self.cache = {}
+
+    def once(self, key, fn):
+        """Legal-option tables are computed once per turn and shared."""
+        if key not in self.cache:
+            self.cache[key] = fn()
+        return self.cache[key]
+
     def call(self, name, *args):
         try:
             return bool(getattr(self.ct, name)(*args))
@@ -76,6 +84,10 @@ def _type(api):
 
 # ---- legal options -------------------------------------------------------------
 def core_opts(api):
+    return api.once('core_opts', lambda: _core_opts(api))
+
+
+def _core_opts(api):
     ct = api.ct
     p = ct.get_position()
     spawn, sx = [1], [None]
@@ -96,6 +108,10 @@ def core_opts(api):
 
 
 def builder_opts(api):
+    return api.once('builder_opts', lambda: _builder_opts(api))
+
+
+def _builder_opts(api):
     p = api.ct.get_position()
     tiles = [(p.x + DXY[d][0], p.y + DXY[d][1]) for d in CARD4]
     move = [int(api.call("can_move", api.D[d])) for d in CARD4]
@@ -119,6 +135,10 @@ def builder_opts(api):
 
 
 def line_opts(api, typ):
+    return api.once('line_opts', lambda: _line_opts(api, typ))
+
+
+def _line_opts(api, typ):
     ct = api.ct
     p = ct.get_position()
     dd = ct.get_direction().delta()
@@ -132,6 +152,10 @@ def line_opts(api, typ):
 
 
 def launcher_opts(api):
+    return api.once('launcher_opts', lambda: _launcher_opts(api))
+
+
+def _launcher_opts(api):
     ct = api.ct
     p = ct.get_position()
     dests = [(p.x + dx, p.y + dy) for dy in range(-5, 6) for dx in range(-5, 6) if dx or dy]
@@ -219,6 +243,8 @@ def decide(api, logits, choose=None):
     ('heal',x,y) ('destroy',x,y) ('fire',x,y) ('rotate',dir) ('launch',bx,by,tx,ty);
     records: list of (head, mask, choice, logp)."""
     choose = choose or (lambda head, l, m: argmax_choice(l, m))
+    if callable(logits):
+        logits = logits()
     t = _type(api)
     p = POLICY_OF_TYPE[t]
     actions, records = [], []

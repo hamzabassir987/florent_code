@@ -125,8 +125,10 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     int p = policy_of_type(type);
-                    if (p < 0 || !has_choice(m.game, a)) continue;     // only wait: no forward
-                    std::vector<float> obs; m.actor_observation(a, obs);
+                    if (p < 0) continue;
+                    m.observe(a);                            // memory updates every turn, as deployed
+                    if (!has_choice(m.game, a)) continue;     // only wait: no forward
+                    std::vector<float> obs; m.encode_only(a, obs);
                     DecisionRow row; row.policy = p; row.team = m.game.ents[a].team; row.round_key = key;
                     row.obs.assign(obs.begin(), obs.end());
                     torch::Tensor lt;

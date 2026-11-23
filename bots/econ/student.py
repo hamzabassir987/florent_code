@@ -12,19 +12,24 @@ import json
 PATCH, HALF = 17, 8
 ACTOR_CH, SCALARS = 59, 40
 BITS = 16
-S = PATCH + 2
+# The heads read only the centre tile, and 4 blocks with one 3x3 depthwise
+# conv each give a 9x9 receptive field, so the trunk runs on the central 9x9
+# window only: the centre output is identical to the full 17x17 computation.
+RADIUS = 4
+WIN = 2 * RADIUS + 1
+S = WIN + 2
 NSLOT = S * S
 SLOT = (1 << BITS) - 1
 HALF_SLOT = 1 << (BITS - 1)
 ONES = sum(1 << (i * BITS) for i in range(NSLOT))
 INNER = 0
-for _y in range(1, PATCH + 1):
-    INNER |= ((1 << (PATCH * BITS)) - 1) << ((_y * S + 1) * BITS)
+for _y in range(1, WIN + 1):
+    INNER |= ((1 << (WIN * BITS)) - 1) << ((_y * S + 1) * BITS)
 OFF = ONES * HALF_SLOT
 FULL = (1 << (NSLOT * BITS)) - 1
 FIFTEEN = ONES * 15
 SIXTEEN = ONES * 16
-CENTRE_SLOT = (HALF + 1) * S + (HALF + 1)
+CENTRE_SLOT = (RADIUS + 1) * S + (RADIUS + 1)
 # encoder channel layout (bots/econ/encoder.py)
 C_STALE, C_VISIT, C_ATTR_STALE, C_HP, C_RAY = 29, 30, 31, 42, 48
 DW_SHIFTS = [((k // 3 - 1) * S + (k % 3 - 1)) * BITS for k in range(9)]
@@ -72,14 +77,15 @@ def quantize(raw):
 
 
 def _pack(q, c):
+    """Central WIN x WIN window of channel c into a bordered big int."""
     acc, base = 0, c * PATCH * PATCH
-    for y in range(PATCH):
-        row = base + y * PATCH
-        slot = (y + 1) * S + 1
-        for x in range(PATCH):
-            v = q[row + x]
+    for wy in range(WIN):
+        row = base + (HALF - RADIUS + wy) * PATCH + (HALF - RADIUS)
+        slot = (wy + 1) * S + 1
+        for wx in range(WIN):
+            v = q[row + wx]
             if v:
-                acc |= v << ((slot + x) * BITS)
+                acc |= v << ((slot + wx) * BITS)
     return acc
 
 

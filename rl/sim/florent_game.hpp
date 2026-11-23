@@ -20,5 +20,7 @@ struct Match {
     std::vector<int> acting_units() const;
     int act(int entity, const Candidate& c);
     void actor_observation(int entity, std::vector<float>& out);
+    void observe(int entity);            // update this unit's fog memory (every turn it runs)
+    void encode_only(int entity, std::vector<float>& out);   // encode without updating
 };
 }

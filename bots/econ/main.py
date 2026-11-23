@@ -36,12 +36,20 @@ try:
 except Exception:
     ActorEncoder = None
 try:
-    from action_abi import candidates as learned_candidates, apply as apply_learned
-    from policy import LearnedPolicy, cpu_budget_ok
+    import heads as HEADS
+    from student import StudentPolicy
 except Exception:
-    learned_candidates = apply_learned = None
-    LearnedPolicy = None
-    cpu_budget_ok = lambda ct: False
+    HEADS = None
+    StudentPolicy = None
+
+# Learned turns start the network only while this much CPU of the turn is left
+# unused (the SWAR forward takes ~4-5 ms of the 10 ms budget).
+LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "3000"))
+if os.environ.get("FLORENT_POLICY"):
+    # A cyclic-GC pause can push a turn past the 10 ms limit; reference
+    # counting still frees everything, cycles just wait.
+    import gc
+    gc.disable()
 
 CARDINALS = (Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST)
 DIRS8 = tuple(d for d in Direction if d != Direction.CENTRE)
@@ -165,15 +173,19 @@ class Player:
         self.known_builders = {}
         self.last_report_round = -1
         self.actor_encoder = ActorEncoder() if ActorEncoder is not None else None
-        self.learned_policy = None
+        # FLORENT_POLICY=<student.json>: the int4 student plays every unit;
+        # otherwise the heuristic bot below plays.
+        self.student = None
         policy_path = os.environ.get("FLORENT_POLICY")
-        if LearnedPolicy is not None and policy_path:
+        if StudentPolicy is not None and HEADS is not None and policy_path:
             try:
-                self.learned_policy = LearnedPolicy(policy_path)
-            except Exception:
-                self.learned_policy = None
+                self.student = StudentPolicy(policy_path)
+            except Exception as e:
+                import sys
+                print("FLORENT_POLICY load failed:", repr(e), file=sys.stderr)
         self.policy_disabled = False
-        self.last_observation = None
+        self.learned_turns = 0
+        self.fallback_turns = 0
 
     # ------------------------------------------------------------------
     def _setup(self, ct: Controller):
@@ -194,32 +206,15 @@ class Player:
     def run(self, ct: Controller) -> None:
         if not self.init:
             self._setup(ct)
-        try:
-            if self.actor_encoder is not None:
-                self.last_observation = self.actor_encoder.encode(ct)
-        except Exception:
-            self.last_observation = None
-        # Learned inference is opt-in and always guarded by the official CPU
-        # budget. Heuristic handlers remain the safe fallback for unavailable,
-        # malformed, or over-budget policies.
-        if (self.learned_policy is not None and not self.policy_disabled and
-                learned_candidates is not None and self.last_observation is not None and
-                cpu_budget_ok(ct)):
+        # Learned inference (opt-in). Heuristic handlers remain the fallback for
+        # an unavailable policy, an error, or a turn without enough CPU left.
+        if self.student is not None and not self.policy_disabled:
             try:
-                choices, mask = learned_candidates(ct)
-                if choices and any(mask[1:]):
-                    typ = ct.get_entity_type()
-                    pidx = {EntityType.CORE: 0, EntityType.BUILDER_BOT: 1,
-                            EntityType.GUNNER: 2, EntityType.SENTINEL: 3,
-                            EntityType.LAUNCHER: 4, EntityType.SPIKE: 5}.get(typ, 0)
-                    chosen = self.learned_policy.choose(
-                        choices, mask,
-                        self.last_observation[0] + self.last_observation[1],
-                        pidx, cpu_budget_ok(ct))
-                    if chosen is not None:
-                        apply_learned(ct, chosen)
-                        return
-            except Exception:
+                if self.learned_turn(ct):
+                    return
+            except Exception as e:
+                import sys
+                print("LEARNED disabled after error:", repr(e), file=sys.stderr)
                 self.policy_disabled = True
         t = ct.get_entity_type()
         try:
@@ -237,6 +232,34 @@ class Player:
             import sys
 
             print("ERR", t, repr(e), file=sys.stderr)
+
+    def learned_turn(self, ct):
+        """One turn of the int4 student (same heads and masks as training).
+        Returns False to hand this turn to the heuristic (CPU too short)."""
+        api = HEADS.Api(ct)
+        typ = api.Tinv[ct.get_entity_type()]
+        if typ == HEADS.SPIKE:                       # deterministic, as in training
+            act = HEADS.spike_action(api)
+            if act:
+                HEADS.apply(api, act)
+            return True
+        p = HEADS.POLICY_OF_TYPE.get(typ)
+        if p is None:
+            return True
+        spatial, scalars = self.actor_encoder.encode(ct)   # memory updates every turn
+        if not HEADS.has_choice(api):
+            return True                              # only "wait" is legal: no forward
+        if ct.get_cpu_time_elapsed() > LEARNED_START_LIMIT_US:
+            self.fallback_turns += 1
+            print("FALLBACK", ct.get_current_round(), ct.get_cpu_time_elapsed())
+            return False
+        raw = spatial + scalars
+        actions, _ = HEADS.decide(api, lambda: self.student.logits(p, raw))
+        for a in actions:
+            HEADS.apply(api, a)
+        self.learned_turns += 1
+        print("LEARNED", ct.get_current_round(), p, actions, ct.get_cpu_time_elapsed())
+        return True
 
     # ------------------------------------------------------------------
     # memory
