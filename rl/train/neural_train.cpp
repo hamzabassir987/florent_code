@@ -246,7 +246,8 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
         if (train) {
             RoundE& re = s.segs.back().rounds.back();
             re.terminal = m.game.over;
-            if (m.game.over) re.reward = float(m.terminal_reward(0));
+            // a coin-flip finish is a draw in training: reward 0 for both teams
+            if (m.game.over && m.game.win_condition != "coinflip") re.reward = float(m.terminal_reward(0));
         }
     }
 }
@@ -699,9 +700,12 @@ int main(int argc, char** argv) {
         const double pl_mean = pl_sum / std::max(1, n_steps), ent_mean = ent_sum / std::max(1, n_steps);
         const double vl_mean = vl_sum / std::max(1, v_steps), kl_mean = kl_sum / std::max(1, n_steps);
         const long clip_total = std::max(1L, nrec);
-        double mean_rounds = 0; int ended_a = 0;
+        double mean_rounds = 0; int ended_a = 0, draws = 0;
         std::map<std::string, int> by_cond;
-        for (auto& e : ended) { mean_rounds += e.rounds; ended_a += e.winner == 0; by_cond[e.cond]++; }
+        for (auto& e : ended) {
+            mean_rounds += e.rounds; by_cond[e.cond]++;
+            if (e.cond == "coinflip") draws++; else ended_a += e.winner == 0;
+        }
         if (!ended.empty()) mean_rounds /= ended.size();
         finished += long(ended.size()); a_wins_all += ended_a;
         const double mem_gb = double(samples.size()) * (fe::ACTOR_SPATIAL + 2 * fe::ACTOR_SCALARS) / 1e9
@@ -743,7 +747,7 @@ int main(int argc, char** argv) {
             double ti[2] = {0, 0}, hv[2] = {0, 0};
             for (auto& e : ended) for (int t = 0; t < 2; t++) { ti[t] += e.ti_col[t]; hv[t] += e.harv[t]; }
             o << "  " << lfmt::label("ended") << ended.size() << " games   rounds " << std::fixed << std::setprecision(0) << mean_rounds
-              << "   A wins " << lfmt::ratio(ended_a, long(ended.size()))
+              << "   A wins " << lfmt::ratio(ended_a, long(ended.size())) << "   draws (coin flip) " << draws
               << "   Ti collected A " << ti[0] / ended.size() << "  B " << ti[1] / ended.size()
               << "   harvesters A " << std::setprecision(1) << hv[0] / ended.size() << "  B " << hv[1] / ended.size() << std::defaultfloat << "\n";
             o << "  " << lfmt::label("");
@@ -801,15 +805,16 @@ int main(int argc, char** argv) {
                     start_game(s, S);
                 }
                 play(ev_slots, S, {&net, &frozen}, dev, /*stretch=*/0, /*restart=*/false, /*train=*/false, nullptr);
-                long wins = 0, games = 0; double rounds = 0;
+                long wins = 0, games = 0, ev_draws = 0; double rounds = 0;
                 for (int i = 0; i < K.eval_games; i++) {
                     const fe::Game& g = ev_slots[i].m.game;
                     games++; rounds += g.round;
-                    if (g.winner == ((i & 1) ? 1 : 0)) wins++;
+                    if (g.win_condition == "coinflip") ev_draws++;            // a draw, not a win
+                    else if (g.winner == ((i & 1) ? 1 : 0)) wins++;
                 }
                 const float wr = games ? float(wins) / games : 0.f;
                 bool promoted = false;
-                std::cout << "  " << lfmt::label(greedy ? "eval greedy" : "eval sample") << "vs frozen " << lfmt::ratio(wins, games)
+                std::cout << "  " << lfmt::label(greedy ? "eval greedy" : "eval sample") << "vs frozen " << lfmt::ratio(wins, games) << "   draws " << ev_draws
                           << "   rounds " << std::fixed << std::setprecision(0) << rounds / std::max(1L, games) << "   "
                           << std::setprecision(1) << std::chrono::duration<double>(std::chrono::steady_clock::now() - te).count()
                           << " s" << std::defaultfloat << std::endl;
