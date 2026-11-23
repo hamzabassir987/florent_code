@@ -48,14 +48,19 @@ inline torch::Tensor critic_scalar_scale() {
 }
 
 struct ResBlockImpl : torch::nn::Module {
-    torch::nn::Conv2d pw{nullptr}, dw{nullptr};
+    // two (1x1 -> depthwise 3x3) pairs, then residual: +-2 tiles per block
+    torch::nn::Conv2d pw{nullptr}, dw{nullptr}, pw2{nullptr}, dw2{nullptr};
     explicit ResBlockImpl(int c) {
         pw = register_module("pw", torch::nn::Conv2d(torch::nn::Conv2dOptions(c, c, 1)));
         dw = register_module("dw", torch::nn::Conv2d(torch::nn::Conv2dOptions(c, c, 3).padding(1).groups(c)));
+        pw2 = register_module("pw2", torch::nn::Conv2d(torch::nn::Conv2dOptions(c, c, 1)));
+        dw2 = register_module("dw2", torch::nn::Conv2d(torch::nn::Conv2dOptions(c, c, 3).padding(1).groups(c)));
     }
     torch::Tensor forward(torch::Tensor x) {
         auto z = torch::relu(pw->forward(x));
-        z = dw->forward(z);
+        z = torch::relu(dw->forward(z));
+        z = torch::relu(pw2->forward(z));
+        z = dw2->forward(z);
         return torch::relu(x + z);
     }
 };

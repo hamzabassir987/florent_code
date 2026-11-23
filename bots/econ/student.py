@@ -12,27 +12,52 @@ import json
 PATCH, HALF = 17, 8
 ACTOR_CH, SCALARS = 59, 40
 BITS = 16
-# The heads read only the centre tile, and 4 blocks with one 3x3 depthwise
-# conv each give a 9x9 receptive field, so the trunk runs on the central 9x9
-# window only: the centre output is identical to the full 17x17 computation.
-RADIUS = 4
-WIN = 2 * RADIUS + 1
-S = WIN + 2
-NSLOT = S * S
+# 4 residual blocks x 2 (1x1 -> depthwise 3x3) layers = 8 depthwise convs:
+# receptive field 17x17, exactly the patch.
+LAYERS = 8
+RADIUS = 8
 SLOT = (1 << BITS) - 1
 HALF_SLOT = 1 << (BITS - 1)
-ONES = sum(1 << (i * BITS) for i in range(NSLOT))
-INNER = 0
-for _y in range(1, WIN + 1):
-    INNER |= ((1 << (WIN * BITS)) - 1) << ((_y * S + 1) * BITS)
-OFF = ONES * HALF_SLOT
-FULL = (1 << (NSLOT * BITS)) - 1
-FIFTEEN = ONES * 15
-SIXTEEN = ONES * 16
-CENTRE_SLOT = (RADIUS + 1) * S + (RADIUS + 1)
+
+
+class Geo:
+    """Slot layout for a (2r+1)^2 window with a zero border.
+
+    The heads read only the centre tile, so block b (2 depthwise layers) only
+    needs its input within radius 8 - 2b: windows 17, 13, 9, 5. Edge cells of a
+    window go wrong inside the block, but those are exactly the cells the next
+    (smaller) window drops, so the centre output stays exact."""
+    def __init__(self, r):
+        self.r = r
+        self.win = 2 * r + 1
+        self.s = S = self.win + 2
+        n = S * S
+        self.ones = sum(1 << (i * BITS) for i in range(n))
+        inner = 0
+        for y in range(1, self.win + 1):
+            inner |= ((1 << (self.win * BITS)) - 1) << ((y * S + 1) * BITS)
+        self.inner = inner
+        self.off = self.ones * HALF_SLOT
+        self.full = (1 << (n * BITS)) - 1
+        self.sixteen = self.ones * 16
+        self.centre = (r + 1) * S + (r + 1)
+        self.dw = [((k // 3 - 1) * S + (k % 3 - 1)) * BITS for k in range(9)]
+
+    def crop(self, v, g):
+        """Central window of geometry g from big int v (laid out in self)."""
+        d, out, rowmask = self.r - g.r, 0, (1 << (g.win * BITS)) - 1
+        for y in range(g.win):
+            row = (v >> (((y + d + 1) * self.s + d + 1) * BITS)) & rowmask
+            if row:
+                out |= row << (((y + 1) * g.s + 1) * BITS)
+        return out
+
+
+GEOS = [Geo(RADIUS - 2 * b) for b in range(LAYERS // 2)]
+G0 = GEOS[0]
+WIN, S = G0.win, G0.s
 # encoder channel layout (bots/econ/encoder.py)
 C_STALE, C_VISIT, C_ATTR_STALE, C_HP, C_RAY = 29, 30, 31, 42, 48
-DW_SHIFTS = [((k // 3 - 1) * S + (k % 3 - 1)) * BITS for k in range(9)]
 
 
 def quantize(raw):
@@ -89,23 +114,24 @@ def _pack(q, c):
     return acc
 
 
-def _finish(p, n, shift):
+def _finish(g, p, n, shift):
     """clamp(floor((p - n) / 2^shift), 0, 15) per slot, border cleared."""
-    r = (p + OFF - n) & FULL
-    sign = (r >> (BITS - 1)) & ONES                     # 1 where p - n >= 0
+    ones = g.ones
+    r = (p + g.off - n) & g.full
+    sign = (r >> (BITS - 1)) & ones                     # 1 where p - n >= 0
     r &= sign * (HALF_SLOT - 1)                          # ReLU, drop the offset
     if shift:
-        r = (r >> shift) & (ONES * ((1 << (BITS - 1 - shift)) - 1))
-    over = (((r + OFF - SIXTEEN) >> (BITS - 1)) & ONES)  # 1 where r >= 16
+        r = (r >> shift) & (ones * ((1 << (BITS - 1 - shift)) - 1))
+    over = (((r + g.off - g.sixteen) >> (BITS - 1)) & ones)  # 1 where r >= 16
     r = (r & ~(over * SLOT)) | (over * 15)
-    return r & INNER
+    return r & g.inner
 
 
-def _bias(p, n, b):
+def _bias(g, p, n, b):
     if b > 0:
-        p += b * ONES
+        p += b * g.ones
     elif b < 0:
-        n += (-b) * ONES
+        n += (-b) * g.ones
     return p, n
 
 
@@ -123,7 +149,7 @@ class StudentPolicy:
             sw = pd["stem_w"]                      # [C][59][1][1]
             P["stem"] = [[sw[co * ACTOR_CH + ci] for ci in range(ACTOR_CH)] for co in range(C)]
             P["stem_b"] = pd["stem_b"]
-            for b in range(4):
+            for b in range(LAYERS):
                 pw = pd[f"pw_w{b}"]
                 P[f"pw{b}"] = [[pw[co * C + ci] for ci in range(C)] for co in range(C)]
                 P[f"pwb{b}"] = pd[f"pw_b{b}"]
@@ -141,7 +167,7 @@ class StudentPolicy:
 
     # ---- SWAR trunk ----------------------------------------------------------
     @staticmethod
-    def _pointwise(xs, W, B, shift):
+    def _pointwise(g, xs, W, B, shift):
         out = []
         for co, row in enumerate(W):
             p = n = 0
@@ -150,38 +176,46 @@ class StudentPolicy:
                     p += w * xs[ci]
                 elif w < 0:
                     n -= w * xs[ci]
-            p, n = _bias(p, n, B[co])
-            out.append(_finish(p, n, shift))
+            p, n = _bias(g, p, n, B[co])
+            out.append(_finish(g, p, n, shift))
         return out
 
     @staticmethod
-    def _depthwise_res(ts, hs, W, B, shift):
+    def _depthwise(g, ts, hs, W, B, shift):
         out = []
         for c, x in enumerate(ts):
             p = n = 0
             for k, w in enumerate(W[c]):
                 if not w:
                     continue
-                s = DW_SHIFTS[k]
+                s = g.dw[k]
                 v = x >> s if s > 0 else x << -s
                 if w > 0:
                     p += w * v
                 else:
                     n -= w * v
-            p, n = _bias(p, n, B[c])
-            p += hs[c] << shift                     # residual at accumulator scale
-            out.append(_finish(p, n, shift))
+            p, n = _bias(g, p, n, B[c])
+            if hs is not None:
+                p += hs[c] << shift                 # residual at accumulator scale
+            out.append(_finish(g, p, n, shift))
         return out
 
     def features(self, policy, q):
         P = self.pol[policy]
         sh = P["shifts"]
         xs = [_pack(q, c) for c in range(ACTOR_CH)]
-        h = self._pointwise(xs, P["stem"], P["stem_b"], sh[0])
-        for b in range(4):
-            t = self._pointwise(h, P[f"pw{b}"], P[f"pwb{b}"], sh[1 + 2 * b])
-            h = self._depthwise_res(t, h, P[f"dw{b}"], P[f"dwb{b}"], sh[2 + 2 * b])
-        centre = [(v >> (CENTRE_SLOT * BITS)) & SLOT for v in h]
+        g = G0
+        h = self._pointwise(g, xs, P["stem"], P["stem_b"], sh[0])
+        for blk in range(LAYERS // 2):
+            if blk:
+                ng = GEOS[blk]
+                h = [g.crop(v, ng) for v in h]
+                g = ng
+            hb = h
+            for b in (2 * blk, 2 * blk + 1):
+                t = self._pointwise(g, h, P[f"pw{b}"], P[f"pwb{b}"], sh[1 + 2 * b])
+                h = self._depthwise(g, t, hb if b % 2 else None, P[f"dw{b}"], P[f"dwb{b}"], sh[2 + 2 * b])
+        centre = [(v >> (g.centre * BITS)) & SLOT for v in h]
         s0 = ACTOR_CH * PATCH * PATCH
         f = centre + list(q[s0:s0 + SCALARS])
         hid = []
@@ -190,7 +224,7 @@ class StudentPolicy:
             for i, w in enumerate(row):
                 if w and f[i]:
                     acc += w * f[i]
-            v = acc >> sh[9]
+            v = acc >> sh[-1]
             hid.append(0 if v < 0 else (15 if v > 15 else v))
         return hid
 
@@ -227,7 +261,8 @@ def reference_logits(model, policy, q):
 
     x = [[q[c * P2 + i] for i in range(P2)] for c in range(ACTOR_CH)]
     h = [[act(P["stem_b"][co] + sum(P["stem"][co][ci] * x[ci][i] for ci in range(ACTOR_CH)), sh[0]) for i in range(P2)] for co in range(C)]
-    for b in range(4):
+    hb = h
+    for b in range(LAYERS):
         t = [[act(P[f"pwb{b}"][co] + sum(P[f"pw{b}"][co][ci] * h[ci][i] for ci in range(C)), sh[1 + 2 * b]) for i in range(P2)] for co in range(C)]
         nh = []
         for c in range(C):
@@ -239,12 +274,15 @@ def reference_logits(model, policy, q):
                         yy, x2 = y + k // 3 - 1, xx + k % 3 - 1
                         if 0 <= yy < PATCH and 0 <= x2 < PATCH:
                             acc += P[f"dw{b}"][c][k] * t[c][yy * PATCH + x2]
-                    acc += h[c][y * PATCH + xx] << sh[2 + 2 * b]
+                    if b % 2:
+                        acc += hb[c][y * PATCH + xx] << sh[2 + 2 * b]
                     row.append(act(acc, sh[2 + 2 * b]))
             nh.append(row)
         h = nh
+        if b % 2:
+            hb = h
     centre = [h[c][HALF * PATCH + HALF] for c in range(C)]
     s0 = ACTOR_CH * P2
     f = centre + list(q[s0:s0 + SCALARS])
-    hid = [act(P["fc_b"][j] + sum(w * f[i] for i, w in enumerate(P["fc"][j])), sh[9]) for j in range(len(P["fc"]))]
+    hid = [act(P["fc_b"][j] + sum(w * f[i] for i, w in enumerate(P["fc"][j])), sh[-1]) for j in range(len(P["fc"]))]
     return [P["out_b"][j] + sum(w * hid[i] for i, w in enumerate(P["out"][j])) for j in range(P["n"])]

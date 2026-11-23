@@ -64,10 +64,10 @@ static void export_student(Student& st, const std::string& path) {
         auto q7 = [](const torch::Tensor& w) { return torch::round(torch::clamp(w, -7, 7)); };
         auto q127 = [](const torch::Tensor& w, double lim = 127) { return torch::round(torch::clamp(w, -lim, lim)); };
         os << (p ? "," : "") << "{\"policy\":" << p << ",\"nlogits\":" << a->nlogits << ",\"shifts\":[";
-        for (int i = 0; i < 10; i++) os << (i ? "," : "") << a->shifts[i];
+        for (int i = 0; i < ST_NSHIFT; i++) os << (i ? "," : "") << a->shifts[i];
         os << "],\"stem_w\":"; dump_json_int(os, q7(a->stem_w));
         os << ",\"stem_b\":"; dump_json_int(os, q127(a->stem_b));
-        for (int b = 0; b < 4; b++) {
+        for (int b = 0; b < ST_LAYERS; b++) {
             os << ",\"pw_w" << b << "\":"; dump_json_int(os, q7(a->pw_w[b]));
             os << ",\"pw_b" << b << "\":"; dump_json_int(os, q127(a->pw_b[b]));
             os << ",\"dw_w" << b << "\":"; dump_json_int(os, q7(a->dw_w[b]));
