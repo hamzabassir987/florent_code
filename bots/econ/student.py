@@ -8,6 +8,8 @@ ReLU / shift / clamp per slot. Integer logits; divide by 16 for softmax.
 Only the standard library is used.
 """
 import json
+import sys
+from array import array
 
 PATCH, HALF = 17, 8
 ACTOR_CH, SCALARS = 59, 40
@@ -102,16 +104,16 @@ def quantize(raw):
 
 
 def _pack(q, c):
-    """Central WIN x WIN window of channel c into a bordered big int."""
-    acc, base = 0, c * PATCH * PATCH
-    for wy in range(WIN):
-        row = base + (HALF - RADIUS + wy) * PATCH + (HALF - RADIUS)
-        slot = (wy + 1) * S + 1
-        for wx in range(WIN):
-            v = q[row + wx]
-            if v:
-                acc |= v << ((slot + wx) * BITS)
-    return acc
+    """Channel c (the full 17x17 patch) into a bordered big int (C-level copies)."""
+    base = c * PATCH * PATCH
+    seg = q[base:base + PATCH * PATCH]
+    if not any(seg):
+        return 0
+    buf = [0] * (S * S)
+    for y in range(PATCH):
+        o = (y + 1) * S + 1
+        buf[o:o + PATCH] = seg[y * PATCH:(y + 1) * PATCH]
+    return int.from_bytes(array("H", buf).tobytes(), sys.byteorder)
 
 
 def _finish(g, p, n, shift):
@@ -163,20 +165,28 @@ class StudentPolicy:
             ow = pd["out_w"]
             P["out"] = [[ow[j * self.hidden + i] for i in range(self.hidden)] for j in range(P["n"])]
             P["out_b"] = pd["out_b"]
+            P["fcT"] = [list(c) for c in zip(*P["fc"])]
+            P["stem_g"] = self._groups(P["stem"])
+            for b in range(LAYERS):
+                P[f"pwg{b}"] = self._groups(P[f"pw{b}"])
             self.pol[p] = P
 
     # ---- SWAR trunk ----------------------------------------------------------
     @staticmethod
     def _pointwise(g, xs, W, B, shift):
+        # W[co] = (pos, neg): for each sign, input indices grouped by |w| = 7..1.
+        # sum_v v * S_v is accumulated as running sums: adds only, no multiplies.
         out = []
-        for co, row in enumerate(W):
-            p = n = 0
-            for ci, w in enumerate(row):
-                if w > 0:
-                    p += w * xs[ci]
-                elif w < 0:
-                    n -= w * xs[ci]
-            p, n = _bias(g, p, n, B[co])
+        for co, (pos, neg) in enumerate(W):
+            pn = []
+            for groups in (pos, neg):
+                t = acc = 0
+                for idx in groups:
+                    for ci in idx:
+                        t += xs[ci]
+                    acc += t
+                pn.append(acc)
+            p, n = _bias(g, pn[0], pn[1], B[co])
             out.append(_finish(g, p, n, shift))
         return out
 
@@ -200,12 +210,22 @@ class StudentPolicy:
             out.append(_finish(g, p, n, shift))
         return out
 
+    @staticmethod
+    def _groups(W):
+        """Dense rows -> (pos, neg) lists of 7 index groups for |w| = 7, 6, ..., 1."""
+        res = []
+        for row in W:
+            pos = [[ci for ci, w in enumerate(row) if w == v] for v in range(7, 0, -1)]
+            neg = [[ci for ci, w in enumerate(row) if w == -v] for v in range(7, 0, -1)]
+            res.append((pos, neg))
+        return res
+
     def features(self, policy, q):
         P = self.pol[policy]
         sh = P["shifts"]
         xs = [_pack(q, c) for c in range(ACTOR_CH)]
         g = G0
-        h = self._pointwise(g, xs, P["stem"], P["stem_b"], sh[0])
+        h = self._pointwise(g, xs, P["stem_g"], P["stem_b"], sh[0])
         for blk in range(LAYERS // 2):
             if blk:
                 ng = GEOS[blk]
@@ -213,20 +233,19 @@ class StudentPolicy:
                 g = ng
             hb = h
             for b in (2 * blk, 2 * blk + 1):
-                t = self._pointwise(g, h, P[f"pw{b}"], P[f"pwb{b}"], sh[1 + 2 * b])
+                t = self._pointwise(g, h, P[f"pwg{b}"], P[f"pwb{b}"], sh[1 + 2 * b])
                 h = self._depthwise(g, t, hb if b % 2 else None, P[f"dw{b}"], P[f"dwb{b}"], sh[2 + 2 * b])
         centre = [(v >> (g.centre * BITS)) & SLOT for v in h]
         s0 = ACTOR_CH * PATCH * PATCH
         f = centre + list(q[s0:s0 + SCALARS])
-        hid = []
-        for j, row in enumerate(P["fc"]):
-            acc = P["fc_b"][j]
-            for i, w in enumerate(row):
-                if w and f[i]:
-                    acc += w * f[i]
-            v = acc >> sh[-1]
-            hid.append(0 if v < 0 else (15 if v > 15 else v))
-        return hid
+        acc = list(P["fc_b"])
+        fcT = P["fcT"]
+        for i, fi in enumerate(f):
+            if fi:
+                col = fcT[i]
+                acc = [a + fi * w for a, w in zip(acc, col)]
+        s9 = sh[-1]
+        return [0 if v < 0 else (15 if v > 15 else v) for v in (a >> s9 for a in acc)]
 
     def logits_int(self, policy, q, indices=None):
         """Integer logits (all, or only `indices`)."""

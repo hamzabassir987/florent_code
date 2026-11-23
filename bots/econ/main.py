@@ -44,7 +44,7 @@ except Exception:
 
 # Learned turns start the network only while this much CPU of the turn is left
 # unused (the SWAR forward takes ~4-5 ms of the 10 ms budget).
-LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "3000"))
+LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "2000"))
 if os.environ.get("FLORENT_POLICY"):
     # A cyclic-GC pause can push a turn past the 10 ms limit; reference
     # counting still frees everything, cycles just wait.
