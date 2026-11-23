@@ -89,20 +89,28 @@ struct ActorImpl : torch::nn::Module {
 };
 TORCH_MODULE(Actor);
 
+// Privileged critic: 48x48 board -> stem 1x1 -> [ResBlock, pool] x 3
+// (2x2: 48 -> 24, 2x2: 24 -> 12, 4x4: 12 -> 3) -> 32*3*3 = 288 ++ scalars
+// -> Linear 80 -> ReLU -> Linear 1.
 struct CriticImpl : torch::nn::Module {
+    static constexpr int CRITIC_HIDDEN = 80;
     torch::nn::Conv2d stem{nullptr};
     torch::nn::ModuleList blocks;
-    torch::nn::Linear value{nullptr};
+    torch::nn::Linear hidden{nullptr}, value{nullptr};
     CriticImpl() {
         stem = register_module("stem", torch::nn::Conv2d(torch::nn::Conv2dOptions(fe::CRITIC_CH, TRUNK_CH, 1)));
         for (int b = 0; b < 3; b++) blocks->push_back(ResBlock(TRUNK_CH));
         register_module("blocks", blocks);
-        value = register_module("value", torch::nn::Linear(TRUNK_CH * 6 * 6 + fe::CRITIC_SCALARS, 1));
+        hidden = register_module("hidden", torch::nn::Linear(TRUNK_CH * 3 * 3 + fe::CRITIC_SCALARS, CRITIC_HIDDEN));
+        value = register_module("value", torch::nn::Linear(CRITIC_HIDDEN, 1));
     }
     torch::Tensor forward(torch::Tensor spatial, torch::Tensor scalars) {
+        static const int POOL[3] = {2, 2, 4};
         auto h = torch::relu(stem->forward(spatial));
-        for (auto& b : *blocks) h = torch::max_pool2d(b->as<ResBlock>()->forward(h), {2, 2}, {2, 2});
-        return value->forward(torch::cat({h.flatten(1), scalars}, 1)).squeeze(1);
+        for (int b = 0; b < 3; b++)
+            h = torch::max_pool2d(blocks[b]->as<ResBlock>()->forward(h), {POOL[b], POOL[b]}, {POOL[b], POOL[b]});
+        auto f = torch::relu(hidden->forward(torch::cat({h.flatten(1), scalars}, 1)));
+        return value->forward(f).squeeze(1);
     }
 };
 TORCH_MODULE(Critic);
