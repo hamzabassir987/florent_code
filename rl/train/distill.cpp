@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
     const int iters = std::atoi(argv[4]);
     std::vector<std::string> maps(argv + 5, argv + argc);
     const int G = env_int("GAMES", 4), R = env_int("ROUNDS", 40), EPOCHS = env_int("EPOCHS", 2), MB = 256;
-    torch::set_num_threads(env_int("THREADS", 2));
+    if (std::getenv("THREADS")) torch::set_num_threads(env_int("THREADS", 0));   // default: torch picks (all cores)
     torch::manual_seed(11);
     Teacher teacher; torch::load(teacher, tpath); teacher->eval();
     Student st;

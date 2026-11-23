@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
     K.lr = env_float("LR", 3e-4f); K.epochs = env_int("EPOCHS", 3);
     for (auto& e : K.head_entropy) e = env_float("ENT", 0.01f);
     if (!read_entropy_file(KNOB_PATH, K)) std::cout << "no " << KNOB_PATH << ": defaults\n";
-    torch::set_num_threads(env_int("THREADS", 4));
+    if (std::getenv("THREADS")) torch::set_num_threads(env_int("THREADS", 0));   // default: torch picks (all cores)
     torch::manual_seed(7);
 
     Teacher net;
