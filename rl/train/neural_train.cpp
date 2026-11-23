@@ -76,6 +76,8 @@ int main(int argc, char** argv) {
     const int G = env_int("GAMES", 4), R = env_int("ROUNDS", 32), EPOCHS = env_int("EPOCHS", 3);
     const int MB = env_int("MINIBATCH", 256);
     const float LR = env_float("LR", 3e-4f), ENT = env_float("ENT", 0.01f), VF = env_float("VF", 0.5f);
+    // curriculum: round limit (official 1000); ore farther than this from both cores is removed (-1: keep all)
+    const int MAX_TURNS = env_int("MAX_TURNS", 1000), ORE_RADIUS = env_int("ORE_RADIUS", -1);
     torch::set_num_threads(env_int("THREADS", 4));
     torch::manual_seed(7);
 
@@ -90,6 +92,8 @@ int main(int argc, char** argv) {
         g.m = Match();
         if (!g.m.load(mp, master())) { std::cerr << "bad map " << mp << "\n"; std::exit(3); }
         g.m.reset();
+        g.m.game.max_turns = MAX_TURNS;
+        g.m.game.limit_ore(ORE_RADIUS);
         g.rng.seed(master());
     };
     for (auto& g : games) new_game(g);
