@@ -1,27 +1,45 @@
-# Live training knobs: re-read by neural_train (and distill) every iteration.
-# See rl/train/entropy_file.hpp.
-lr 0.0003
-epochs 3
-game_rounds 1000
-replay_every 50      # greedy self-play game logged every N iterations (0: off)
-ore_radius -1         # >= 0: all ore moved within this distance of each core (mirrored); -1: map as is
+# Live training knobs: re-read by neural_train (and distill) at the start of
+# EVERY iteration, so edits apply live. See rl/train/entropy_file.hpp.
+# One name and its value per line; '#' comments. A line you leave out keeps
+# its current value.
 
-# entropy coefficient per head
-core_spawn 0.01
-core_convert 0.01
-builder_mode 0.01
-builder_move 0.01
-builder_build_type 0.01
-builder_build_tile 0.01
-builder_build_dir 0.01
-builder_attack 0.01
-builder_heal 0.01
-builder_destroy 0.01
-gunner_mode 0.01
-gunner_fire 0.01
-gunner_rotate 0.01
-sentinel_mode 0.01
-sentinel_fire 0.01
-launcher_mode 0.01
-launcher_bot 0.01
-launcher_dest 0.01
+# lr: while this line is here it overrides the 3e-5 -> 1e-5 schedule;
+# delete it to go back to the schedule.
+# lr 0.00003
+
+# epochs: passes over each rollout (1-8). With more than one, a minibatch
+# whose KL(old || new) is over 0.03 ends that iteration's updates.
+epochs 1
+
+# game_rounds: rounds a training game lasts (1-1000), then decided like round 1000.
+game_rounds 1000
+
+# ore_radius: >= 0 moves all ore within this distance of each core (mirrored,
+# same Ti/Vo counts); -1 keeps the map's ore. Applies to games started afterwards.
+ore_radius -1
+
+# eval: every eval_every iterations, eval_games greedy games against the frozen
+# net (half on each side); >= 85% wins promotes the live net to frozen.
+# Game 0 is logged to replays/ for rl/tools/make_replay.py.
+eval_every 50
+eval_games 200
+
+# target entropy per head (defaults 0.008)
+core_spawn         0.008
+core_convert       0.008
+builder_mode       0.008
+builder_move       0.008
+builder_build_type 0.008
+builder_build_tile 0.008
+builder_build_dir  0.008
+builder_attack     0.008
+builder_heal       0.008
+builder_destroy    0.008
+gunner_mode        0.008
+gunner_fire        0.008
+gunner_rotate      0.008
+sentinel_mode      0.008
+sentinel_fire      0.008
+launcher_mode      0.008
+launcher_bot       0.008
+launcher_dest      0.008
