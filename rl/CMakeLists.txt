@@ -1,0 +1,48 @@
+cmake_minimum_required(VERSION 3.16)
+project(florent_rl CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_library(florent_rl_core STATIC
+  sim/florent_actions.cpp
+  sim/florent_heads.cpp
+  sim/florent_game.cpp
+)
+set_target_properties(florent_rl_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# engine + heads C API in one library, for the Python parity tests
+add_library(rlcapi SHARED sim/heads_capi.cpp ../engine/src/capi.cpp)
+target_link_libraries(rlcapi PRIVATE florent_rl_core)
+target_include_directories(florent_rl_core PUBLIC ../engine/src sim train)
+target_sources(florent_rl_core PRIVATE ../engine/src/fengine.cpp ../engine/src/obs.cpp)
+add_executable(action_smoke tests/action_smoke.cpp)
+target_link_libraries(action_smoke PRIVATE florent_rl_core)
+add_executable(rollout_smoke tests/rollout_smoke.cpp)
+target_include_directories(rollout_smoke PRIVATE train sim)
+target_link_libraries(rollout_smoke PRIVATE florent_rl_core)
+# LibTorch: either a standalone libtorch (find_package) or the pip torch wheel
+# (set TORCH_PY=<site-packages>/torch; its CMake config demands CUDA, so link it by hand).
+if(TORCH_PY)
+  set(Torch_FOUND TRUE)
+  set(TORCH_INCLUDE_DIRS ${TORCH_PY}/include ${TORCH_PY}/include/torch/csrc/api/include)
+  set(TORCH_LIBRARIES ${TORCH_PY}/lib/libtorch.so ${TORCH_PY}/lib/libtorch_cpu.so ${TORCH_PY}/lib/libc10.so)
+  set(CMAKE_BUILD_RPATH ${TORCH_PY}/lib)
+else()
+  find_package(Torch QUIET)
+endif()
+if(Torch_FOUND)
+ add_library(florent_model STATIC train/model.cpp)
+ target_include_directories(florent_model PUBLIC train ${TORCH_INCLUDE_DIRS})
+ target_link_libraries(florent_model PUBLIC ${TORCH_LIBRARIES})
+ target_compile_definitions(florent_model PUBLIC _GLIBCXX_USE_CXX11_ABI=1)
+endif()
+add_executable(florent_train train/main.cpp)
+target_include_directories(florent_train PRIVATE train sim)
+target_link_libraries(florent_train PRIVATE florent_rl_core)
+if(Torch_FOUND)
+ target_link_libraries(florent_train PRIVATE florent_model)
+ add_executable(neural_train train/neural_train.cpp)
+ target_include_directories(neural_train PRIVATE train sim ${TORCH_INCLUDE_DIRS})
+ target_link_libraries(neural_train PRIVATE florent_rl_core florent_model ${TORCH_LIBRARIES})
+ target_compile_definitions(neural_train PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+ # Spatial checkpoint export is implemented by rl/bot/export.py after a
+ # tensor-to-JSON conversion; no stale dense-MLP exporter target is shipped.
+endif()

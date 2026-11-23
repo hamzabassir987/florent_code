@@ -6,18 +6,42 @@ into the core or into an existing friendly conveyor. Voltium is converted to
 ammo by the core; spikes and gunners are built around the core when enemies
 show up there, and late in the game spare builders raid enemy conveyors.
 
-Store slots:
-  0  core position (packed)
-  1  number of harvesters built (approx, counter)
-  2  threat position near our core (packed, 0 = none)
-  3  enemy core position if seen (packed, 0 = unknown)
-  4  enemy conveyor seen (packed raid target, 0 = none)
-  5-14  ore claims, one per builder slot (id % 10)
+Team memory
+-----------
+The runtime gives every unit its own Player object and a single 16-slot u32
+team store whose writes become visible to the *next* round. Slots 3-12 are a
+priority-banded report bus (see docs/team-memory.md):
+
+  0      core position (packed)
+  1      harvester count, written by the core from its merged view
+  2      threat position near our core (packed, 0 = none)
+  3-5    resource discoveries          (highest priority)
+  6-8    turret / sentinel / spike / harvester add or remove
+  9-12   builder sightings, refreshed every 3 rounds
+  13,14  guard lease
+  15     phase flags
+
+Every unit queues its own uncommitted observations and broadcasts one report
+per band per turn; a report survives in the slot until overwritten, so every
+living unit sees it on its next turn. Losing a same-round slot collision is
+detected next turn (the report is absent from the snapshot) and retried.
 """
 
 from collections import deque
+import os
 
 from fcode import Controller, Direction, EntityType, Environment, Position, Team
+try:
+    from encoder import ActorEncoder
+except Exception:
+    ActorEncoder = None
+try:
+    from action_abi import candidates as learned_candidates, apply as apply_learned
+    from policy import LearnedPolicy, cpu_budget_ok
+except Exception:
+    learned_candidates = apply_learned = None
+    LearnedPolicy = None
+    cpu_budget_ok = lambda ct: False
 
 CARDINALS = (Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST)
 DIRS8 = tuple(d for d in Direction if d != Direction.CENTRE)
@@ -26,13 +50,22 @@ CARD_DELTA = tuple(d.delta() for d in CARDINALS)
 S_CORE = 0
 S_HARV = 1
 S_THREAT = 2
-S_ECORE = 3
-S_RAID = 4
-S_CLAIM0 = 5
 S_PHASE = 15
-N_CLAIM = 8
 S_GUARD = 13
 S_GUARD_BEAT = 14
+
+# report bands (priority order)
+BAND_RES = (3, 4, 5)
+BAND_STR = (6, 7, 8)
+BAND_BLD = (9, 10, 11, 12)
+REPORT_SLOTS = BAND_RES + BAND_STR + BAND_BLD
+
+# report categories
+R_TI, R_VO, R_GUNNER, R_SENTINEL, R_SPIKE, R_HARV, R_BUILDER = range(7)
+A_ADD, A_REMOVE, A_REFRESH = 0, 1, 2
+BUILDER_REFRESH_ROUNDS = 3
+BUILDER_SIGHTING_TTL = 3
+PENDING_CAP = 64
 
 # env codes in memory
 U, EMPTY, WALL, TI, VO, VOID = 0, 1, 2, 3, 4, 5
@@ -63,6 +96,47 @@ def unpack(v: int):
     return Position((v >> 8) - 1, (v & 0xFF) - 1)
 
 
+# ---------------------------------------------------------------------------
+# Team-store report packets
+#
+# One self-contained message per slot, packed into a u32 (0 = empty):
+#
+#   bit  0     valid flag (always 1 in a written packet)
+#   bits 1-2   action: 0 = add/observe, 1 = remove, 2 = refresh (sighting)
+#   bits 3-5   category: R_TI .. R_BUILDER
+#   bit  6     team: 0 = own, 1 = enemy
+#   bits 7-17  tile index (11 bits; every shipped map fits in 44x36)
+#   bits 18-27 observation round (10 bits, wraps every 1024 rounds)
+#
+# Fields are independent of slot choice, so a receiver needs nothing else.
+# ---------------------------------------------------------------------------
+PACK_TILE_BITS = 11
+PACK_ROUND_BITS = 10
+PACK_TILE_MAX = (1 << PACK_TILE_BITS) - 1
+PACK_ROUND_MASK = (1 << PACK_ROUND_BITS) - 1
+
+
+def pack_report(action, cat, team, tile, round_no):
+    return (1
+            | (action & 3) << 1
+            | (cat & 7) << 3
+            | (team & 1) << 6
+            | (tile & PACK_TILE_MAX) << 7
+            | (round_no & PACK_ROUND_MASK) << 18)
+
+
+def unpack_report(v):
+    if v <= 0 or not (v & 1):
+        return None
+    return (
+        (v >> 1) & 3,
+        (v >> 3) & 7,
+        (v >> 6) & 1,
+        (v >> 7) & PACK_TILE_MAX,
+        (v >> 18) & PACK_ROUND_MASK,
+    )
+
+
 class Player:
     def __init__(self):
         self.init = False
@@ -85,6 +159,21 @@ class Player:
         self.bad_sym = set()
         self.siege_cool = 0
         self.mines = set()
+        self.pending_reports = []
+        self.known_resources = {}
+        self.known_structures = {}
+        self.known_builders = {}
+        self.last_report_round = -1
+        self.actor_encoder = ActorEncoder() if ActorEncoder is not None else None
+        self.learned_policy = None
+        policy_path = os.environ.get("FLORENT_POLICY")
+        if LearnedPolicy is not None and policy_path:
+            try:
+                self.learned_policy = LearnedPolicy(policy_path)
+            except Exception:
+                self.learned_policy = None
+        self.policy_disabled = False
+        self.last_observation = None
 
     # ------------------------------------------------------------------
     def _setup(self, ct: Controller):
@@ -105,6 +194,33 @@ class Player:
     def run(self, ct: Controller) -> None:
         if not self.init:
             self._setup(ct)
+        try:
+            if self.actor_encoder is not None:
+                self.last_observation = self.actor_encoder.encode(ct)
+        except Exception:
+            self.last_observation = None
+        # Learned inference is opt-in and always guarded by the official CPU
+        # budget. Heuristic handlers remain the safe fallback for unavailable,
+        # malformed, or over-budget policies.
+        if (self.learned_policy is not None and not self.policy_disabled and
+                learned_candidates is not None and self.last_observation is not None and
+                cpu_budget_ok(ct)):
+            try:
+                choices, mask = learned_candidates(ct)
+                if choices and any(mask[1:]):
+                    typ = ct.get_entity_type()
+                    pidx = {EntityType.CORE: 0, EntityType.BUILDER_BOT: 1,
+                            EntityType.GUNNER: 2, EntityType.SENTINEL: 3,
+                            EntityType.LAUNCHER: 4, EntityType.SPIKE: 5}.get(typ, 0)
+                    chosen = self.learned_policy.choose(
+                        choices, mask,
+                        self.last_observation[0] + self.last_observation[1],
+                        pidx, cpu_budget_ok(ct))
+                    if chosen is not None:
+                        apply_learned(ct, chosen)
+                        return
+            except Exception:
+                self.policy_disabled = True
         t = ct.get_entity_type()
         try:
             if t == EntityType.CORE:
@@ -206,8 +322,11 @@ class Player:
                 continue
             et = ct.get_entity_type(uid)
             if et == EntityType.CORE:
-                ep = ct.get_position(uid)
-                ct.write_store(S_ECORE, pack(ep.x, ep.y))
+                # The enemy core is symmetry-derived; a direct sighting is
+                # still kept as a high-confidence local fact, not broadcast in
+                # the report bus.
+                if not own:
+                    self.ecore = ct.get_position(uid)
                 continue
             if et == EntityType.CONVEYOR or et == EntityType.SPLITTER:
                 continue
@@ -281,12 +400,11 @@ class Player:
                         self.bld[i] = B_CORE
                         self.env[i] = EMPTY
         self.scan(ct)
+        self._merge_reports(ct)
+        self._scan_reportable(ct)
+        self._publish_reports(ct)
         if self.ecore is None:
-            e = unpack(ct.read_store(S_ECORE))
-            if e is not None:
-                self.ecore = e
-        if self.ecore is not None:
-            ct.write_store(S_ECORE, pack(self.ecore.x, self.ecore.y))
+            self.ecore = self.enemy_core_guess()
         pos = ct.get_position()
         if self.last == pos:
             self.stuck += 1
@@ -309,7 +427,6 @@ class Player:
 
         if self.jobs:
             self.do_jobs(ct, pos)
-            self.claim(ct)
             return
 
         # opportunistic: attack adjacent enemy building
@@ -332,7 +449,6 @@ class Player:
                     return
         if self.target is None:
             self.target = self.pick_ore(ct, pos)
-        self.claim(ct)
         if self.target is not None:
             self.go_harvest(ct, pos)
             return
@@ -480,24 +596,93 @@ class Player:
             return True
         return False
 
-    def claim(self, ct):
-        slot = S_CLAIM0 + ct.get_id() % N_CLAIM
-        if self.target is not None:
-            ct.write_store(slot, pack(self.target[0], self.target[1]))
-        else:
-            ct.write_store(slot, 0)
+    def _report_band(self, cat):
+        if cat in (R_TI, R_VO):
+            return BAND_RES
+        if cat == R_BUILDER:
+            return BAND_BLD
+        return BAND_STR
+
+    def _queue_report(self, action, cat, team, tile, round_no):
+        if not (0 <= tile <= PACK_TILE_MAX):
+            return
+        fact = (action, cat, team, tile)
+        if fact not in self.pending_reports:
+            self.pending_reports.append(fact)
+            if len(self.pending_reports) > PENDING_CAP:
+                # Preserve earlier, higher-priority facts; newest builder
+                # sightings are the only intentionally lossy class.
+                self.pending_reports = self.pending_reports[:PENDING_CAP]
+
+    def _merge_reports(self, ct):
+        for slot in REPORT_SLOTS:
+            msg = unpack_report(ct.read_store(slot))
+            if msg is None:
+                continue
+            action, cat, team, tile, seen_round = msg
+            if cat in (R_TI, R_VO):
+                if action != A_REMOVE:
+                    self.known_resources[tile] = TI if cat == R_TI else VO
+            elif cat == R_BUILDER:
+                if action == A_REMOVE:
+                    self.known_builders.pop(tile, None)
+                else:
+                    self.known_builders[tile] = (team, seen_round)
+            else:
+                key = (tile, cat, team)
+                if action == A_REMOVE:
+                    self.known_structures.pop(key, None)
+                else:
+                    self.known_structures[key] = seen_round
+        now = ct.get_current_round()
+        for tile, (_, seen) in tuple(self.known_builders.items()):
+            if ((now - seen) & PACK_ROUND_MASK) > BUILDER_SIGHTING_TTL:
+                self.known_builders.pop(tile, None)
+
+    def _publish_reports(self, ct):
+        """Publish deterministic, retryable reports; writes land next round."""
+        if not self.pending_reports:
+            return
+        now = ct.get_current_round()
+        remaining = []
+        for fact in self.pending_reports:
+            action, cat, team, tile = fact
+            band = self._report_band(cat)
+            # A stable hash distributes writers without a shared append cursor.
+            slot = band[(tile * 17 + cat * 7 + team) % len(band)]
+            ct.write_store(slot, pack_report(action, cat, team, tile, now))
+            remaining.append(fact)
+        self.pending_reports = remaining[-PENDING_CAP:]
+        self.last_report_round = now
+
+    def _scan_reportable(self, ct):
+        """Queue facts visible on this unit's current controller view."""
+        now = ct.get_current_round()
+        for p in ct.get_nearby_tiles():
+            i = p.y * self.W + p.x
+            env = ENV_CODE.get(ct.get_tile_env(p), EMPTY)
+            if env == TI:
+                self._queue_report(A_ADD, R_TI, 0, i, now)
+            elif env == VO:
+                self._queue_report(A_ADD, R_VO, 0, i, now)
+            bid = ct.get_tile_building_id(p)
+            if bid is not None:
+                et = ct.get_entity_type(bid)
+                if et in (EntityType.GUNNER, EntityType.SENTINEL, EntityType.SPIKE, EntityType.HARVESTER):
+                    cat = {
+                        EntityType.GUNNER: R_GUNNER, EntityType.SENTINEL: R_SENTINEL,
+                        EntityType.SPIKE: R_SPIKE, EntityType.HARVESTER: R_HARV,
+                    }[et]
+                    self._queue_report(A_ADD, cat, int(ct.get_team(bid) != self.me), i, now)
+            uid = ct.get_tile_builder_bot_id(p)
+            if uid is not None and now % BUILDER_REFRESH_ROUNDS == (uid % BUILDER_REFRESH_ROUNDS):
+                self._queue_report(A_REFRESH, R_BUILDER, int(ct.get_team(uid) != self.me), i, now)
 
     def claimed(self, ct):
-        mine = S_CLAIM0 + ct.get_id() % N_CLAIM
-        out = set()
-        for s in range(S_CLAIM0, S_CLAIM0 + N_CLAIM):
-            if s == mine:
-                continue
-            v = ct.read_store(s)
-            if v:
-                p = unpack(v)
-                out.add((p.x, p.y))
-        return out
+        # Resource reports are globally known only after the next-round store
+        # snapshot. Do not use this as an atomic reservation; deterministic
+        # distance/ID tie-breaking below handles occasional duplicate picks.
+        return {(tile % self.W, tile // self.W) for tile in self.known_resources}
 
     # BFS over walkable tiles from pos; returns dist dict-ish via generator
     def bfs_first_step(self, pos, goal_fn, max_nodes=1200, unknown_ok=True):
@@ -585,11 +770,12 @@ class Player:
         env = self.env
         bld = self.bld
         harv = ct.read_store(S_HARV)
+        known = self.known_resources
         best = None
         bestd = 10**9
         core = self.core
         for i in range(W * self.H):
-            e = env[i]
+            e = known.get(i, env[i])
             if (e == TI or e == VO) and bld[i] == B_NONE:
                 x, y = i % W, i // W
                 if (x, y) in claimed or self.fail.get((x, y), 0) > 30:
@@ -624,11 +810,9 @@ class Player:
                     self.jobs = []
                     return
                 ct.build_harvester(tp)
-                ct.write_store(S_HARV, ct.read_store(S_HARV) + 1)
                 self.bld[ty * self.W + tx] = B_OWN_HARV
                 self.replans = 0
                 self.target = None
-                self.claim(ct)
                 if self.jobs:
                     self.do_jobs(ct, pos)
             else:

@@ -1,7 +1,8 @@
 src = open('sep.py').read().replace("W, C, L = 15, 32, 3", "W, C, L = 17, 32, 3")
 exec(src.split("print(f\"{W}x{W}")[0])
-from array import array
-
+# Selected deployment architecture: four residual blocks, each consisting of
+# a 1x1 pointwise projection followed by a depthwise 3x3 layer. The cropped
+# implementation computes only the radius needed for the centre output.
 GRIDS = {}
 def grid(w):
     if w not in GRIDS: GRIDS[w] = G(w, w, 16)

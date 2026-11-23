@@ -1,0 +1,96 @@
+// Observation encoder.
+//
+// Two observations are defined here:
+//
+//  * the ACTOR observation: a 17x17 patch centred on the acting unit, built
+//    only from information that unit's controller is allowed to see (fog of
+//    war), plus "edge rays" that summarise what lies beyond the patch in the
+//    direction of every boundary cell. This is what the deployed Python bot
+//    computes, so the C++ and Python versions must agree bit for bit
+//    (engine/tools/obs_parity.py checks that).
+//
+//  * the CRITIC observation: the whole board at native resolution, without
+//    fog. Training only; never deployed. Computed once per round, not once
+//    per unit.
+#pragma once
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+#include "fengine.hpp"
+
+namespace fe {
+
+// ---------------------------------------------------------------- actor
+constexpr int PATCH = 17;
+constexpr int HALF = PATCH / 2;      // 8
+constexpr int RAY_LEN = 32;          // max tiles a ray walks
+
+// terrain codes kept in per-unit memory (0 = never seen)
+enum ObsTerrain : uint8_t { T_UNKNOWN = 0, T_EMPTY, T_WALL, T_ORE_TI, T_ORE_VO, T_VOID };
+
+constexpr int CH_TERRAIN = 6;        // empty, wall, ore_ti, ore_vo, void, unknown
+constexpr int CH_OWN = 11;           // own entity one-hot, index = Type
+constexpr int CH_ENEMY = 10;         // enemy entity one-hot, index = Type (mine omitted)
+constexpr int CH_OCC = 2;            // own / enemy builder bot on the tile
+constexpr int CH_STALE = 1;          // rounds since last seen (0 = visible now), cap 255
+constexpr int CH_VISIT = 1;          // rounds since last observed builder presence
+constexpr int CH_ATTR_STALE = 2;     // age of remembered building / bot attributes, cap 255
+constexpr int CH_DIR = 9;            // building direction one-hot: centre, then compass directions
+constexpr int CH_HP = 2;             // remembered building / builder HP percentage
+constexpr int CH_THREAT = 4;         // own/enemy remembered turret reach: possible / confirmed
+constexpr int CH_RAY = 11;           // ray aggregates, written on boundary cells only
+constexpr int ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY;  // 57
+constexpr int ACTOR_SPATIAL = ACTOR_CH * PATCH * PATCH;
+constexpr int ACTOR_SCALARS = 40;
+
+constexpr int C_TERRAIN = 0;
+constexpr int C_OWN = C_TERRAIN + CH_TERRAIN;
+constexpr int C_ENEMY = C_OWN + CH_OWN;
+constexpr int C_OCC = C_ENEMY + CH_ENEMY;
+constexpr int C_STALE = C_OCC + CH_OCC;
+constexpr int C_VISIT = C_STALE + CH_STALE;
+constexpr int C_ATTR_STALE = C_VISIT + CH_VISIT;
+constexpr int C_DIR = C_ATTR_STALE + CH_ATTR_STALE;
+constexpr int C_HP = C_DIR + CH_DIR;
+constexpr int C_THREAT = C_HP + CH_HP;
+constexpr int C_RAY = C_THREAT + CH_THREAT;
+
+// per-unit fog memory (one instance per unit)
+struct ObsMemory {
+    int W = 0, H = 0, team = 0;
+    std::vector<uint8_t> terrain;       // ObsTerrain
+    std::vector<int32_t> bld_id;        // remembered building, -1 = none
+    std::vector<int8_t> bld_type;       // Type, when bld_id >= 0
+    std::vector<int8_t> bld_team;
+    std::vector<int32_t> bot_id;        // remembered builder bot, -1 = none
+    std::vector<int8_t> bot_team;
+    std::vector<int32_t> seen_round;    // last round in vision, -1 = never
+    std::vector<int32_t> visit_round;   // last observed round with a builder on tile, -1 = never
+    std::vector<int8_t> bld_dir;        // last observed direction, -1 = unavailable/centre
+    std::vector<int16_t> bld_hp;        // last observed HP percentage
+    std::vector<int8_t> bot_dir;
+    std::vector<int16_t> bot_hp;
+    std::vector<int32_t> attr_seen_round; // last round entity attributes were observed
+
+    void init(const Game& g, int team_);
+    void update(const Game& g, int actor);
+};
+
+// flat int32 buffer; channel-major, index = channel * PATCH*PATCH + (dy+HALF)*PATCH + (dx+HALF)
+void encode_actor(const Game& g, const ObsMemory& m, int actor,
+                  std::vector<int32_t>& ch, std::vector<int32_t>& scalars);
+
+// ---------------------------------------------------------------- critic
+constexpr int CRITIC_PAD = 48;       // maps up to 48x48; larger ones are clipped
+constexpr int CC_TERRAIN = 5;        // empty, wall, ore_ti, ore_vo, void
+constexpr int CC_OWN = 11;           // own (team 0 of the encoder call) entity one-hot
+constexpr int CC_ENEMY = 11;
+constexpr int CC_OCC = 2;            // builder bots
+constexpr int CRITIC_CH = CC_TERRAIN + CC_OWN + CC_ENEMY + CC_OCC;   // 29
+constexpr int CRITIC_SPATIAL = CRITIC_CH * CRITIC_PAD * CRITIC_PAD;
+constexpr int CRITIC_SCALARS = 1 + 10 + 2 * NTYPES;
+
+void encode_critic(const Game& g, std::vector<int32_t>& ch, std::vector<int32_t>& scalars);
+
+}  // namespace fe

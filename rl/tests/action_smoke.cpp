@@ -1,0 +1,3 @@
+#include "../sim/florent_game.hpp"
+#include <iostream>
+int main(int argc,char**argv){ if(argc<2){std::cerr<<"map required\n";return 2;} florent_rl::Match m; if(!m.load(argv[1],7)) return 3; m.reset(); for(int r=0;r<8 && !m.game.over;++r){ m.round_critic(); for(int a:m.acting_units()){ std::vector<florent_rl::Candidate> cs; florent_rl::enumerate_candidates(m.game,a,cs); bool done=false; for(const auto& c:cs) if(florent_rl::legal_candidate(m.game,a,c)){ int e=m.act(a,c); if(e==fe::OK){done=true;break;} } if(!done) std::cerr<<"no legal action for "<<a<<"\n"; } m.game.end_round(); } std::cout<<"ACTION SMOKE OK rounds="<<m.game.round<<"\n"; }

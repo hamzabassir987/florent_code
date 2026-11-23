@@ -1,291 +1,398 @@
-# Handoff: Florent Code League project (read this first)
+# HANDOFF — Florent Code League / RL continuation
 
-Context for a new Claude Code session continuing this work. Everything below
-was done in one long earlier session (cloud container). The repository is
-the source of truth: `hamzabassir987/florent_code`, branch
-`claude/trusting-babbage-cv9nfu`.
+This file is the complete handoff for a fresh Claude Code session. Read it before doing anything. The repository is `/home/hamza/florent/florent_code` and is a git repository, currently with uncommitted work. The user wants the entire train-to-deploy RL system completed, not a sequence of milestone explanations.
 
----
+## 0. User requirements and working rules
 
-## 0. How to work with this user
+- Continue working autonomously; do not stop after a compile or smoke test.
+- Do not repeatedly explain that the work is incomplete. Implement the next missing layer.
+- The supplied `rl_pipeline.zip` is an architecture/template from another game. Reuse its generic PPO/GAE/rollout/checkpoint/distillation/parity ideas, but do not port its game rules, token layout, action semantics, maps, or reward shaping.
+- Reward must be **only terminal**:
+  - winner: `+1`
+  - loser: `-1`
+  - non-terminal/draw: `0`
+  - no economy, damage, delivery, survival, or combat shaping.
+- Exactness matters for the native engine and trainer/deployment parity.
+- Production bot is pure Python in a sub-interpreter. No NumPy. Official per-unit budget is 10 ms plus banked buffer.
+- Do not ask the user to choose routine implementation details. Make sensible decisions and continue.
+- Do not claim the system is complete until a learned policy is actually integrated into the bot, exported, and tested under official `fcode run --tle 10`.
 
-- **Very concise answers.** The user gets impatient with long explanations or
-  with being shown many options at once. Answer exactly what was asked, short.
-  When they ask "how fast is X", give the number.
-- **Exactness matters.** For the engine, the user explicitly demanded 0%
-  difference from the official engine ("it should be at 0%") and asked to
-  consider edge cases, not rely on replays only. Don't settle for "close".
-- Don't add things they didn't ask for (e.g. I once benchmarked a ResNet
-  variant unprompted and they were confused: "when did I tell you to use
-  resnet?").
-- They make the design decisions (network shape etc.); give data, then do
-  what they choose.
-- They may hit usage limits mid-task; resume where things stopped.
+## 1. Game/runtime facts
 
----
+Florent Code League package/runtime is `fcode 2.6.0`.
 
-## 1. The game (summary; full rules in `engine/RULES.md`)
+- Two symmetric teams, up to 1000 rounds.
+- Entry point: `main.py`, top-level `class Player`, `run(self, ct)`.
+- `run()` is called once per round for every living acting unit.
+- Units: core, builder, gunner, sentinel, launcher, spike.
+- Buildings: conveyor, splitter, harvester, barrier, mine.
+- Builders are the mobile units. A builder may move or perform a normal action per turn; builders move cardinally.
+- Team store has 16 slots; writes are visible next round, not immediately.
+- Fog is per unit. Out-of-vision controller calls can raise exceptions.
+- An uncaught exception destroys the unit. Existing bot wraps `run()` defensively.
+- Official test must use `--tle 10`; default local `--tle 0` does not enforce timing.
+- NumPy cannot be used reliably in the runtime.
 
-"Florent Code League" (`fcode` on PyPI, v2.6.0): two teams on a symmetric
-grid (8x8 to 30x30 per docs, but ladder maps go up to 44x24 and 36x36). Each
-team writes a Python `class Player` with `run(self, ct)` in `main.py`; `run`
-is called once per round for **every living unit** (core, builder bots,
-turrets). 1000 rounds.
+Important official commands from repo root:
 
-- Win: destroy enemy core (500 HP), else tiebreaks at round 1000: titanium
-  delivered to core → harvesters alive → titanium stored → coin flip.
-- Resources: titanium (Ti; start 500, +10 every 4 rounds) pays for everything;
-  Voltium only converts to ammo (2 ammo per Voltium, core `convert_ammo`).
-  Harvesters on ore output a stack of 10 every 4 rounds; stacks travel along
-  conveyors to the core.
-- Units: builder bots (only mobile unit, 1 move OR 1 action per round, cardinal
-  moves, everything targets orthogonally adjacent tiles), gunners (3-tile line,
-  7 dmg, 4 ammo), sentinels (5-tile line, ignores obstacles, 18 dmg, 10 ammo),
-  launchers (throw builders), spikes (12 dmg to all 8 neighbours, no ammo),
-  mines (hidden from enemy, 40 dmg). Buildings: conveyor, splitter, harvester,
-  barrier.
-- Costs: `floor(base × scale)` with one per-team scale (sum of increments of
-  living entities).
-- **Fog of war**: each unit sees only within its vision radius² (core 36,
-  builder 20, gunner 13, sentinel 32, launcher 26, spike 8). Querying outside
-  vision raises GameError. Ore/walls/enemy core are unknown until seen.
-- **CPU**: 10 ms per unit per turn plus a banked buffer of up to 5% (0.5 ms).
-  Over budget → turn interrupted (unit survives, restarts fresh next round).
-  Uncaught exception → unit destroyed permanently.
-- Shared team memory: 16 int store slots, writes visible next round.
-- Bot runs in a Python sub-interpreter: **numpy is not usable** (fails to load
-  twice in one process; the server likely doesn't have it anyway). Pure Python
-  only.
-- Server drops printed stdout from replays (local runs keep it).
+```bash
+.venv/bin/fcode run econ starter maps/gen00.map26 --seed 3 --replay check_s3.replay26 --tle 10
+.venv/bin/python3 engine/tools/verify.py check_s3.replay26
+.venv/bin/python3 engine/tools/obs_parity.py --games 8 --rounds 250 --seed 7 --map maps/gen00.map26
+```
 
-The original full API/spec text was pasted by the user at the start of the
-earlier session; `engine/RULES.md` has everything verified, and the API stubs
-are in the installed package (`fcode/_types.py`).
-
----
+Official ladder map access requires `fcode login`; credentials are not available in this session. Local maps are under `maps/`.
 
 ## 2. Repository layout
 
+- `engine/src/fengine.hpp/.cpp`: exact native engine.
+- `engine/src/capi.cpp`: C API for ctypes/trainer.
+- `engine/src/obs.hpp/.cpp`: C++ actor/critic observation encoder.
+- `engine/Makefile`: builds `engine/build/libfengine.so`.
+- `engine/tools/verify.py`: replay-driven exactness verifier.
+- `engine/tools/obs_parity.py`: C++/Python observation parity harness.
+- `bots/econ/main.py`: current heuristic bot, modified with team-memory report bus and encoder integration.
+- `bots/econ/encoder.py`: pure-Python production-shaped actor encoder.
+- `docs/obs.md`: observation specification.
+- `docs/team-memory.md`: delayed team-store/report-bus specification.
+- `docs/rl-layout.md`: original Florent action/layout proposal; some details need correction before final ABI.
+- `rl/`: new experimental Florent RL subtree added during this session.
+- `rl_pipeline.zip`: supplied architecture reference at `/home/hamza/florent/rl_pipeline.zip`.
+- Extracted reference audit directory: `/tmp/rl_pipeline_review/rl_pipeline`.
+- `.env` outside the repo contains a secret and must never be committed or included.
+
+## 3. Native engine status: DONE and exact
+
+The native engine was already implemented before the RL work and is the source of truth.
+
+Key APIs in `engine/src/fengine.hpp`:
+
+- `load_map`, `reset`, `turn_order`, `end_round`.
+- State: `ents`, `bld`, `bot`, `env`, `teams`, `round`, `winner`, `over`, `last_moves`.
+- Actions: `move`, `build`, `attack`, `heal`, `destroy`, `self_destruct`, `spawn`, `convert_ammo`, `fire`, `rotate`, `launch`, `write_store`, `resign`.
+- Checks: `can_move`, `can_build`, `can_attack`, `can_heal`, `can_destroy`, `can_spawn`, `can_convert`, `can_fire`, `can_rotate`, `can_launch`.
+- Fog/vision: `in_vision`, `dist2_from`, `nearby_tiles`, `nearby_ids`, `visible_building`, `tile_building`, `tile_empty`, `tile_passable`.
+
+Exactness history:
+
+- Replay verifier and official probes established engine parity over many generated and ladder replays.
+- Engine speed is approximately 500 full random games/s single-threaded.
+- Store timing was tested: same-round reads see the old snapshot; writes become visible after the round.
+
+Do not modify engine rules casually. Any engine change must be verified against official replay/probe behavior.
+
+## 4. Observation system: implemented and parity-tested
+
+### C++
+
+`engine/src/obs.hpp/.cpp` defines:
+
+- Actor patch: 17x17.
+- Actor spatial channels: 59.
+- Actor scalar features: 40.
+- Per-unit `ObsMemory`: terrain, remembered buildings/entities, staleness, builder visit history, direction, HP.
+- Raw edge-ray channels including unseen count.
+- Turret possible/confirmed reach cues.
+- Critic: global 48x48 padded board, 29 channels, 33 scalars.
+- Critic is intended to be computed once per round, not once per unit.
+
+Important dimensions:
+
+```text
+ACTOR_SPATIAL = 59 * 17 * 17 = 17051
+ACTOR_SCALARS = 40
+ACTOR_INPUT   = 17091
+CRITIC_SPATIAL = 29 * 48 * 48 = 66816
+CRITIC_SCALARS = 33
 ```
-bot.zip                 submission zip of bots/econ (main.py at root)
-bench.zip               CPU benchmark submission (bots/bench)
-fcode.toml              fcode project config (bots_dir=bots, maps_dir=maps)
-maps/                   28 generated test maps (gen*, pit*, s7_*)
-tools/genmap.py         random symmetric map generator (+ pit maps); `encode()` writes .map26
-tools/readreplay.py     prints per-unit CPU time per turn from a replay
-bots/econ/              MY CURRENT BOT (handwritten heuristic, see §4)
-bots/v1, bots/v2        older snapshots of econ (for A/B tests)
-bots/starter/           official starter bot
-bots/chaos/             random/probe bot (copy of engine/probe/chaos)
-bots/bench/             server CPU benchmark bot (SWAR conv timing)
-engine/                 NATIVE C++ ENGINE (exact clone of the official engine)
-  RULES.md              all verified rules, incl. exact distribution algorithm
-  src/fengine.hpp/.cpp  the engine (Game class)
-  src/rustrng.hpp       bit-exact Rust rand 0.8 StdRng (ChaCha12) port
-  src/capi.cpp          C API (ctypes) used by the verifier
-  Makefile              builds build/libfengine.so
-  examples/random_game.cpp  speed benchmark (~500 random games/s, 1 thread)
-  tools/replay.py       .replay26 decoder (no deps)
-  tools/verify.py       replay verifier (see §3)
-  tools/rustrand.py     Python port of the Rust StdRng
-  tools/seedsearch.cpp  recover a replay's 32-bit seed from its first 2 entity ids
-  probe/                bots run in the OFFICIAL engine to measure rules:
-    run_probe.py, bot/  scripted scenario runner (custom map + build list)
-    chaos/              random play + logs can_* answers ("Q ...") and vision ("V ...")
-    pitthrow/           launcher throws across pits of width 2/3/5
-    minetest/           mines: spawn-onto, walk-onto, enemy build checks
-    unitcap/            reaches the 50-unit cap (uses econ.py copy)
-research/nn_bench/      pure-Python NN speed benchmarks (SWAR), see §5
-research/reverse_engineering/  gdb tracing scripts + replay-generation scripts
-                        (these reference /tmp/claude-0 paths from the old container; adjust)
+
+`engine/src/capi.cpp` exposes observation functions and `fe_get_store`.
+
+### Python
+
+`bots/econ/encoder.py` contains:
+
+- `ObsMemory`.
+- `ControllerAdapter`.
+- `ActorEncoder` keyed by unit ID.
+- Pure Python, no NumPy.
+- Same channel/scalar semantics as C++.
+
+A real bug was fixed in `ControllerAdapter.entity_direction`: official `get_direction()` can throw for non-facing entities such as harvesters, barriers, mines, and cores. The Python adapter now catches that and returns centre/unavailable semantics matching C++.
+
+### Parity result
+
+Latest run passed:
+
+```text
+mismatches: 0
+leaks: 0
+critic failures: 0
+PARITY OK
 ```
 
-Not in the repo (were in the old container's /tmp, gone): the user's 32 ladder
-replays (`test.zip`, user has it), the RL pipeline zip (`rl_pipeline.zip`, user
-has it), ~100 locally generated official replays (regenerate with `fcode run
---seed N --replay X_s<N>.replay26`), recovered ladder seeds (rerun seedsearch).
+The encoder timing measured approximately 0.5 ms median and approximately 1 ms p95 per unit in the parity harness.
 
-Setup on a new machine:
+Do not regress this parity. The actor must only receive production-observable information. The critic may be privileged and global.
+
+## 5. Current heuristic bot status
+
+`bots/econ/main.py` is a working heuristic economy/siege bot.
+
+Design:
+
+- Per-unit map memory.
+- Known resource reports through delayed 16-slot team store.
+- Priority report bus:
+  - slot 0 core position;
+  - slot 1 harvester count;
+  - slot 2 threat;
+  - slots 3–5 resource reports;
+  - slots 6–8 structure reports;
+  - slots 9–12 builder sightings;
+  - slots 13–14 guard lease;
+  - slot 15 phase.
+- Packet format has valid bit, action, category, team, tile, round modulo 1024.
+- Collision/pending retry logic exists.
+- Resource positions persist; builders move freely; conveyor path planning is not builder movement macro-control.
+- Known resource is required before path planning/harvester construction.
+- Visible harvester masks build-harvester but does not delete resource/path knowledge.
+
+The bot now imports `ActorEncoder` optionally and calls it at the start of each turn, storing `last_observation`. Learned inference is not yet used for decisions; heuristic behavior remains the fallback.
+
+Official runtime regression recently passed:
+
+```text
+fcode run econ starter maps/gen00.map26 --seed 3 --tle 10
+Winner: econ, core destroyed, turn 611
 ```
-pip install fcode            # official CLI + engine (Linux x86 wheel was used)
-cd engine && make            # builds build/libfengine.so
-fcode run econ starter maps/gen00.map26 --seed 3 --replay check_s3.replay26
-python3 engine/tools/verify.py check_s3.replay26   # expect 0 mismatches
+
+Another recent test:
+
+```text
+fcode run econ starter maps/pit01.map26 --seed 3 --tle 10
+Completed turn 1000
+Winner: econ by titanium tiebreak
+No TLE or exception
 ```
-`fcode` needs `fcode.toml` in cwd (repo root has it). Official maps need
-`fcode login` (we never had credentials), so all maps were generated locally.
 
----
+The replay verifier reported the known conveyor tie-order differences in one local run, but core state, HP, totals, and winner checks passed. Re-run verifier after future bot changes.
 
-## 3. The native engine (DONE, exact)
+## 6. User’s final action/policy design
 
-Goal (user's): a fast native engine for RL self-play that reproduces the
-official engine **exactly**. Status: achieved and verified.
+One model/trunk per unit type:
 
-### How it was made exact
-The official engine is a compiled Rust library
-(`fcode/fcode_engine.cpython-313-x86_64-linux-gnu.so`, built from a private
-repo `battlecode-platform/engine/rust/...`, no source available anywhere). It
-still has symbol names. Methods used:
-1. **Replays** (`tools/verify.py`): rebuild every action from a replay's events,
-   run them through the engine, compare HP, deaths, ids, resource moves (incl.
-   stack ids), team totals each round, winner.
-2. **Disassembly + gdb tracing** of `Game::distribute_resources` and its
-   `edge_priority` (objdump; gdb Python breakpoints logging heap push/pop).
-3. **Probe bots in the official engine** that log `can_*` answers and vision
-   answers; the verifier re-asks the native engine in the identical state.
+- Core: spawn builder, ammo conversion amount, wait.
+- Builder: free movement, all building types, local attack/heal/destroy, wait.
+- Gunner: fire, rotate, wait.
+- Sentinel: fire, wait.
+- Spike: heuristic fire/wait initially.
+- Launcher: own policy; select adjacent builder and destination; wait.
+- Harvester/conveyor/splitter/barrier/mine do not act independently.
 
-### Key findings (all in RULES.md)
-- Turn order = creation order (both teams interleaved).
-- Resource distribution = max-heap of edges (source→target), priority
-  `i32::MAX` if source has 1 edge and target 1 source, else −(round edge last
-  used); plus uniform [0,1) tie-break from `StdRng(seed)`. Waiting edges
-  re-pushed when a tile empties. Grid scan row-major; pushes in target (x,y)
-  order. Harvester cooldown 4.
-- RNG: `StdRng::seed_from_u64(seed)` for distribution tie-breaks and the coin
-  flip (`gen::<bool>()`, top bit of next_u32, true = A);
-  `StdRng::seed_from_u64(seed ^ 0x1D5EED00C0DEF00D)` for entity AND stack ids:
-  `gen_range(3..1e9)`, redrawn if the id was EVER issued (never reused).
-- Legality details found by probing: builder attack needs a building; only
-  conveyor/splitter can be built under a builder bot; launcher can't target
-  void; throw across pit >2 wide is legal and the bot falls; gunner rotation
-  must change direction; shots hit the bot on a tile before the building;
-  spike hits one entity per tile (bot first); enemy can't build on a hidden
-  mine's tile; spawning onto an enemy mine triggers it; unit cap 50; the map's
-  "economy" game-mode flag has no effect.
-- Vision: core radius from nearest footprint tile; lists row-major, building
-  then bot, self included; enemy mines invisible; `is_tile_passable` false
-  under any bot.
-- Ladder seeds are 32-bit; recover with `seedsearch ID1 ID2 0 4294967296`
-  (~4 min each, 4 cores). Name replays `*_s<seed>.replay26` so verify.py uses
-  the seed.
+Important corrections still required before final ABI:
 
-### Verification totals (all zero differences)
-- 32/32 user ladder replays (seeds recovered): 1.04 M moves, 10,846 ids,
-  4.6 M HP checks, 1,041 deaths, all totals, 32 winners.
-- ~80 locally generated official games (bot pairings, pit/wide-pit maps,
-  chaos, probes): 6+ M legality answers, 1.3 M resource moves, all ids/HP/
-  totals/winners; vision 1.63 M answers.
+1. Builder normal actions are mutually exclusive with movement. Do not model separate independent sampled heads whose product is not the executed action probability. Use one main categorical union of legal actions, or explicitly model free-action heads and one committed main action.
+2. `destroy` and `convert_ammo` have special semantics and need exact treatment. Verify whether they are free/repeatable before final policy ABI.
+3. Board-sized logits violate fixed checkpoint ABI. Use fixed offset tables/windows for spawn and launcher destination rather than map-dependent board-sized heads.
+4. `can_launch` may permit enemy builder targets; do not restrict to friendly builders without verifying the rule.
+5. Builder movement is cardinal only; facing/build directions may be 8-way.
+6. Every legal choice set must be nonempty. Always retain wait/none.
+7. Conveyor/splitter planner masks must be shared exactly between C++ and Python, or omit planner restriction in v1 and let the policy choose all legal builds.
 
-### Engine API (C++ `fe::Game`, C API in capi.cpp)
-`load_map`, `reset(seed)`, `turn_order()`, actions (`move, build, attack,
-heal, destroy, self_destruct, spawn, convert_ammo, fire, rotate, launch,
-write_store, resign`), checks (`can_*`), `end_round()`, state (`ents`, `bld`,
-`bot`, `teams`, `env`, `round`, `winner`, `over`), vision (`in_vision`,
-`nearby_tiles`, `nearby_ids`, `tile_building`, `tile_empty`,
-`tile_passable`). Speed: ~500 full random games/s single thread.
+The current `docs/rl-layout.md` is a design draft, not a final validated ABI. Fix it to reflect the above before relying on checkpoints.
 
-Store (`write_store`) is implemented trivially (buffered); not verified (no
-rule depends on it).
+## 7. Supplied RL pipeline audit
 
----
+The archive is Battlecode/cambc-specific. Useful generic pieces:
 
-## 4. Current submission bot: `bots/econ/main.py` (= bot.zip)
+- PPO clipped policy loss.
+- GAE and truncation.
+- Legal choice-set masked log-softmax.
+- Entropy scheduling.
+- KL stopping and gradient clipping.
+- Checkpoint save/load/widening patterns.
+- Teacher/student distillation.
+- Quantization/calibration ideas.
+- Evaluation/opponent pool/dashboard patterns.
 
-Handwritten heuristic. Beat the starter 10/10 locally and earlier versions
-(v1, v2) clearly. Main ideas:
-- Builders keep per-unit map memory, claim ore via store slots, build a
-  harvester only if its whole conveyor chain is affordable, chain planned by
-  Dijkstra into the core or into an existing chain that reaches the core.
-- **Conveyor throughput is ~1 stack/round**, so trunks are limited to
-  `MAX_TRUNK = 3` harvesters each (big income gain).
-- Spawn rate `want = 4 + harvesters//2` (tuned).
-- Siege from round ≥150 with ≥500 Ti: idle builders find the enemy core via
-  map symmetry, ring it with gunners, heal them, attack the core.
-- Danger-aware pathing, core healing, a home guard laying corner mines.
-- Worst CPU turn measured ~2.7 ms.
+Reference files:
 
-Not yet tuned: siege trigger timing (a test was interrupted).
+- `/tmp/rl_pipeline_review/rl_pipeline/train/main.cpp`
+- `/tmp/rl_pipeline_review/rl_pipeline/train/model.cpp`
+- `/tmp/rl_pipeline_review/rl_pipeline/train/game.hpp`
+- `/tmp/rl_pipeline_review/rl_pipeline/train/env.hpp`
+- `/tmp/rl_pipeline_review/rl_pipeline/train/layout.hpp`
+- `/tmp/rl_pipeline_review/rl_pipeline/train/export_bot.cpp`
+- `/tmp/rl_pipeline_review/rl_pipeline/train/qnet.hpp`
+- `/tmp/rl_pipeline_review/rl_pipeline/train/parity.cpp`
 
----
+Do not reuse:
 
-## 5. Neural network plan and measured speeds (pure Python)
+- cambc `sim/game.*`.
+- cambc token layout.
+- champion/camp/altar/ward/spell/draft logic.
+- cambc reward shaping.
+- cambc map generation.
+- cambc C++ SIMD deployment target.
 
-The user wants an RL-trained policy. Pure Python only, 10 ms/turn.
+## 8. Current RL subtree and exact status
 
-**SWAR big-integer trick** (research/nn_bench): pack a whole grid channel
-into one Python int (16-bit slots with 4-bit weights/activations, or 32-bit),
-so one int op processes all cells. Bit-exact vs a naive reference. Cost scales
-with number of int ops (≈ channels² × kernel), NOT grid area.
+Files added under `rl/`:
 
-Measured (this container; the server looked about equally fast):
-- normal 3x3 conv 26→26 on 30x30: 8.2 ms/layer; 14x14: ~2.2 ms/layer.
-- 13x13, 26ch: 2/3/4 layers = 3.6/5.6/7.4 ms. 14x14: 4.5/6.7/9.1 ms.
-- 15x15, 32ch, 3 layers: normal 8.0 ms; 1x1+depthwise3x3: 1.5 ms.
-- ResNet (2 layers per block, 1x1+dw3x3, 32ch): 3 blocks 15x15 3.3 ms;
-  20x20 5.2 ms; 17x17 4 blocks 5.4 ms (36ch: 6.3 ms).
-- **Cropping** each layer to the region the centre still needs: 17x17, 4 blocks,
-  32ch → **4.4 ms** (centre output identical).
-- Depthwise 5x5 variant (2 blocks): 3.6 ms; user chose to keep 3x3.
-- Tried and rejected: whole-layer-as-one-multiply (Kronecker): 10-40x slower;
-  stacking output channels in one int: 10x slower.
+- `rl/CMakeLists.txt`: builds native RL core, smoke tests, optional LibTorch model/trainer.
+- `rl/README.md`: current workspace notes.
+- `rl/sim/florent_actions.hpp/.cpp`: candidate enumeration, native `can_*` legality, action application.
+- `rl/sim/florent_game.hpp/.cpp`: native match wrapper, critic encoding once per round, actor observation method, terminal reward helper.
+- `rl/train/florent_layout.hpp`: dimensions, PPO constants, unit policies, terminal reward helper.
+- `rl/train/policy_math.hpp`: masked log-softmax/entropy utility.
+- `rl/train/model.hpp/.cpp`: minimal LibTorch `SpatialPolicy`; currently a simple flattened MLP, not the user-selected SWAR spatial network.
+- `rl/train/trajectory.hpp`: basic trajectory/advantage scaffold.
+- `rl/train/rollout.hpp`: random rollout scaffold.
+- `rl/train/main.cpp`: table-style placeholder trainer; not the final PPO trainer.
+- `rl/train/neural_train.cpp`: current observation-driven LibTorch smoke trainer; it samples legal actions from logits and runs an optimizer update, but is not yet correct PPO/GAE/critic training.
+- `rl/bot/action_abi.py`: Python candidate/action ABI draft.
+- `rl/bot/export.py`: currently copies checkpoint bytes and writes metadata; not a true quantized exporter.
+- `rl/bot/policy.py`: deployment loader with safe wait fallback; does not run model weights.
+- `rl/tests/action_smoke.cpp`: random first-legal native rollout.
+- `rl/tests/rollout_smoke.cpp`: random rollout smoke test.
 
-**Chosen design (user's decision):** input = 17×17 patch centred on the unit,
-filled from the unit's map memory (with an "unknown" channel), plus distance
-features for things outside the patch (precomputed BFS distance maps,
-recomputed only when things change); network = 4 ResNet blocks of
-(1x1 conv → depthwise 3x3 → ReLU) with skips, 32 channels, cropped, read the
-centre logits. Receptive field 17x17. ~4.4 ms. Must be trained with 4-bit
-quantisation in mind. Run only when the turn has CPU left
-(`ct.get_cpu_time_elapsed()`), fall back to heuristics otherwise.
-MLP for scoring candidate decisions was also discussed as an option.
+Build command:
 
-Server CPU: `bench.zip` measured; one server replay showed the server about as
-fast as the container (a setup step took 11.3 ms there vs 12.7 ms locally).
+```bash
+cmake -S rl -B /tmp/florent_rl_build -DCMAKE_PREFIX_PATH=/home/hamza/libtorch
+cmake --build /tmp/florent_rl_build -j2
+```
 
----
+LibTorch is installed at `/home/hamza/libtorch` and is CUDA-enabled. In this WSL environment CUDA initialization segfaulted through the NVIDIA PTX JIT. CPU-only runs work with:
 
-## 6. RL pipeline (user's zip, to port)
+```bash
+CUDA_VISIBLE_DEVICES=-1 LD_LIBRARY_PATH=/home/hamza/libtorch/lib /tmp/florent_rl_build/neural_train maps/gen00.map26 1 /tmp/florent-real.pt
+```
 
-`rl_pipeline.zip` (user has it): a C++/libtorch PPO self-play trainer built
-for Battlecode 2026a "cambc" (`README_FIRST.md`, `train/README.md`,
-`train/NEXT_RUN.md`). Pieces: native engine wrapper (`sim/`), `train/layout.hpp`
-(inputs/heads), `train/model.cpp` (encoder `begin_turn`, legal-action filter
-`plan_turn`, `finish_turn`, rewards), `train/main.cpp` (PPO, GAE, eval,
-distillation), `export_bot.cpp` (int8 SIMD export), parity tools. Lessons in
-its README (parity is everything; path distances not straight-line; train the
-student on the degraded inputs the bot can afford).
+Latest successful smoke output:
 
-Porting gaps identified:
-1. Engine: DONE (this repo's `engine/`, replaces their wasm2c engine).
-2. Deployed bot is pure Python with the SWAR int4 network (their export
-   targets C++ int8 SIMD): need a new exporter + Python inference code with a
-   parity checker.
-3. Inputs/heads: their policy is token-based; ours is the 17x17 patch + distance
-   features + MLP head. Heads needed: builder (move N/E/S/W/stay, build type ×
-   tile × direction, attack, heal, destroy, mine), core (spawn tile, convert),
-   turrets (target), launcher (bot, target). Legal-action masking via the
-   engine's `can_*`.
-4. No GPU / no PyTorch in the old container; training runs on the user's
-   machine.
+```text
+NEURAL TRAIN COMPLETE checkpoint=/tmp/florent-real.pt
+```
 
----
+This is **not** completion. It only proves the current minimal model can consume real encoded rows, sample legal native actions, update once, and save a checkpoint.
 
-## 7. Next steps (where we stopped)
+## 9. Critical known defects / unfinished work
 
-The engine is complete (rules + randomness + vision, all exact). Next:
-1. Observation encoder from the engine state honouring fog: 17x17 patch from
-   per-unit memory + unknown channel + distance features; must be computable
-   identically in the Python bot (parity tests).
-2. Action heads + legal-action filter.
-3. Plug into the PPO loop from the pipeline (C++ trainer linking fengine).
-4. Quantised (4-bit) training/distillation, exporter to the Python SWAR
-   format, parity checker (bot vs trainer), CPU budget guard.
-5. Optional: tune the heuristic bot's siege timing; keep `bot.zip` as fallback.
+These must be fixed, not merely documented:
 
----
+### RL correctness
 
-## 8. Gotchas
+- Current neural trainer does not implement true PPO clipped objective.
+- Current trainer does not store old log probabilities correctly per legal choice set.
+- Current trainer does not calculate proper round-level GAE from a trained centralized critic.
+- Current trainer does not train or use the critic.
+- Current trainer uses one generic `H_WAIT` head for all unit types instead of separate unit-type architectures/heads.
+- Current trainer handles spikes by waiting, not the intended heuristic fire/wait policy.
+- Current trainer’s action candidate ABI is still too broad/map-dependent in places and needs fixed action union/window redesign.
+- Current reward propagation is only a minimal terminal helper; implement terminal `{+1,0,-1}` at game end and correct team assignment.
+- Current match wrapper lacks a robust turn cursor/round folding layer for batched PPO trajectories.
+- Current critic encoder is team-0 oriented and needs team-frame handling or explicit team identity.
+- Full 48x48 critic rows are large; do not blindly allocate cambc-sized queues. Use compact critic representation or tightly bounded batches.
 
-- `fcode run` with `--tle 0` (default locally) does not enforce the 10 ms
-  limit; use `--tle 10` to test timing.
-- Replay event order: an action's effects (hp, remove) are logged BEFORE the
-  action event; spike fire logs one event per tile; rotations appear as a
-  `place` with an existing id; launches as a long `move` plus launcher acd.
-- verify.py takes the seed from the filename `_s<seed>.replay26`; without it,
-  only seed-independent checks are exact.
-- Probe bots must ask `can_*` questions AFTER acting in a turn (the verifier
-  checks at the end of the unit's turn), otherwise you get false
-  "cooldown"/"dead" differences.
-- My econ bot can kill an idle opponent's core quickly (siege); use pit maps
-  when you need long games against idle bots.
+### Deployment
+
+- `bots/econ/main.py` calls the encoder but does not use learned logits/actions.
+- `rl/bot/export.py` is not a real exporter.
+- `rl/bot/policy.py` only validates metadata and returns wait; it does not execute weights.
+- No Python SWAR/int4 network is implemented for the chosen 17x17 4-block 1x1+depthwise architecture.
+- No quantized-vs-float parity checker exists.
+- No CPU-budget guard with `ct.get_cpu_time_elapsed()` is integrated for learned inference.
+- No learned-policy official match has been run.
+
+### Parity/tests
+
+- Existing observation parity passes, but action candidate/mask parity between C++ and official Python controller is missing.
+- Need reachable-state C++/Python legal-mask parity.
+- Need action decode parity.
+- Need deterministic replay/trainer-vs-bot row parity.
+- Need random legal rollouts over all map families, not only a few maps.
+- Need checkpoint reload test.
+- Need packaging test ensuring `main.py`, `encoder.py`, weights, and policy code are all in submission shape.
+
+### Existing draft code concerns
+
+- `rl/sim/florent_actions.cpp` currently enumerates board-sized spawn/fire/launcher destinations and has an old broad candidate model. Rewrite before treating it as final.
+- `rl/train/model.hpp` currently uses flattened input MLP and 4096-output heads. This is a temporary smoke model, not the selected deployment architecture.
+- `rl/train/neural_train.cpp` has a minimal update path and should be replaced/rewritten, not incrementally trusted as PPO.
+- `rl/train/main.cpp` is an older table learner and should not be presented as the final trainer.
+- `docs/rl-layout.md` contains old assumptions and must be corrected after validating engine semantics.
+
+## 10. Correct implementation order from here
+
+Do not stop after any single gate. Continue through this sequence:
+
+1. **Finalize action ABI** against `fengine.cpp` legality semantics. Use fixed candidate tables, one actual executed-action probability per turn, and free heads only where engine semantics justify them.
+2. **Implement `Match` turn cursor**: exact creation-order units, per-unit memory, one critic observation per team per round, round end only after all units, units created during round act next round.
+3. **Implement action/mask parity tests** in C++ and Python against reachable native/official states.
+4. **Implement compact actor/critic model**: selected 17x17 spatial encoder, separate unit-type policy models, centralized critic with team frame/identity.
+5. **Implement real rollout buffers**: actor observations, candidate IDs, legal masks, chosen IDs, old logp, values, round/team/entity metadata, terminal reward.
+6. **Implement correct GAE/PPO** using terminal-only reward and per-round critic timing. Add clipped ratio, entropy, value loss, KL guard, advantage normalization, checkpointing.
+7. **Run a short PPO training smoke test** with finite loss, nonzero gradients, checkpoint reload, and action distribution changes.
+8. **Implement Python float inference first** using exported weights and exact candidate decoder. Wire into `main.py` behind CPU guard with heuristic fallback.
+9. **Implement quantization/SWAR int4 export** based on `research/nn_bench/` and `bots/bench/swar.py`. Add float-vs-quantized agreement test.
+10. **Run official deployment tests** with `--tle 10`, timing/replay inspection, and compare learned bot against heuristic/starter.
+11. Only after all above, report the system as complete.
+
+## 11. Useful command checklist
+
+From `/home/hamza/florent/florent_code`:
+
+```bash
+# Native engine
+make -C engine
+
+# Build RL tree
+cmake -S rl -B /tmp/florent_rl_build -DCMAKE_PREFIX_PATH=/home/hamza/libtorch
+cmake --build /tmp/florent_rl_build -j2
+
+# Native action smoke
+/tmp/florent_rl_build/action_smoke maps/gen00.map26
+/tmp/florent_rl_build/action_smoke maps/pit01.map26
+/tmp/florent_rl_build/action_smoke maps/s7_gen02.map26
+
+# Random rollout
+/tmp/florent_rl_build/rollout_smoke maps/gen00.map26 32
+
+# CPU-only current neural smoke
+CUDA_VISIBLE_DEVICES=-1 LD_LIBRARY_PATH=/home/hamza/libtorch/lib \
+  /tmp/florent_rl_build/neural_train maps/gen00.map26 1 /tmp/florent-real.pt
+
+# Python validation
+python3 -I -m py_compile bots/econ/main.py bots/econ/encoder.py rl/bot/*.py
+
+# Official runtime with TLE
+.venv/bin/fcode run econ starter maps/gen00.map26 --seed 3 --tle 10
+.venv/bin/fcode run econ starter maps/pit01.map26 --seed 3 --tle 10
+
+# Observation parity
+.venv/bin/python3 engine/tools/obs_parity.py --games 1 --rounds 20 --seed 7 --map maps/gen00.map26
+```
+
+## 12. Git/status/security
+
+Current changes are uncommitted. Do not commit `.env`, credentials, checkpoints, or generated replay artifacts. The repository currently includes modified/untracked work in:
+
+- `bots/econ/main.py`
+- `bots/econ/encoder.py`
+- `engine/Makefile`
+- `engine/src/capi.cpp`
+- `engine/src/obs.hpp`
+- `engine/src/obs.cpp`
+- `engine/tools/obs_parity.py`
+- `docs/`
+- `rl/`
+
+If committing later, commit message must end with:
+
+```text
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+```
+
+Do not treat the current RL smoke output as proof of completion. The next session must continue coding from §10, starting with the corrected action ABI and real PPO data flow.

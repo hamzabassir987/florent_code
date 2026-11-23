@@ -1,5 +1,6 @@
 // Plain C interface over fe::Game, for ctypes (verifier) and other languages.
 #include "fengine.hpp"
+#include "obs.hpp"
 using fe::Game;
 extern "C" {
 Game* fe_new() { return new Game(); }
@@ -70,6 +71,7 @@ void fe_vis_tile(Game* g, int a, int x, int y, int* o) {
     o[2] = b >= 0 ? g->ents[b].id : -1; o[3] = u >= 0 ? g->ents[u].id : -1; o[4] = g->env[g->idx(x, y)];
 }
 int fe_write_store(Game* g, int t, int i, long long v) { return g->write_store(t, i, v); }
+long long fe_get_store(Game* g, int t, int i) { return g->teams[t].store[i]; }
 void fe_end_round(Game* g) { g->end_round(); }
 int fe_last_moves(Game* g, int* out, int max) {
     int n = 0;
@@ -84,4 +86,33 @@ void fe_dbg_set_hp(Game* g, int i, int hp) { g->ents[i].hp = hp; }
 void fe_dbg_kill(Game* g, int i) { g->kill(i); }
 void fe_dbg_set_sides(Game* g, int i, const int* in4, const int* out4) { for (int k = 0; k < 4; k++) { g->ents[i].in_last[k] = in4[k]; g->ents[i].out_last[k] = out4[k]; } }
 void fe_dbg_set_last_out(Game* g, int i, int r) { g->ents[i].last_out = r; }
+
+// ---- observation encoder
+void* fe_obs_new(Game* g, int team) {
+    fe::ObsMemory* m = new fe::ObsMemory();
+    m->init(*g, team);
+    return m;
+}
+void fe_obs_free(void* p) { delete reinterpret_cast<fe::ObsMemory*>(p); }
+void fe_obs_update(void* p, Game* g, int actor) { reinterpret_cast<fe::ObsMemory*>(p)->update(*g, actor); }
+int fe_obs_ch() { return fe::ACTOR_CH; }
+int fe_obs_patch() { return fe::PATCH; }
+int fe_obs_spatial() { return fe::ACTOR_SPATIAL; }
+int fe_obs_nscalars() { return fe::ACTOR_SCALARS; }
+void fe_obs_encode(void* p, Game* g, int actor, int* out, int* scal) {
+    std::vector<int32_t> ch, sc;
+    fe::encode_actor(*g, *reinterpret_cast<fe::ObsMemory*>(p), actor, ch, sc);
+    for (size_t i = 0; i < ch.size(); i++) out[i] = ch[i];
+    for (size_t i = 0; i < sc.size(); i++) scal[i] = sc[i];
+}
+int fe_critic_ch() { return fe::CRITIC_CH; }
+int fe_critic_pad() { return fe::CRITIC_PAD; }
+int fe_critic_spatial() { return fe::CRITIC_SPATIAL; }
+int fe_critic_nscalars() { return fe::CRITIC_SCALARS; }
+void fe_critic_encode(Game* g, int* out, int* scal) {
+    std::vector<int32_t> ch, sc;
+    fe::encode_critic(*g, ch, sc);
+    for (size_t i = 0; i < ch.size(); i++) out[i] = ch[i];
+    for (size_t i = 0; i < sc.size(); i++) scal[i] = sc[i];
+}
 }
