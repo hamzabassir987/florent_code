@@ -3,6 +3,7 @@
 lr 0.0003
 epochs 3
 game_rounds 1000
+replay_every 50      # greedy self-play game logged every N iterations (0: off)
 ore_radius -1         # >= 0: all ore moved within this distance of each core (mirrored); -1: map as is
 
 # entropy coefficient per head

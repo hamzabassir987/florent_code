@@ -15,6 +15,8 @@
 //    live knobs in the entropy file, see entropy_file.hpp)
 #include <torch/torch.h>
 #include "entropy_file.hpp"
+#include "game_log.hpp"
+#include <filesystem>
 #include <iomanip>
 
 #include <algorithm>
@@ -314,6 +316,36 @@ int main(int argc, char** argv) {
             if (head_n[h]) std::cout << " " << HEAD_NAMES[h] << " " << std::setprecision(3) << head_ent[h] / head_n[h] << "|" << K.head_entropy[h];
         std::cout << std::setprecision(6) << std::endl;
         if (it % env_int("SAVE_EVERY", 25) == 0 || it == iterations) torch::save(net, out);
+        if (K.replay_every > 0 && it % K.replay_every == 0) {
+            // one greedy self-play game, logged for rl/tools/make_replay.py
+            auto tg = std::chrono::steady_clock::now();
+            namespace fs = std::filesystem;
+            fs::path dir = fs::path(out).parent_path() / "replays";
+            fs::create_directories(dir);
+            char name[32]; std::snprintf(name, sizeof name, "iter_%06d", it);
+            Match gm;
+            const std::string mp = maps[master() % maps.size()];
+            const uint64_t seed = master();
+            gm.load(mp, seed); gm.reset();
+            gm.game.max_turns = K.game_rounds;
+            gm.game.limit_ore(K.ore_radius, master());
+            std::vector<ActionLine> glog;
+            net->eval();
+            play_greedy(gm, [&](int p, const std::vector<float>& obs) {
+                torch::NoGradGuard ng;
+                std::vector<int16_t> o16(obs.begin(), obs.end());
+                torch::Tensor lt = net->logits(p, actor_tensor(o16)).squeeze(0).contiguous();
+                const float* lp = lt.data_ptr<float>();
+                return std::vector<float>(lp, lp + lt.numel());
+            }, glog);
+            const std::string mapf = (dir / (std::string(name) + ".map26")).string();
+            const std::string gamef = (dir / (std::string(name) + ".game")).string();
+            write_map(gm.game, mp, mapf);
+            write_game(gamef, mapf, seed, gm.game, glog);
+            std::cout << "greedy game " << gamef << " map " << mp << " rounds " << gm.game.round
+                      << " winner " << gm.game.winner << " " << gm.game.win_condition << " actions " << glog.size()
+                      << " ms " << int(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count()) << std::endl;
+        }
     }
     std::cout << "TRAIN COMPLETE checkpoint=" << out << std::endl;
 }

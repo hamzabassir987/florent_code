@@ -9,6 +9,8 @@
 //     ore_radius 2           # all ore moved to random tiles within this distance
 //                            # of each core, mirrored (same Ti/Vo counts as the
 //                            # map); -1: map as is. Applies to games started afterwards
+//     replay_every 50        # every N iterations play one greedy self-play game and
+//                            # log it for rl/tools/make_replay.py (0: off)
 //
 // No file: the current values are kept. A deleted line keeps its last value.
 #pragma once
@@ -36,6 +38,7 @@ struct Knobs {
     int epochs;
     int game_rounds = 1000;
     int ore_radius = -1;
+    int replay_every = 0;
 };
 
 // Returns false if the file does not exist.
@@ -48,6 +51,7 @@ inline bool read_entropy_file(const std::string& path, Knobs& k) {
         if (key == "epochs") { k.epochs = std::clamp(int(v), 1, 8); return; }
         if (key == "game_rounds") { k.game_rounds = std::clamp(int(v), 1, 1000); return; }
         if (key == "ore_radius") { k.ore_radius = int(v); return; }
+        if (key == "replay_every") { k.replay_every = std::max(0, int(v)); return; }
         for (int h = 0; h < NUM_HEAD_IDS; h++)
             if (key == HEAD_NAMES[h]) { k.head_entropy[h] = float(v); return; }
         std::cerr << "entropy_file: unknown field '" << key << "', ignored\n";
