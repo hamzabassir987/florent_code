@@ -769,7 +769,7 @@ void Game::end_round() {
     }
     for (auto& t : teams) { t.converted = false; t.store = t.store_next; }
     round++;
-    if (round >= MAX_TURNS && winner < 0) {
+    if (round >= max_turns && winner < 0) {
         auto harv = [&](int team) { int n = 0; for (auto& e : ents) if (e.alive && e.team == team && e.type == HARVESTER) n++; return n; };
         int a0 = teams[0].ti_collected, b0 = teams[1].ti_collected;
         int a1 = harv(0), b1 = harv(1);
@@ -783,6 +783,24 @@ void Game::end_round() {
         }
     }
     if (winner >= 0) over = true;
+}
+
+void Game::limit_ore(int radius) {
+    if (radius < 0) return;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            uint8_t& t = env[idx(x, y)];
+            if (t != ORE_TI && t != ORE_VO) continue;
+            int best = 1 << 30;
+            for (auto& tm : teams) {
+                if (tm.core < 0) continue;
+                const Entity& c = ents[tm.core];
+                int dx = std::max({c.x - x, x - (c.x + 1), 0});
+                int dy = std::max({c.y - y, y - (c.y + 1), 0});
+                best = std::min(best, std::max(dx, dy));
+            }
+            if (best > radius) t = EMPTY;
+        }
 }
 
 }  // namespace fe

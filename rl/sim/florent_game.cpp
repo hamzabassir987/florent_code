@@ -1,7 +1,15 @@
+#include <cstdlib>
 #include "florent_game.hpp"
 namespace florent_rl {
 bool Match::load(const std::string& p,uint64_t s){ map_path=p; seed=s; return game.load_map(p); }
-void Match::reset(){ game.reset(seed); memories.clear(); critic_round=-1; }
+// Curriculum (env): MAX_TURNS = round limit (official 1000);
+// ORE_RADIUS = drop ore farther than this from both cores (unset: keep all).
+void Match::reset(){
+    game.reset(seed);
+    if (const char* v = std::getenv("MAX_TURNS")) game.max_turns = std::atoi(v);
+    if (const char* v = std::getenv("ORE_RADIUS")) game.limit_ore(std::atoi(v));
+    memories.clear(); critic_round=-1;
+}
 std::vector<int> Match::acting_units() const { return game.turn_order(); }
 bool Match::round_critic(){ if(critic_round==game.round) return false; fe::encode_critic(game,critic_channels,critic_scalars); critic_round=game.round; return true; }
 int Match::terminal_reward(int team) const { if(!game.over || game.winner<0) return 0; return game.winner==team ? 1 : -1; }

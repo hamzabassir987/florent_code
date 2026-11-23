@@ -74,12 +74,17 @@ public:
     bool load_map(const std::string& path);          // .map26 file
     bool load_map_bytes(const uint8_t* data, size_t n);
     void reset(uint64_t seed = 1);
+    // Training curriculum: turn ore tiles farther than `radius` (Chebyshev,
+    // from the nearest tile of either core's 2x2 footprint) into empty floor.
+    // Call after reset(). radius < 0: no change.
+    void limit_ore(int radius);
 
     // ---- map / state queries
     int W = 0, H = 0;
     std::vector<uint8_t> env;
     int pit_axis = -1, pit_at = 0, pit_w = 0;         // -1: no pit
     int round = 0;
+    int max_turns = MAX_TURNS;                         // training curriculum: game ends at this round
     int winner = -1;                                   // -1 running, 0 A, 1 B
     bool over = false;                                 // set at the end of the round the game was decided
     std::string win_condition;

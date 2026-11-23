@@ -11,7 +11,8 @@
 // rounds of each, bootstrapping from the critic at the cut. Terminal reward
 // only (+1 / -1 / 0). Self-play: one network plays both teams.
 //
-//   neural_train ITERATIONS OUT.pt [maps...]   (env: GAMES, ROUNDS, EPOCHS, LR, INIT)
+//   neural_train ITERATIONS OUT.pt [maps...]   (env: GAMES, ROUNDS, EPOCHS, LR, INIT;
+//    curriculum: MAX_TURNS round limit, ORE_RADIUS ore distance from cores)
 #include <torch/torch.h>
 
 #include <algorithm>
