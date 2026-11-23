@@ -3,7 +3,7 @@
 lr 0.0003
 epochs 3
 game_rounds 1000
-ore_radius -1
+ore_radius -1         # >= 0: all ore moved within this distance of each core (mirrored); -1: map as is
 
 # entropy coefficient per head
 core_spawn 0.01

@@ -74,10 +74,13 @@ public:
     bool load_map(const std::string& path);          // .map26 file
     bool load_map_bytes(const uint8_t* data, size_t n);
     void reset(uint64_t seed = 1);
-    // Training curriculum: turn ore tiles farther than `radius` (Chebyshev,
-    // from the nearest tile of either core's 2x2 footprint) into empty floor.
-    // Call after reset(). radius < 0: no change.
-    void limit_ore(int radius);
+    // Training curriculum, call after reset(). radius < 0: no change.
+    // Removes every ore tile and places the same number of Titanium and
+    // Voltium tiles at random within `radius` (Chebyshev, from the nearest
+    // tile of the core's 2x2 footprint) of core A, mirrored around core B with
+    // the map's own symmetry. Only empty, unoccupied floor is used; if there
+    // is not enough, fewer tiles are placed.
+    void limit_ore(int radius, uint64_t seed);
 
     // ---- map / state queries
     int W = 0, H = 0;

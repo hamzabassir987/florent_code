@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
         if (!g.m.load(mp, master())) { std::cerr << "bad map " << mp << "\n"; std::exit(3); }
         g.m.reset();
         g.m.game.max_turns = K.game_rounds;
-        g.m.game.limit_ore(K.ore_radius);
+        g.m.game.limit_ore(K.ore_radius, master());
         g.rng.seed(master());
     };
     for (auto& g : games) new_game(g);

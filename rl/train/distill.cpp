@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
         games[i].load(maps[master() % maps.size()], master());
         games[i].reset();
         games[i].game.max_turns = K.game_rounds;
-        games[i].game.limit_ore(K.ore_radius);
+        games[i].game.limit_ore(K.ore_radius, master());
         grng[i].seed(master());
     };
     for (int i = 0; i < G; i++) new_game(i);

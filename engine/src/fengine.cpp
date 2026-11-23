@@ -1,6 +1,7 @@
 #include "fengine.hpp"
 
 #include <algorithm>
+#include <random>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -785,22 +786,59 @@ void Game::end_round() {
     if (winner >= 0) over = true;
 }
 
-void Game::limit_ore(int radius) {
-    if (radius < 0) return;
-    for (int y = 0; y < H; y++)
-        for (int x = 0; x < W; x++) {
-            uint8_t& t = env[idx(x, y)];
-            if (t != ORE_TI && t != ORE_VO) continue;
-            int best = 1 << 30;
-            for (auto& tm : teams) {
-                if (tm.core < 0) continue;
-                const Entity& c = ents[tm.core];
-                int dx = std::max({c.x - x, x - (c.x + 1), 0});
-                int dy = std::max({c.y - y, y - (c.y + 1), 0});
-                best = std::min(best, std::max(dx, dy));
-            }
-            if (best > radius) t = EMPTY;
+void Game::limit_ore(int radius, uint64_t seed) {
+    if (radius < 0 || teams[0].core < 0 || teams[1].core < 0) return;
+    const Entity& c0 = ents[teams[0].core];
+    const Entity& c1 = ents[teams[1].core];
+    // the map symmetry that carries core A's footprint onto core B's
+    auto tr = [&](int k, int x, int y) {
+        if (k == 0) return std::pair<int, int>(W - 1 - x, H - 1 - y);   // 180 rotation
+        if (k == 1) return std::pair<int, int>(W - 1 - x, y);           // mirror x
+        return std::pair<int, int>(x, H - 1 - y);                       // mirror y
+    };
+    int sym = -1, best_match = -1;
+    for (int k = 0; k < 3; k++) {
+        auto a = tr(k, c0.x, c0.y), b = tr(k, c0.x + 1, c0.y + 1);
+        if (std::min(a.first, b.first) != c1.x || std::min(a.second, b.second) != c1.y) continue;
+        int match = 0;
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            auto m = tr(k, x, y);
+            match += env[idx(x, y)] == env[idx(m.first, m.second)];
         }
+        if (match > best_match) { best_match = match; sym = k; }
+    }
+    if (sym < 0) sym = 0;
+    int n_ti = 0, n_vo = 0;
+    for (auto& t : env) {
+        if (t == ORE_TI) { n_ti++; t = EMPTY; }
+        else if (t == ORE_VO) { n_vo++; t = EMPTY; }
+    }
+    // candidate tiles around core A whose mirror is also free and distinct
+    auto free_tile = [&](int x, int y) {
+        int i = idx(x, y);
+        return env[i] == EMPTY && bld[i] < 0 && bot[i] < 0;
+    };
+    std::vector<std::pair<int, int>> cand;
+    for (int y = c0.y - radius; y <= c0.y + 1 + radius; y++)
+        for (int x = c0.x - radius; x <= c0.x + 1 + radius; x++) {
+            if (!inb(x, y) || !free_tile(x, y)) continue;
+            auto m = tr(sym, x, y);
+            if (m == std::pair<int, int>(x, y) || !free_tile(m.first, m.second)) continue;
+            cand.push_back({x, y});
+        }
+    std::mt19937_64 rng(seed ^ 0x0BE5EEDULL);
+    std::shuffle(cand.begin(), cand.end(), rng);
+    int want_ti = n_ti / 2, want_vo = n_vo / 2;
+    for (auto& [x, y] : cand) {
+        auto m = tr(sym, x, y);
+        if (env[idx(x, y)] != EMPTY || env[idx(m.first, m.second)] != EMPTY) continue;  // taken as a mirror
+        uint8_t t;
+        if (want_ti > 0) { t = ORE_TI; want_ti--; }
+        else if (want_vo > 0) { t = ORE_VO; want_vo--; }
+        else break;
+        env[idx(x, y)] = t;
+        env[idx(m.first, m.second)] = t;
+    }
 }
 
 }  // namespace fe

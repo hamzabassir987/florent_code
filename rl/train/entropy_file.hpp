@@ -6,8 +6,9 @@
 //     lr 0.0003
 //     epochs 3               # PPO passes over each rollout (1-8)
 //     game_rounds 200        # games end at this round (official 1000)
-//     ore_radius 3           # ore farther than this from both cores is removed
-//                            # (-1: keep all); applies to games started afterwards
+//     ore_radius 2           # all ore moved to random tiles within this distance
+//                            # of each core, mirrored (same Ti/Vo counts as the
+//                            # map); -1: map as is. Applies to games started afterwards
 //
 // No file: the current values are kept. A deleted line keeps its last value.
 #pragma once
