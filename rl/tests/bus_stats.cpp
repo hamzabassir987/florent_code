@@ -31,7 +31,8 @@ int main(int argc, char** argv) {
     if (const char* v = std::getenv("SYM_DIV")) fe::g_bus.sym_div = std::max(1, std::atoi(v));
     if (const char* v = std::getenv("USE_PIT")) fe::g_bus.use_pit = std::atoi(v) != 0;
     if (const char* v = std::getenv("USE_ECORE")) fe::g_bus.use_enemy_core = std::atoi(v) != 0;
-    std::printf("bus: rot_div %d  sym_report %d  sym_div %d  use_pit %d  use_enemy_core %d\n", fe::g_bus.rot_div, fe::g_bus.sym_report, fe::g_bus.sym_div, int(fe::g_bus.use_pit), int(fe::g_bus.use_enemy_core));
+    if (const char* v = std::getenv("ROT_DEDUPE")) fe::g_bus.rot_dedupe = std::atoi(v) != 0;
+    std::printf("bus: rot_div %d  sym_report %d  sym_div %d  use_pit %d  use_enemy_core %d  rot_dedupe %d\n", fe::g_bus.rot_div, fe::g_bus.sym_report, fe::g_bus.sym_div, int(fe::g_bus.use_pit), int(fe::g_bus.use_enemy_core), int(fe::g_bus.rot_dedupe));
     std::map<int, std::vector<double>> late_sym;          // k -> share of late units knowing the symmetry
     long store_writes = 0, unit_turns = 0;
     std::vector<std::string> maps(argv + 3, argv + argc);

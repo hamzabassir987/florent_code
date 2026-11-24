@@ -71,7 +71,8 @@ constexpr int C_PATH = C_RAY + CH_RAY;
 //   use_pit: a pit fixes the symmetry (mirror along its axis)
 //   use_enemy_core: a known enemy core tile must mirror one of ours
 struct BusConfig { int rot_div = 8; int sym_report = 1; int sym_div = 4;     // sym_report: 0 off, 1 symmetry, 2 + partial sets
-                   bool use_pit = true, use_enemy_core = true; };
+                   bool use_pit = true, use_enemy_core = true;
+                   bool rot_dedupe = false; };   // reposts: ore cluster anchors only
 extern BusConfig g_bus;
 
 // per-unit fog memory (one instance per unit)

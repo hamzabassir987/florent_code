@@ -247,10 +247,22 @@ bool ObsMemory::next_report(uint64_t unit_id, int round, int& slot, uint32_t& re
     if (k % uint64_t(g_bus.rot_div) != 0) return false;
     std::vector<uint32_t> live;
     const int enemy = 1 - team;
-    for (uint32_t f : known) {                  // std::set: ascending
+    std::vector<uint8_t> covered;               // dedupe: ore tiles inside an earlier anchor's 4x4 block
+    if (g_bus.rot_dedupe) covered.assign(size_t(W) * H * 3, 0);
+    for (uint32_t f : known) {                  // std::set: ascending (by category, then tile)
         if (f & REP_REMOVE) continue;
         const int cat = (f >> 26) & 15, t = f & 0x7FF;
-        if (rep_is_ore(cat)) { if (terrain[t] == (cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO)) live.push_back(f); }
+        if (rep_is_ore(cat)) {
+            const uint8_t ore = cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO;
+            if (terrain[t] != ore) continue;
+            if (g_bus.rot_dedupe) {
+                if (covered[size_t(cat) * W * H + t]) continue;
+                const int x = t % W, y = t / W;
+                for (int dy = 0; dy < 4; dy++) for (int dx = 0; dx < 4; dx++)
+                    if (x + dx < W && y + dy < H) covered[size_t(cat) * W * H + (y + dy) * W + x + dx] = 1;
+            }
+            live.push_back(f);
+        }
         else if (cat == REP_OWN_LAUNCHER) { if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == LAUNCHER) live.push_back(f); }
         else if (bld_id[t] >= 0 && bld_team[t] == enemy && bld_type[t] == rep_type_of_cat(cat)) live.push_back(f);
     }
