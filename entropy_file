@@ -5,18 +5,18 @@
 
 # lr: while this line is here it overrides the 3e-5 -> 1e-5 schedule;
 # delete it to go back to the schedule.
-# lr 0.00003
+lr 0.0002
 
 # epochs: passes over each rollout (1-8). With more than one, a minibatch
 # whose KL(old || new) is over 0.03 ends that iteration's updates.
 epochs 1
 
 # game_rounds: rounds a training game lasts (1-1000), then decided like round 1000.
-game_rounds 1000
+game_rounds 200
 
 # ore_radius: >= 0 moves all ore within this distance of each core (mirrored,
 # same Ti/Vo counts); -1 keeps the map's ore. Applies to games started afterwards.
-ore_radius -1
+ore_radius 4
 
 # eval: every eval_every iterations, eval_games greedy games against the frozen
 # net (half on each side); >= 85% wins promotes the live net to frozen.

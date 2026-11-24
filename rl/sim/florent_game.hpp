@@ -22,5 +22,11 @@ struct Match {
     void actor_observation(int entity, std::vector<float>& out);
     void observe(int entity);            // update this unit's fog memory (every turn it runs)
     void encode_only(int entity, std::vector<float>& out);   // encode without updating
+    // Encode without updating, straight into the trainer's compact input:
+    // spatial clamped to 0..255 (uint8), scalars to the int16 range (the same
+    // values as encode_only followed by a float clamp). Returns the number of
+    // spatial values that had to be clamped.
+    long encode_compact(int entity, uint8_t* sp, int16_t* sc);
+    std::vector<int32_t> enc_ch, enc_sc;   // encoder scratch (reused)
 };
 }

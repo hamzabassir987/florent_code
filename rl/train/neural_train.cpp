@@ -29,7 +29,7 @@
 // (rl/tools/make_replay.py turns it into an official .replay26).
 //
 //   neural_train ITERATIONS OUT.pt MAP [MAP...]
-//   env: GAMES (950) ROUNDS (150) N_MINI (15 minibatches a pass) VALUE_KEEP (0.1)
+//   env: GAMES (200) ROUNDS (150) N_MINI (15 minibatches a pass) VALUE_KEEP (0.1)
 //        MICRO (512 rows per forward/backward) CRITIC_BATCH (1024 rows per critic inference)
 //        RECORD_P (0.05: share of decisions kept for PPO; ~17 KB each) INIT (checkpoint) START_ITER (0) FROZEN (checkpoint)
 //        THREADS (all) DEVICE (cuda if available | cpu) SNAP_EVERY (400)
@@ -38,6 +38,7 @@
 #include <omp.h>
 #include <torch/torch.h>
 #ifdef FLORENT_CUDA_GRAPHS
+#include <ATen/cuda/CUDAEvent.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -56,6 +57,7 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -139,13 +141,12 @@ static EndStat end_stat(const fe::Game& g) {
 
 struct Rec { int head, choice; std::vector<uint8_t> mask; float old_logp; };
 
-// One recorded decision. The spatial input is stored as uint8 (every actor
-// channel is 0..255), the scalars as int16.
+// One recorded decision. Its input (spatial uint8: every actor channel is
+// 0..255; scalars int16) lives in the device-side sample store, at `row`.
 struct Sample {
     int policy, team;
     int seg, rnd;                  // where its round lives in its slot (for the advantage)
-    std::vector<uint8_t> sp;
-    std::array<int16_t, fe::ACTOR_SCALARS> sc;
+    long row = -1;                 // row in the sample store
     std::vector<Rec> recs;
     float adv = 0;
 };
@@ -173,7 +174,10 @@ struct Slot {
     int start_round = 0;
     int played = 0;                                  // rounds this stretch
     // the unit waiting for a forward
-    bool need = false; int ent = -1, policy = -1, net = 0; std::vector<float> obs, logits;
+    bool need = false; int ent = -1, policy = -1, net = 0;
+    uint8_t* in_sp = nullptr; int16_t* in_sc = nullptr;   // this slot's row of the (pinned) input stage
+    const float* lg = nullptr;                            // its logits row after the forward
+    bool recorded = false;                                // the last decision was recorded
     // play setup
     int net_of[2] = {0, 0}; bool greedy = false, record = true;
     std::vector<ActionLine>* log = nullptr;
@@ -249,7 +253,7 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
             if (p < 0) { s.pos++; continue; }
             m.observe(a);                              // memory updates every turn, as deployed
             if (!has_choice(m.game, a)) { s.pos++; continue; }   // only wait: no forward
-            m.encode_only(a, s.obs);
+            s.oob += m.encode_compact(a, s.in_sp, s.in_sc);
             s.need = true; s.ent = a; s.policy = p; s.net = s.net_of[m.game.ents[a].team];
             return;
         }
@@ -265,29 +269,24 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
     }
 }
 
+// Pinned host memory when the device is CUDA (fast, asynchronous uploads).
+static torch::TensorOptions host_opts(torch::ScalarType t, bool cuda) { return torch::TensorOptions().dtype(t).pinned_memory(cuda); }
+
 // Compact uploads: the critic's one-hot board as uint8, its scalars as int32;
-// the float conversion happens on the device (Teacher::value_split).
-static void critic_upload(const std::vector<const std::vector<uint8_t>*>& sps, const std::vector<const std::vector<int32_t>*>& scs,
-                          torch::Device dev, torch::Tensor& tsp, torch::Tensor& tsc) {
+// the float conversion happens on the device (Teacher::value_split). The rows
+// are packed in parallel into pinned memory and uploaded asynchronously (the
+// caller keeps the host tensors alive until the copy has run).
+static void critic_pack(const std::vector<const std::vector<uint8_t>*>& sps, const std::vector<const std::vector<int32_t>*>& scs,
+                        bool cuda, torch::Tensor& hsp, torch::Tensor& hsc) {
     const long n = long(sps.size());
-    tsp = torch::empty({n, fe::CRITIC_SPATIAL}, torch::kUInt8);
-    tsc = torch::empty({n, fe::CRITIC_SCALARS}, torch::kInt32);
-    uint8_t* a = tsp.data_ptr<uint8_t>(); int32_t* b = tsc.data_ptr<int32_t>();
+    hsp = torch::empty({n, fe::CRITIC_SPATIAL}, host_opts(torch::kUInt8, cuda));
+    hsc = torch::empty({n, fe::CRITIC_SCALARS}, host_opts(torch::kInt32, cuda));
+    uint8_t* a = hsp.data_ptr<uint8_t>(); int32_t* b = hsc.data_ptr<int32_t>();
+    #pragma omp parallel for schedule(static)
     for (long i = 0; i < n; i++) {
         std::memcpy(a + i * fe::CRITIC_SPATIAL, sps[i]->data(), fe::CRITIC_SPATIAL);
         std::memcpy(b + i * fe::CRITIC_SCALARS, scs[i]->data(), sizeof(int32_t) * fe::CRITIC_SCALARS);
     }
-    tsp = tsp.to(dev); tsc = tsc.to(dev);
-}
-// The actor's input as stored and as played: spatial clamped to 0..255 (uint8),
-// scalars to int16. The rollout plays on exactly what PPO later trains on.
-static void actor_compact(const std::vector<float>& obs, uint8_t* sp, int16_t* sc, long& oob) {
-    for (int i = 0; i < fe::ACTOR_SPATIAL; i++) {
-        float v = obs[i];
-        if (v < 0 || v > 255) { oob++; v = std::clamp(v, 0.f, 255.f); }
-        sp[i] = uint8_t(v);
-    }
-    for (int i = 0; i < fe::ACTOR_SCALARS; i++) sc[i] = int16_t(std::clamp(obs[fe::ACTOR_SPATIAL + i], -32768.f, 32767.f));
 }
 
 static int sample_masked(const float* l, const std::vector<uint8_t>& mask, std::mt19937_64& rng, float& lp) {
@@ -302,11 +301,12 @@ static int sample_masked(const float* l, const std::vector<uint8_t>& mask, std::
     return pick;
 }
 
-// Play the forward's result for the waiting unit.
+// Play the forward's result for the waiting unit. A recorded decision's input
+// is copied to the sample store afterwards (store_recorded).
 static void play_decision(Slot& s, const Setup& S, bool train) {
     Match& m = s.m;
     const int a = s.ent;
-    Decision d = decide(m.game, a, s.logits.data(), [&](int, const float* l, const std::vector<uint8_t>& mk, float& lp) {
+    Decision d = decide(m.game, a, s.lg, [&](int, const float* l, const std::vector<uint8_t>& mk, float& lp) {
         return s.greedy ? argmax_choice(l, mk, lp) : sample_masked(l, mk, s.rng, lp);
     });
     for (auto& c : d.actions) {
@@ -316,18 +316,82 @@ static void play_decision(Slot& s, const Setup& S, bool train) {
         if (s.log) s.log->push_back({m.game.round, m.game.ents[a].id, c});
     }
     s.decisions++;
+    s.recorded = false;
     if (train && s.record && std::uniform_real_distribution<float>(0.f, 1.f)(s.rng) < S.record_p) {
         Sample smp;
         smp.policy = s.policy; smp.team = m.game.ents[a].team;
         smp.seg = int(s.segs.size()) - 1; smp.rnd = int(s.segs.back().rounds.size()) - 1;
-        smp.sp.resize(fe::ACTOR_SPATIAL);
-        long dummy = 0;
-        actor_compact(s.obs, smp.sp.data(), smp.sc.data(), dummy);
-        for (auto& hr : d.records) smp.recs.push_back({hr.head, hr.choice, hr.mask, hr.logp});
+        for (auto& hr : d.records) smp.recs.push_back({hr.head, hr.choice, std::move(hr.mask), hr.logp});
         s.samples.push_back(std::move(smp));
+        s.recorded = true;
     }
     s.need = false; s.pos++;
 }
+
+// ===========================================================================
+// ROLLOUT I/O
+// ===========================================================================
+// Every step of a rollout: each waiting game writes its unit's compact input
+// straight into its row of a pinned stage (in the parallel advance), the
+// stage goes up in ONE copy, each (net, policy) group gathers its rows on the
+// device, runs its forward and scatters its logits into one device logits
+// table, which comes back in ONE copy. Recorded decisions' inputs are then
+// copied device-to-device into the sample store, which PPO trains from: the
+// rollout's inputs never go back through host memory.
+static int max_logits() { int m = 0; for (int p = 0; p < NUM_POLICIES; p++) m = std::max(m, policy_logit_count(p)); return m; }
+
+struct RollIO {
+    long cap = 0;
+    torch::Tensor h_sp, h_sc, d_sp, d_sc;          // [cap, ACTOR_SPATIAL] uint8, [cap, ACTOR_SCALARS] int16
+    torch::Tensor h_lg, d_lg;                      // [cap, max_logits()] float
+    torch::Tensor h_idx;                           // pinned int64 scratch for index uploads
+    long idx_cap = 0;
+    void ensure(long G, torch::Device dev) {
+        const bool cuda = dev.is_cuda();
+        if (G > cap) {
+            cap = G;
+            h_sp = torch::zeros({G, fe::ACTOR_SPATIAL}, host_opts(torch::kUInt8, cuda));
+            h_sc = torch::zeros({G, fe::ACTOR_SCALARS}, host_opts(torch::kInt16, cuda));
+            h_lg = torch::zeros({G, max_logits()}, host_opts(torch::kFloat32, cuda));
+            if (cuda) {
+                auto o = torch::TensorOptions().device(dev);
+                d_sp = torch::zeros({G, fe::ACTOR_SPATIAL}, o.dtype(torch::kUInt8));
+                d_sc = torch::zeros({G, fe::ACTOR_SCALARS}, o.dtype(torch::kInt16));
+                d_lg = torch::zeros({G, max_logits()}, o.dtype(torch::kFloat32));
+            } else { d_sp = h_sp; d_sc = h_sc; d_lg = h_lg; }
+        }
+        // one region per (net, policy) group + one for the recorded rows (x2: slots and store rows)
+        const long need = (2 * NUM_POLICIES + 2) * G;
+        if (need > idx_cap) { idx_cap = need; h_idx = torch::zeros({need}, host_opts(torch::kLong, cuda)); }
+    }
+    // upload v (int64) through the pinned scratch at offset `off` (asynchronous on CUDA)
+    torch::Tensor upload_idx(const std::vector<long>& v, long off, torch::Device dev) {
+        long* p = h_idx.data_ptr<long>() + off;
+        std::memcpy(p, v.data(), sizeof(long) * v.size());
+        auto t = h_idx.narrow(0, off, long(v.size()));
+        return dev.is_cuda() ? t.to(dev, /*non_blocking=*/true) : t.clone();
+    }
+};
+static RollIO g_io;
+#ifdef FLORENT_CUDA_GRAPHS
+static std::vector<c10::cuda::CUDAStream> g_group_streams;   // one per (net, policy) group of a step
+#endif
+
+// Decision inputs kept for PPO, on the device (grown as needed, reused across iterations).
+struct SampleStore {
+    torch::Tensor sp, sc;
+    long n = 0, cap = 0;
+    void reserve(long need, torch::Device dev) {
+        if (need <= cap) return;
+        const long nc = std::max(need, cap + cap / 2 + 4096);
+        auto o = torch::TensorOptions().device(dev);
+        auto nsp = torch::empty({nc, fe::ACTOR_SPATIAL}, o.dtype(torch::kUInt8));
+        auto nsc = torch::empty({nc, fe::ACTOR_SCALARS}, o.dtype(torch::kInt16));
+        if (n > 0) { nsp.narrow(0, 0, n).copy_(sp.narrow(0, 0, n)); nsc.narrow(0, 0, n).copy_(sc.narrow(0, 0, n)); }
+        sp = nsp; sc = nsc; cap = nc;
+    }
+};
+static SampleStore g_store;
 
 // ===========================================================================
 // ROLLOUT FORWARD, with CUDA graphs
@@ -349,10 +413,13 @@ struct FwdGraphs {
 };
 static FwdGraphs g_graphs;
 
-static torch::Tensor policy_forward(Teacher& net, int p, const torch::Tensor& sp_host, const torch::Tensor& sc_host, torch::Device dev) {
+// Forward of policy p on rows `idx` (device int64, n rows) of the device
+// inputs sp / sc. Returns the device logits [n, L] (valid until the next
+// forward of the same graph).
+static torch::Tensor policy_forward(Teacher& net, int p, const torch::Tensor& sp, const torch::Tensor& sc,
+                                    const torch::Tensor& idx, long n, torch::Device dev) {
 #ifdef FLORENT_CUDA_GRAPHS
     if (g_graphs.enabled && dev.is_cuda()) {
-        const long n = sp_host.size(0);
         long B = 8; while (B < n) B *= 2;
         const auto key = std::make_tuple((const void*)net.get(), p, B);
         auto it = g_graphs.m.find(key);
@@ -363,7 +430,7 @@ static torch::Tensor policy_forward(Teacher& net, int p, const torch::Tensor& sp
             e.sc = torch::zeros({B, fe::ACTOR_SCALARS}, opt.dtype(torch::kInt16));
             {
                 auto st = c10::cuda::getStreamFromPool();
-                st.synchronize();
+                c10::cuda::getCurrentCUDAStream().synchronize();
                 c10::cuda::CUDAStreamGuard guard(st);
                 for (int w = 0; w < 3; w++) net->logits_split(p, e.sp, e.sc);     // warm-up before capture
                 st.synchronize();
@@ -374,73 +441,171 @@ static torch::Tensor policy_forward(Teacher& net, int p, const torch::Tensor& sp
                 st.synchronize();
             }
             // check the graph against the plain forward on this batch
-            e.sp.narrow(0, 0, n).copy_(sp_host); e.sc.narrow(0, 0, n).copy_(sc_host);
+            auto xs = sp.index_select(0, idx), xc = sc.index_select(0, idx);
+            e.sp.narrow(0, 0, n).copy_(xs); e.sc.narrow(0, 0, n).copy_(xc);
             e.g->replay();
-            auto ref = net->logits_split(p, sp_host.to(dev), sc_host.to(dev));
+            auto ref = net->logits_split(p, xs, xc);
             const double diff = (e.out.narrow(0, 0, n) - ref).abs().max().item<double>();
             std::cout << "  cuda graph  captured: policy " << p << " batch " << B << ", check max diff " << diff << std::endl;
             if (!(diff < 1e-3)) {
                 std::cout << "  cuda graph  mismatch: graphs off for the rest of the run" << std::endl;
                 g_graphs.enabled = false;
-                return ref.to(torch::kCPU);
+                return ref;
             }
             it = g_graphs.m.emplace(key, std::move(e)).first;
-            return it->second.out.narrow(0, 0, n).to(torch::kCPU);
+            return it->second.out.narrow(0, 0, n);
         }
         FwdGraphs::Entry& e = it->second;
-        e.sp.narrow(0, 0, n).copy_(sp_host);
-        e.sc.narrow(0, 0, n).copy_(sc_host);
+        net->inference_flat(p);                          // weights changed since the capture: refresh in place
+        auto osp = e.sp.narrow(0, 0, n), osc = e.sc.narrow(0, 0, n);
+        torch::index_select_out(osp, sp, 0, idx);
+        torch::index_select_out(osc, sc, 0, idx);
         e.g->replay();
-        return e.out.narrow(0, 0, n).to(torch::kCPU);
+        return e.out.narrow(0, 0, n);
     }
 #endif
-    return net->logits_split(p, sp_host.to(dev), sc_host.to(dev)).to(torch::kCPU);
+    return net->logits_split(p, sp.index_select(0, idx), sc.index_select(0, idx));
 }
 
 struct PlayStats { long steps = 0; double t_encode = 0, t_forward = 0, t_act = 0, t_critic = 0; long critic_rows = 0; };
 
-// Kept value rows (for the value loss): the critic input and the return.
-struct ValueRow { std::vector<uint8_t> sp; std::vector<int32_t> sc; float ret = 0; int slot, seg, rnd; };
+// Kept value rows (for the value loss): the row of the device critic store
+// and the return.
+struct ValueRow { long row = -1; float ret = 0; int slot, seg, rnd; };
+struct CriticStore {
+    std::vector<torch::Tensor> sp_parts, sc_parts;   // kept rows, flush by flush
+    torch::Tensor sp, sc;                            // concatenated at the end of the rollout
+    long n = 0;
+};
 
-// Evaluate every queued critic row and write the values back; rows marked to
-// keep move to `kept`.
-static void flush_critic(std::vector<Slot>& slots, Teacher& net, torch::Device dev, std::vector<ValueRow>& kept, PlayStats& st) {
+// Critic inference runs on its own CUDA stream, overlapped with the rollout:
+// queued rows are evaluated in batches as soon as CRITIC_FLUSH of them are
+// waiting (the weights do not change during a rollout); the values are read
+// back once at the end.
+struct CriticPending {
+    torch::Tensor hsp, hsc, v, keep_h;               // pinned inputs (alive until uploaded), device values
+    std::vector<std::pair<int, CriticRow>> rows;     // (slot, row metadata; inputs already freed)
+};
+struct CriticRun {
+    std::vector<CriticPending> pend;
+#ifdef FLORENT_CUDA_GRAPHS
+    std::optional<c10::cuda::CUDAStream> stream;
+#endif
+};
+static int CRITIC_FLUSH = 2000;
+
+// Launch the critic on every queued row (asynchronously on CUDA); rows marked
+// to keep are also copied into the critic store.
+static void launch_critic(std::vector<Slot>& slots, Teacher& net, torch::Device dev, CriticStore& cs, CriticRun& run, PlayStats& st) {
     auto c0 = std::chrono::steady_clock::now();
     std::vector<std::pair<int, CriticRow*>> all;
     for (int i = 0; i < int(slots.size()); i++) for (auto& cr : slots[i].crit) all.push_back({i, &cr});
-    c10::InferenceMode im;
+    const bool cuda = dev.is_cuda();
+#ifdef FLORENT_CUDA_GRAPHS
+    std::optional<c10::cuda::CUDAStreamGuard> sg;
+    if (cuda) {
+        if (!run.stream) run.stream = c10::cuda::getStreamFromPool();
+        at::cuda::CUDAEvent ready;                      // the critic stream starts after the main stream's work
+        ready.record(c10::cuda::getCurrentCUDAStream());
+        ready.block(*run.stream);
+        sg.emplace(*run.stream);
+    }
+#endif
     for (size_t lo = 0; lo < all.size(); lo += CRITIC_BATCH) {
         const size_t hi = std::min(all.size(), lo + CRITIC_BATCH);
         std::vector<const std::vector<uint8_t>*> sps; std::vector<const std::vector<int32_t>*> scs;
         for (size_t k = lo; k < hi; k++) { sps.push_back(&all[k].second->sp); scs.push_back(&all[k].second->sc); }
-        torch::Tensor tsp, tsc; critic_upload(sps, scs, dev, tsp, tsc);
-        auto v = net->value_split(tsp, tsc).to(torch::kCPU).contiguous();
-        const float* vp = v.data_ptr<float>();
+        CriticPending pd;
+        critic_pack(sps, scs, cuda, pd.hsp, pd.hsc);
+        auto tsp = cuda ? pd.hsp.to(dev, true) : pd.hsp, tsc = cuda ? pd.hsc.to(dev, true) : pd.hsc;
+        {
+            c10::InferenceMode im;
+            pd.v = net->value_split(tsp, tsc);
+        }
+        std::vector<long> keep;
         for (size_t k = lo; k < hi; k++) {
             CriticRow& cr = *all[k].second;
             Slot& s = slots[all[k].first];
-            if (cr.boot) { s.segs[cr.seg].boot = vp[k - lo]; continue; }
-            RoundE& re = s.segs[cr.seg].rounds[cr.rnd];
-            re.value = vp[k - lo];
-            if (re.keep == -2) {
-                re.keep = int(kept.size());
-                kept.push_back({std::move(cr.sp), std::move(cr.sc), 0.f, all[k].first, cr.seg, cr.rnd});
+            if (!cr.boot && s.segs[cr.seg].rounds[cr.rnd].keep == -2) {
+                s.segs[cr.seg].rounds[cr.rnd].keep = int(cs.n + long(keep.size()));
+                keep.push_back(long(k - lo));
             }
         }
+        if (!keep.empty()) {
+            c10::InferenceMode off(false);           // normal tensors: PPO trains on them later
+            torch::NoGradGuard ng;
+            // pinned + asynchronous: a pageable upload would wait for this batch's forward
+            auto kh = torch::empty({long(keep.size())}, host_opts(torch::kLong, cuda));
+            std::memcpy(kh.data_ptr<long>(), keep.data(), sizeof(long) * keep.size());
+            auto ki = cuda ? kh.to(dev, /*non_blocking=*/true) : kh;
+            pd.keep_h = kh;
+            cs.sp_parts.push_back(tsp.index_select(0, ki));
+            cs.sc_parts.push_back(tsc.index_select(0, ki));
+            cs.n += long(keep.size());
+        }
+        for (size_t k = lo; k < hi; k++) {
+            CriticRow& cr = *all[k].second;
+            std::vector<uint8_t>().swap(cr.sp); std::vector<int32_t>().swap(cr.sc);
+            pd.rows.push_back({all[k].first, std::move(cr)});
+        }
         st.critic_rows += long(hi - lo);
+        run.pend.push_back(std::move(pd));
     }
-    for (auto& s : slots) { s.crit.clear(); s.crit.shrink_to_fit(); }
+    for (auto& s : slots) s.crit.clear();
+    st.t_critic += std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+}
+
+// Wait for every launched critic batch and write its values back.
+static void finish_critic(std::vector<Slot>& slots, std::vector<ValueRow>& kept, CriticStore& cs, CriticRun& run, PlayStats& st) {
+    auto c0 = std::chrono::steady_clock::now();
+#ifdef FLORENT_CUDA_GRAPHS
+    if (run.stream) run.stream->synchronize();               // every batch's values are computed
+#endif
+    for (auto& pd : run.pend) {
+        auto v = pd.v.to(torch::kCPU).contiguous();
+        const float* vp = v.data_ptr<float>();
+        for (size_t k = 0; k < pd.rows.size(); k++) {
+            const CriticRow& cr = pd.rows[k].second;
+            Slot& s = slots[pd.rows[k].first];
+            if (cr.boot) { s.segs[cr.seg].boot = vp[k]; continue; }
+            RoundE& re = s.segs[cr.seg].rounds[cr.rnd];
+            re.value = vp[k];
+            if (re.keep >= 0) kept.push_back({long(re.keep), 0.f, pd.rows[k].first, cr.seg, cr.rnd});
+        }
+    }
+    run.pend.clear();
+    if (!cs.sp_parts.empty()) {
+        c10::InferenceMode off(false);
+        torch::NoGradGuard ng;
+        cs.sp = cs.sp_parts.size() == 1 ? cs.sp_parts[0] : torch::cat(cs.sp_parts, 0);
+        cs.sc = cs.sc_parts.size() == 1 ? cs.sc_parts[0] : torch::cat(cs.sc_parts, 0);
+        cs.sp_parts.clear(); cs.sc_parts.clear();
+    }
+    // kept rows in critic-store order
+    std::sort(kept.begin(), kept.end(), [](const ValueRow& a, const ValueRow& b) { return a.row < b.row; });
     st.t_critic += std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
 }
 
 // Run all slots until each is paused or done. nets[k] plays net index k.
 static PlayStats play(std::vector<Slot>& slots, const Setup& S, const std::vector<Teacher*>& nets, torch::Device dev,
-                      int stretch, bool restart, bool train, std::vector<ValueRow>* kept) {
+                      int stretch, bool restart, bool train, std::vector<ValueRow>* kept, CriticStore* cstore) {
     using clk = std::chrono::steady_clock;
     auto secs = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); };
     PlayStats st;
     const int G = int(slots.size());
-    for (auto& s : slots) { s.paused = false; s.played = 0; }
+    const bool cuda = dev.is_cuda();
+    g_io.ensure(G, dev);
+    const long LW = g_io.h_lg.size(1);
+    for (int i = 0; i < G; i++) {
+        Slot& s = slots[i];
+        s.paused = false; s.played = 0;
+        s.in_sp = g_io.h_sp.data_ptr<uint8_t>() + long(i) * fe::ACTOR_SPATIAL;
+        s.in_sc = g_io.h_sc.data_ptr<int16_t>() + long(i) * fe::ACTOR_SCALARS;
+        s.lg = g_io.h_lg.data_ptr<float>() + long(i) * LW;
+    }
+    const bool store = train && kept;
+    if (store) g_store.n = 0;
+    CriticRun crun;
     c10::InferenceMode im;
     for (;;) {
         auto t0 = clk::now();
@@ -451,35 +616,70 @@ static PlayStats play(std::vector<Slot>& slots, const Setup& S, const std::vecto
         }
         auto t1 = clk::now();
         st.t_encode += secs(t0, t1);
-        // one forward per (net, policy) over every waiting game
-        bool any = false;
+        // one upload of every waiting input, then one forward per (net, policy)
+        int hi_row = -1;
+        for (int i = 0; i < G; i++) if (slots[i].need) hi_row = i;
+        if (hi_row < 0) break;
+        if (cuda) {
+            g_io.d_sp.narrow(0, 0, hi_row + 1).copy_(g_io.h_sp.narrow(0, 0, hi_row + 1), true);
+            g_io.d_sc.narrow(0, 0, hi_row + 1).copy_(g_io.h_sc.narrow(0, 0, hi_row + 1), true);
+        }
+        long region = 0;
+#ifdef FLORENT_CUDA_GRAPHS
+        // each (net, policy) group on its own stream: the groups' forwards overlap
+        std::optional<at::cuda::CUDAEvent> up;
+        if (cuda) { up.emplace(); up->record(c10::cuda::getCurrentCUDAStream()); }
+        std::vector<at::cuda::CUDAEvent> done;
+        done.reserve(nets.size() * NUM_POLICIES);
+#endif
         for (int k = 0; k < int(nets.size()); k++)
             for (int p = 0; p < NUM_POLICIES; p++) {
-                std::vector<int> idx;
+                std::vector<long> idx;
                 for (int i = 0; i < G; i++) if (slots[i].need && slots[i].net == k && slots[i].policy == p) idx.push_back(i);
                 if (idx.empty()) continue;
-                any = true;
                 const long n = long(idx.size());
-                auto tsp = torch::empty({n, fe::ACTOR_SPATIAL}, torch::kUInt8);
-                auto tsc = torch::empty({n, fe::ACTOR_SCALARS}, torch::kInt16);
-                for (long j = 0; j < n; j++)
-                    actor_compact(slots[idx[j]].obs, tsp.data_ptr<uint8_t>() + j * fe::ACTOR_SPATIAL,
-                                  tsc.data_ptr<int16_t>() + j * fe::ACTOR_SCALARS, slots[idx[j]].oob);
-                auto l = policy_forward(*nets[k], p, tsp, tsc, dev).contiguous();
-                const long L = l.size(1);
-                const float* lp = l.data_ptr<float>();
-                for (long j = 0; j < n; j++) slots[idx[j]].logits.assign(lp + j * L, lp + (j + 1) * L);
+#ifdef FLORENT_CUDA_GRAPHS
+                std::optional<c10::cuda::CUDAStreamGuard> sg;
+                if (cuda) {
+                    if (g_group_streams.size() < size_t(region + 1)) g_group_streams.push_back(c10::cuda::getStreamFromPool(true));
+                    sg.emplace(g_group_streams[region]);
+                    up->block(g_group_streams[region]);
+                }
+#endif
+                auto d_idx = g_io.upload_idx(idx, region * G, dev);
+                region++;
+                auto l = policy_forward(*nets[k], p, g_io.d_sp, g_io.d_sc, d_idx, n, dev);
+                g_io.d_lg.narrow(1, 0, l.size(1)).index_copy_(0, d_idx, l);
+#ifdef FLORENT_CUDA_GRAPHS
+                if (cuda) { done.emplace_back(); done.back().record(c10::cuda::getCurrentCUDAStream()); }
+#endif
                 st.steps++;
             }
+#ifdef FLORENT_CUDA_GRAPHS
+        for (auto& e : done) e.block(c10::cuda::getCurrentCUDAStream());
+#endif
+        if (cuda) g_io.h_lg.copy_(g_io.d_lg);                // one read-back (waits for the forwards)
         auto t2 = clk::now();
         st.t_forward += secs(t1, t2);
-        if (!any) break;
         #pragma omp parallel for schedule(static, 1)
         for (int i = 0; i < G; i++) if (slots[i].need) play_decision(slots[i], S, train);
+        if (store) {                                          // recorded inputs -> sample store, on the device
+            std::vector<long> from, to;
+            for (int i = 0; i < G; i++)
+                if (slots[i].recorded) { slots[i].recorded = false; slots[i].samples.back().row = g_store.n + long(from.size()); from.push_back(i); }
+            if (!from.empty()) {
+                for (size_t j = 0; j < from.size(); j++) to.push_back(g_store.n + long(j));
+                g_store.reserve(g_store.n + long(from.size()), dev);
+                auto df = g_io.upload_idx(from, 2 * NUM_POLICIES * G, dev), dt = g_io.upload_idx(to, (2 * NUM_POLICIES + 1) * G, dev);
+                g_store.sp.index_copy_(0, dt, g_io.d_sp.index_select(0, df));
+                g_store.sc.index_copy_(0, dt, g_io.d_sc.index_select(0, df));
+                g_store.n += long(from.size());
+            }
+        }
         st.t_act += secs(t2, clk::now());
         if (train && kept) {
             size_t q = 0; for (auto& s : slots) q += s.crit.size();
-            if (q >= size_t(CRITIC_QUEUE)) flush_critic(slots, *nets[0], dev, *kept, st);
+            if (q >= size_t(CRITIC_FLUSH)) launch_critic(slots, *nets[0], dev, *cstore, crun, st);
         }
     }
     if (train && kept) {
@@ -492,7 +692,8 @@ static PlayStats play(std::vector<Slot>& slots, const Setup& S, const std::vecto
             cr.seg = int(s.segs.size()) - 1; cr.rnd = -1; cr.boot = true;
             s.crit.push_back(std::move(cr));
         }
-        flush_critic(slots, *nets[0], dev, *kept, st);
+        launch_critic(slots, *nets[0], dev, *cstore, crun, st);
+        finish_critic(slots, *kept, *cstore, crun, st);
     }
     return st;
 }
@@ -514,10 +715,10 @@ int main(int argc, char** argv) {
     const std::string out = argv[2];
     Setup S;
     S.maps.assign(argv + 3, argv + argc);
-    const int G = env_int("GAMES", 100), R = env_int("ROUNDS", 100);
+    const int G = env_int("GAMES", 200), R = env_int("ROUNDS", 150);
     const int N_MINI = env_int("N_MINI", 10);      // minibatches per pass (reference pipeline: 15)
     // Full-batch learner: do not split PPO minibatches into MICRO chunks.
-    MICRO = env_int("MICRO", std::numeric_limits<int>::max());   // default: no split
+    MICRO = env_int("MICRO", 65536);  // default: no split (the fused trunk keeps no activations, so memory allows it)
     CRITIC_BATCH = std::max(1, env_int("CRITIC_BATCH", 4000));
     S.value_keep = env_float("VALUE_KEEP", 1.0f);
     S.record_p = env_float("RECORD_P", 1.0f);
@@ -618,7 +819,8 @@ int main(int argc, char** argv) {
         }
         net->eval();
         std::vector<ValueRow> kept;
-        const PlayStats ps = play(slots, S, {&net}, dev, R, /*restart=*/true, /*train=*/true, &kept);
+        CriticStore cstore;
+        const PlayStats ps = play(slots, S, {&net}, dev, R, /*restart=*/true, /*train=*/true, &kept, &cstore);
 
         // ---- GAE per segment and team (team 1 sees -value)
         for (auto& s : slots)
@@ -695,29 +897,32 @@ int main(int argc, char** argv) {
         const size_t VB = std::max<size_t>(1, (kept.size() + N_MINI - 1) / N_MINI);
         std::vector<int> vo(kept.size()); std::iota(vo.begin(), vo.end(), 0);
 
-        // ---- pack the iteration's samples once (instead of per minibatch and head)
-        //  SP / SC: every sample's input, one contiguous host tensor each (pinned
-        //  on CUDA); a chunk gathers its rows with index_select and uploads them.
-        //  Per head h: its records as device tensors (choice, mask, old logp,
-        //  advantage), and rec_of[h][sample] = the sample's record in head h, -1 none.
+        // ---- the iteration's samples are already on the device (g_store);
+        //  ROW[sample] = its store row. Per head h: its records as device
+        //  tensors (choice, mask, old logp, advantage), and rec_of[h][sample] =
+        //  the sample's record in head h, -1 none.
         const long NS = long(samples.size());
         const bool cuda = dev.is_cuda();
         using uclk = std::chrono::steady_clock;
-        auto sync_now = [&] { if (cuda) torch::cuda::synchronize(); return uclk::now(); };
+        // timing waits for this thread's stream only (the value steps run on their own)
+        auto sync_now = [&] {
+#ifdef FLORENT_CUDA_GRAPHS
+            if (cuda) c10::cuda::getCurrentCUDAStream().synchronize();
+#else
+            if (cuda) torch::cuda::synchronize();
+#endif
+            return uclk::now();
+        };
         double t_pack = 0, t_pol = 0, t_val = 0;
         const auto tp0 = uclk::now();
-        auto host_opts = [&](torch::ScalarType t) { return torch::TensorOptions().dtype(t).pinned_memory(cuda); };
-        torch::Tensor SP = torch::empty({NS, fe::ACTOR_SPATIAL}, host_opts(torch::kUInt8));
-        torch::Tensor SC = torch::empty({NS, fe::ACTOR_SCALARS}, host_opts(torch::kInt16));
+        torch::Tensor ROW;
         {
-            uint8_t* spp = SP.data_ptr<uint8_t>(); int16_t* scp = SC.data_ptr<int16_t>();
-            #pragma omp parallel for schedule(static)
-            for (long i = 0; i < NS; i++) {
-                std::memcpy(spp + i * fe::ACTOR_SPATIAL, samples[i].sp.data(), fe::ACTOR_SPATIAL);
-                std::memcpy(scp + i * fe::ACTOR_SCALARS, samples[i].sc.data(), sizeof(int16_t) * fe::ACTOR_SCALARS);
-                std::vector<uint8_t>().swap(samples[i].sp);        // the packed copy is the one used now
-            }
+            std::vector<long> r(NS);
+            for (long i = 0; i < NS; i++) r[i] = samples[i].row;
+            ROW = torch::tensor(r, torch::kLong).to(dev);
         }
+        const torch::Tensor& SP = g_store.sp;
+        const torch::Tensor& SC = g_store.sc;
         std::vector<std::vector<int>> rec_of(NUM_HEAD_IDS, std::vector<int>(NS, -1));
         torch::Tensor HCH[NUM_HEAD_IDS], HMK[NUM_HEAD_IDS], HOLP[NUM_HEAD_IDS], HADV[NUM_HEAD_IDS];
         {
@@ -740,6 +945,13 @@ int main(int argc, char** argv) {
                 HADV[h] = torch::tensor(adv[h]).to(dev);
             }
         }
+        // value targets, in critic-store order
+        torch::Tensor VRET;
+        {
+            std::vector<float> r(kept.size());
+            for (size_t i = 0; i < kept.size(); i++) r[i] = kept[i].ret;
+            VRET = torch::tensor(r).to(dev);
+        }
 
         t_pack = std::chrono::duration<double>(sync_now() - tp0).count();
         // Per-minibatch sums, kept on the device and read back once per
@@ -752,34 +964,65 @@ int main(int argc, char** argv) {
                 H = torch::zeros({NUM_HEAD_IDS}, d);
             }
         };
-        // One chunk (rows of one policy). Always adds its sums to `acc`. With
-        // `grad`, also returns the chunk's loss term:
+        // One chunk (rows of one policy) with every index it needs, built once
+        // per minibatch on the host and uploaded in one copy: its store rows,
+        // and per head its records' (row in the chunk, record index).
+        struct ChunkHead { int head; long k; torch::Tensor rr, ri; };
+        struct Chunk { int p; long nr; torch::Tensor rows; std::vector<ChunkHead> heads; };
+        auto make_chunks = [&](const std::vector<int>* by_pol) {
+            std::vector<Chunk> cs;
+            std::vector<long> buf;
+            struct Off { long rows; std::vector<std::tuple<int, long, long, long>> h; };   // head, k, rr off, ri off
+            std::vector<Off> offs;
+            for (int p = 0; p < NUM_POLICIES; p++)
+                for (size_t c = 0; c < by_pol[p].size(); c += MICRO) {
+                    const int* rows = by_pol[p].data() + c;
+                    const long nr = long(std::min(by_pol[p].size() - c, size_t(MICRO)));
+                    Off o; o.rows = long(buf.size());
+                    for (long b = 0; b < nr; b++) buf.push_back(samples[rows[b]].row);
+                    for (int head : policy_heads(p)) {
+                        const std::vector<int>& ro = rec_of[head];
+                        std::vector<long> rr, ri;
+                        for (long b = 0; b < nr; b++) { const int x = ro[rows[b]]; if (x >= 0) { rr.push_back(b); ri.push_back(x); } }
+                        if (rr.empty()) continue;
+                        const long k = long(rr.size()), o1 = long(buf.size());
+                        buf.insert(buf.end(), rr.begin(), rr.end());
+                        buf.insert(buf.end(), ri.begin(), ri.end());
+                        o.h.push_back({head, k, o1, o1 + k});
+                    }
+                    cs.push_back({p, nr, {}, {}});
+                    offs.push_back(std::move(o));
+                }
+            auto host = torch::empty({long(buf.size())}, host_opts(torch::kLong, cuda));
+            std::memcpy(host.data_ptr<long>(), buf.data(), sizeof(long) * buf.size());
+            auto d = cuda ? host.to(dev, /*non_blocking=*/true) : host;
+            for (size_t c = 0; c < cs.size(); c++) {
+                cs[c].rows = d.narrow(0, offs[c].rows, cs[c].nr);
+                for (auto& [head, k, o1, o2] : offs[c].h) cs[c].heads.push_back({head, k, d.narrow(0, o1, k), d.narrow(0, o2, k)});
+            }
+            return cs;
+        };
+        // One chunk. Always adds its sums to `acc`. With `grad`, also returns
+        // the chunk's loss term:
         //   -surr / n_total  -  (1/present) * sum_h coef_h * Hbar_h / Hbar_h.detach()
         // Hbar_h is head h's mean entropy over the minibatch. If the policy is in
         // one chunk (h_mean == nullptr) it is computed here, exactly; otherwise
         // h_mean comes from a no-grad pass over the whole minibatch, and the
         // chunk's share is H_chunk / (cnt_h * h_mean_h).
-        auto chunk = [&](int p, const int* rows, long nr, bool grad, Acc& acc, long n_total,
+        auto chunk = [&](const Chunk& C, bool grad, Acc& acc, long n_total,
                          const long* cnt_total, const double* h_mean, int present) -> torch::Tensor {
-            auto rows_t = torch::from_blob(const_cast<int*>(rows), {nr}, torch::kInt32).to(torch::kLong);
-            auto sp = SP.index_select(0, rows_t), sc = SC.index_select(0, rows_t);
-            if (cuda) { sp = sp.pin_memory(); sc = sc.pin_memory(); }
-            auto logits = net->logits_split(p, sp.to(dev, /*non_blocking=*/cuda), sc.to(dev, cuda));
+            const int p = C.p;
+            auto logits = net->logits_split(p, SP.index_select(0, C.rows), SC.index_select(0, C.rows));
             torch::Tensor loss = torch::zeros({}, dev);
-            for (int head : policy_heads(p)) {
-                // this chunk's records of the head: (row in the chunk, record index)
-                std::vector<long> rr, ri;
-                const std::vector<int>& ro = rec_of[head];
-                for (long b = 0; b < nr; b++) { const int x = ro[rows[b]]; if (x >= 0) { rr.push_back(b); ri.push_back(x); } }
-                if (rr.empty()) continue;
-                const long k = long(rr.size());
-                auto ri_t = torch::tensor(ri, torch::kLong).to(dev);
-                auto hl = logits.index_select(0, torch::tensor(rr, torch::kLong).to(dev)).narrow(1, head_offset(p, head), HEAD_SIZE[head]);
-                auto mask = HMK[head].index_select(0, ri_t);
+            for (const ChunkHead& ch : C.heads) {
+                const int head = ch.head;
+                const long k = ch.k;
+                auto hl = logits.index_select(0, ch.rr).narrow(1, head_offset(p, head), HEAD_SIZE[head]);
+                auto mask = HMK[head].index_select(0, ch.ri);
                 auto lsm = torch::log_softmax(hl.masked_fill(~mask, -1e9f), 1);
-                auto new_lp = lsm.gather(1, HCH[head].index_select(0, ri_t).view({k, 1})).squeeze(1);
-                auto log_ratio = new_lp - HOLP[head].index_select(0, ri_t);
-                auto A = HADV[head].index_select(0, ri_t);
+                auto new_lp = lsm.gather(1, HCH[head].index_select(0, ch.ri).view({k, 1})).squeeze(1);
+                auto log_ratio = new_lp - HOLP[head].index_select(0, ch.ri);
+                auto A = HADV[head].index_select(0, ch.ri);
                 auto ratio = torch::exp(log_ratio);
                 auto surr = torch::min(ratio * A, torch::clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * A).sum();
                 auto H = -(lsm.exp().masked_fill(~mask, 0.f) * lsm.masked_fill(~mask, 0.f)).sum();   // summed over k records
@@ -798,25 +1041,24 @@ int main(int argc, char** argv) {
             }
             return loss;
         };
-        auto value_step = [&](size_t j) {
+        auto value_step = [&](const std::vector<int>& vo, size_t j) {
             const size_t v0 = j * VB;
             if (v0 >= vo.size()) return;
             const size_t v1 = std::min(vo.size(), v0 + VB);
             const double n_all = double(v1 - v0);
             opt_val.zero_grad();
-            double vl_tot = 0;
+            torch::Tensor vl_tot = torch::zeros({}, dev);
             for (size_t c0 = v0; c0 < v1; c0 += MICRO) {
                 const size_t c1 = std::min(v1, c0 + MICRO);
-                std::vector<const std::vector<uint8_t>*> sps; std::vector<const std::vector<int32_t>*> scs; std::vector<float> tgt;
-                for (size_t b = c0; b < c1; b++) { const ValueRow& vr = kept[vo[b]]; sps.push_back(&vr.sp); scs.push_back(&vr.sc); tgt.push_back(vr.ret); }
-                torch::Tensor tsp, tsc; critic_upload(sps, scs, dev, tsp, tsc);
-                auto se = (net->value_split(tsp, tsc) - torch::tensor(tgt).to(dev)).pow(2).sum();
+                std::vector<long> rows(vo.begin() + c0, vo.begin() + c1);     // kept index == critic-store row
+                auto ri = torch::tensor(rows, torch::kLong).to(dev);
+                auto se = (net->value_split(cstore.sp.index_select(0, ri), cstore.sc.index_select(0, ri)) - VRET.index_select(0, ri)).pow(2).sum();
                 (VALUE_COEF * se / n_all).backward();                          // chunk share of the mean
-                vl_tot += se.item<double>();
+                vl_tot += se.detach();
             }
             clip_norm(val_params, CLIP_VAL, 1);
             opt_val.step();
-            vl_sum += vl_tot / n_all; v_steps++;
+            vl_sum += vl_tot.item<double>() / n_all; v_steps++;
         };
         for (int ep = 0; ep < EPOCHS && !kl_stop; ep++) {
             std::shuffle(order.begin(), order.end(), shuf);
@@ -834,14 +1076,13 @@ int main(int argc, char** argv) {
                 bool split = false;
                 for (int p = 0; p < NUM_POLICIES; p++) split |= by_pol[p].size() > size_t(MICRO);
                 const auto tq0 = sync_now();
+                const std::vector<Chunk> chunks = make_chunks(by_pol);
                 // no-grad pass only when needed: the KL check (pass 2+) or a policy split into chunks
                 double h_mean[NUM_HEAD_IDS] = {};
                 if (ep > 0 || split) {
                     torch::NoGradGuard ng;
                     Acc pre(dev);
-                    for (int p = 0; p < NUM_POLICIES; p++)
-                        for (size_t c = 0; c < by_pol[p].size(); c += MICRO)
-                            chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), false, pre, 0, nullptr, nullptr, 0);
+                    for (const Chunk& C : chunks) chunk(C, false, pre, 0, nullptr, nullptr, 0);
                     auto r = torch::cat({pre.kl.view({1}), pre.H}).to(torch::kCPU);
                     const float* rp = r.data_ptr<float>();
                     const double kl = rp[0] / double(pre.n);
@@ -851,12 +1092,10 @@ int main(int argc, char** argv) {
                 // the gradient pass; its sums are the logged ones
                 Acc acc(dev);
                 opt_pol.zero_grad();
-                for (int p = 0; p < NUM_POLICIES; p++)
-                    for (size_t c = 0; c < by_pol[p].size(); c += MICRO) {
-                        auto loss = chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), true, acc,
-                                          n_total, cnt_total, split ? h_mean : nullptr, present);
-                        if (loss.requires_grad()) loss.backward();
-                    }
+                for (const Chunk& C : chunks) {
+                    auto loss = chunk(C, true, acc, n_total, cnt_total, split ? h_mean : nullptr, present);
+                    if (loss.requires_grad()) loss.backward();
+                }
                 clip_norm(pol_params, CLIP_POL, 0);
                 opt_pol.step();
                 // one read-back per minibatch
@@ -871,7 +1110,7 @@ int main(int argc, char** argv) {
                 pl_sum += -rp[0] / double(acc.n); ent_sum += ent_mean / std::max(1, present);
                 kl_sum += rp[1] / double(acc.n); nrec += acc.n; clipped += long(rp[2]); n_steps++;
                 const auto tq1 = sync_now();
-                value_step(j);
+                value_step(vo, j);
                 const auto tq2 = sync_now();
                 t_pol += std::chrono::duration<double>(tq1 - tq0).count();
                 t_val += std::chrono::duration<double>(tq2 - tq1).count();
@@ -1002,7 +1241,7 @@ int main(int argc, char** argv) {
                     if (i == 0 && greedy) s.log = &log0;
                     start_game(s, S);
                 }
-                play(ev_slots, S, {&net, &frozen}, dev, /*stretch=*/0, /*restart=*/false, /*train=*/false, nullptr);
+                play(ev_slots, S, {&net, &frozen}, dev, /*stretch=*/0, /*restart=*/false, /*train=*/false, nullptr, nullptr);
                 long wins = 0, games = 0, ev_draws = 0; double rounds = 0;
                 for (int i = 0; i < K.eval_games; i++) {
                     const fe::Game& g = ev_slots[i].m.game;

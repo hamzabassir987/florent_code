@@ -16,6 +16,21 @@ void Match::encode_only(int entity, std::vector<float>& out) {
     out.resize(ch.size()+sc.size()); for(size_t i=0;i<ch.size();++i) out[i]=static_cast<float>(ch[i]);
     for(size_t i=0;i<sc.size();++i) out[ch.size()+i]=static_cast<float>(sc[i]);
 }
+long Match::encode_compact(int entity, uint8_t* sp, int16_t* sc) {
+    fe::encode_actor(game, memories.at(entity), entity, enc_ch, enc_sc);
+    long oob = 0;
+    const int32_t* c = enc_ch.data();
+    for (int i = 0; i < fe::ACTOR_SPATIAL; i++) {
+        int32_t v = c[i];
+        if (v < 0 || v > 255) { oob++; v = v < 0 ? 0 : 255; }
+        sp[i] = uint8_t(v);
+    }
+    for (int i = 0; i < fe::ACTOR_SCALARS; i++) {
+        int32_t v = enc_sc[i];
+        sc[i] = int16_t(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
+    }
+    return oob;
+}
 void Match::actor_observation(int entity, std::vector<float>& out) {
     if (!memories.count(entity)) { fe::ObsMemory m; m.init(game, game.ents[entity].team); memories.emplace(entity, std::move(m)); }
     auto& mem=memories.at(entity); mem.update(game, entity);

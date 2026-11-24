@@ -12,10 +12,22 @@
 
 #include "../../engine/src/obs.hpp"
 #include "../sim/florent_heads.hpp"
+#include "trunk_fn.hpp"
 
 namespace florent_rl {
 
 constexpr int ACTOR_HIDDEN = 128;
+// The fused CUDA trunk (trunk_kernels.cu) on CUDA inputs; env FUSED_TRUNK=0
+// uses the PyTorch ops instead.
+inline bool use_fused_trunk() {
+    static const bool on = fused_trunk_built() && (!std::getenv("FUSED_TRUNK") || std::atoi(std::getenv("FUSED_TRUNK")) != 0);
+    return on;
+}
+// The same for the critic's spatial part (critic_kernels.cu); env FUSED_CRITIC=0.
+inline bool use_fused_critic() {
+    static const bool on = fused_trunk_built() && (!std::getenv("FUSED_CRITIC") || std::atoi(std::getenv("FUSED_CRITIC")) != 0);
+    return on;
+}
 constexpr int TRUNK_CH = 32;
 
 // Fixed input scaling (part of the checkpoint ABI; the deployed student uses
@@ -120,6 +132,22 @@ struct ResBlockImpl : torch::nn::Module {
         z = dw2->forward(z);
         return z.add_(x).relu_();
     }
+    // The same block without padding: each depthwise conv only produces the
+    // positions whose 3x3 window lies inside its input, so [B, C, S, S] ->
+    // [B, C, S-4, S-4] and the residual is the input's centre crop. Inside
+    // that window every value equals forward()'s (zero padding only reaches
+    // the outer ring of each conv), so a trunk read at its centre is
+    // unchanged: the actor computes only what its centre output depends on.
+    torch::Tensor forward_valid(torch::Tensor x) {
+        static const std::vector<int64_t> one{1, 1}, zero{0, 0};
+        const at::IntArrayRef ONE(one), ZERO(zero);
+        const int64_t c = x.size(1), s = x.size(2);
+        auto z = pw->forward(x).relu_();
+        z = torch::conv2d(z, dw->weight, dw->bias, ONE, ZERO, ONE, c).relu_();
+        z = pw2->forward(z).relu_();
+        z = torch::conv2d(z, dw2->weight, dw2->bias, ONE, ZERO, ONE, c);
+        return z.add_(x.narrow(2, 2, s - 4).narrow(3, 2, s - 4)).relu_();
+    }
 };
 TORCH_MODULE(ResBlock);
 
@@ -137,11 +165,50 @@ struct ActorImpl : torch::nn::Module {
     }
     // spatial: [B, 59, 17, 17] already scaled; scalars: [B, actor_features()]
     torch::Tensor forward(torch::Tensor spatial, torch::Tensor scalars) {
+        return head(trunk_centre(stem->forward(spatial).relu_()), scalars);
+    }
+    // spatial unscaled: the per-channel input scale is folded into the stem
+    // weights (one small multiply instead of a pass over the whole input)
+    torch::Tensor forward_unscaled(torch::Tensor spatial, const torch::Tensor& ch_scale, torch::Tensor scalars) {
+        auto w = stem->weight * ch_scale.view({1, -1, 1, 1});
+        return head(trunk_centre(torch::conv2d(spatial, w, stem->bias).relu_()), scalars);
+    }
+    // The four blocks reach exactly HALF = 8 tiles (two 3x3 convs each) and only
+    // the centre is read, so they run unpadded on shrinking windows:
+    // 17 -> 13 -> 9 -> 5 -> 1 (see ResBlock::forward_valid). Same output as
+    // the padded trunk's centre, ~2.5x less work.
+    static_assert(fe::PATCH == 17, "trunk_centre assumes a 17x17 patch and 4 blocks");
+    torch::Tensor trunk_centre(torch::Tensor h) {
+        for (auto& b : *blocks) h = b->as<ResBlock>()->forward_valid(h);
+        return h.flatten(1);                                     // [B, 32, 1, 1] -> [B, 32]
+    }
+    torch::Tensor head(const torch::Tensor& centre, const torch::Tensor& scalars) {
+        auto f = fc->forward(torch::cat({centre, scalars}, 1)).relu_();
+        return out->forward(f);
+    }
+    // Every trunk parameter as one vector, in trunk_kernels.cu's layout (built
+    // with differentiable ops: the flat gradient flows back to the parameters).
+    // The stem weight includes the per-channel input scale.
+    torch::Tensor trunk_flat(const torch::Tensor& ch_scale) {
+        std::vector<torch::Tensor> v;
+        v.push_back((stem->weight.view({TRUNK_CH, fe::ACTOR_CH}) * ch_scale.view({1, fe::ACTOR_CH})).t().reshape(-1));
+        v.push_back(stem->bias);
+        for (auto& m : *blocks) {
+            auto* b = m->as<ResBlock>();
+            auto pw = b->pw->weight.view({TRUNK_CH, TRUNK_CH}), pw2 = b->pw2->weight.view({TRUNK_CH, TRUNK_CH});
+            v.push_back(pw.t().reshape(-1)); v.push_back(pw.reshape(-1)); v.push_back(b->pw->bias);
+            v.push_back(b->dw->weight.reshape(-1)); v.push_back(b->dw->bias);
+            v.push_back(pw2.t().reshape(-1)); v.push_back(pw2.reshape(-1)); v.push_back(b->pw2->bias);
+            v.push_back(b->dw2->weight.reshape(-1)); v.push_back(b->dw2->bias);
+        }
+        return torch::cat(v);
+    }
+    // reference: the padded trunk read at its centre (parity checks)
+    torch::Tensor forward_padded(torch::Tensor spatial, torch::Tensor scalars) {
         auto h = stem->forward(spatial).relu_();
         for (auto& b : *blocks) h = b->as<ResBlock>()->forward(h);
         auto centre = h.index({torch::indexing::Slice(), torch::indexing::Slice(), fe::HALF, fe::HALF});
-        auto f = fc->forward(torch::cat({centre, scalars}, 1)).relu_();
-        return out->forward(f);
+        return head(centre, scalars);
     }
 };
 TORCH_MODULE(Actor);
@@ -162,12 +229,33 @@ struct CriticImpl : torch::nn::Module {
         value = register_module("value", torch::nn::Linear(CRITIC_HIDDEN, 1));
     }
     torch::Tensor forward(torch::Tensor spatial, torch::Tensor scalars) {
+        return head(spatial_out(spatial), scalars);
+    }
+    torch::Tensor spatial_out(torch::Tensor spatial) {             // [B, 29, 48, 48] -> [B, 288]
         static const int POOL[3] = {2, 2, 4};
         auto h = stem->forward(spatial).relu_();
         for (int b = 0; b < 3; b++)
             h = torch::max_pool2d(blocks[b]->as<ResBlock>()->forward(h), {POOL[b], POOL[b]}, {POOL[b], POOL[b]});
-        auto f = hidden->forward(torch::cat({h.flatten(1), scalars}, 1)).relu_();
+        return h.flatten(1);
+    }
+    torch::Tensor head(const torch::Tensor& spatial, const torch::Tensor& scalars) {
+        auto f = hidden->forward(torch::cat({spatial, scalars}, 1)).relu_();
         return value->forward(f).squeeze(1);
+    }
+    // the spatial parameters as one vector, in critic_kernels.cu's layout
+    torch::Tensor spatial_flat() {
+        std::vector<torch::Tensor> v;
+        v.push_back(stem->weight.view({TRUNK_CH, fe::CRITIC_CH}).t().reshape(-1));
+        v.push_back(stem->bias);
+        for (auto& m : *blocks) {
+            auto* b = m->as<ResBlock>();
+            auto pw = b->pw->weight.view({TRUNK_CH, TRUNK_CH}), pw2 = b->pw2->weight.view({TRUNK_CH, TRUNK_CH});
+            v.push_back(pw.t().reshape(-1)); v.push_back(pw.reshape(-1)); v.push_back(b->pw->bias);
+            v.push_back(b->dw->weight.reshape(-1)); v.push_back(b->dw->bias);
+            v.push_back(pw2.t().reshape(-1)); v.push_back(pw2.reshape(-1)); v.push_back(b->pw2->bias);
+            v.push_back(b->dw2->weight.reshape(-1)); v.push_back(b->dw2->bias);
+        }
+        return torch::cat(v);
     }
 };
 TORCH_MODULE(Critic);
@@ -209,12 +297,63 @@ struct TeacherImpl : torch::nn::Module {
     torch::Tensor actor_features(const torch::Tensor& sc) { return features(sc, a_idx, a_scale, a_big, a_huge); }
     // Compact inputs, already on the device: spatial uint8 [B, ACTOR_SPATIAL],
     // scalars any integer type [B, ACTOR_SCALARS]; converted to float here.
+    // The trunk's flat parameter vector for no-grad forwards (rollouts):
+    // kept per policy and rebuilt, in place, only when a trunk parameter has
+    // changed (version counters and storage, so optimizer steps, copies and
+    // loads are all seen). In place: a captured CUDA graph that reads it stays
+    // valid. Call it before replaying such a graph.
+    std::vector<torch::Tensor> flat_inf = std::vector<torch::Tensor>(NUM_POLICIES);
+    std::vector<std::vector<std::pair<const void*, int64_t>>> flat_key = std::vector<std::vector<std::pair<const void*, int64_t>>>(NUM_POLICIES);
+    const torch::Tensor& inference_flat(int p) {
+        auto a = actors[p]->as<Actor>();
+        std::vector<std::pair<const void*, int64_t>> key;
+        for (auto& t : a->stem->parameters()) key.push_back({t.data_ptr(), t._version()});
+        for (auto& t : a->blocks->parameters()) key.push_back({t.data_ptr(), t._version()});
+        key.push_back({ch_scale.data_ptr(), ch_scale._version()});
+        if (!flat_inf[p].defined() || key != flat_key[p]) {
+            torch::NoGradGuard ng;
+            auto f = a->trunk_flat(ch_scale);
+            if (!flat_inf[p].defined() || flat_inf[p].device() != f.device()) {
+                c10::InferenceMode off(false);       // a normal tensor, updated in place later
+                flat_inf[p] = f.clone();
+            } else flat_inf[p].copy_(f);
+            flat_key[p] = std::move(key);
+        }
+        return flat_inf[p];
+    }
     torch::Tensor logits_split(int p, const torch::Tensor& sp, const torch::Tensor& sc) {
-        auto x = sp.to(torch::kFloat32).view({sp.size(0), fe::ACTOR_CH, fe::PATCH, fe::PATCH}).mul_(ch_scale);
+        if (sp.is_cuda() && use_fused_trunk()) {
+            auto a = actors[p]->as<Actor>();
+            auto y = actor_features(sc.to(torch::kFloat32));
+            const bool grad = torch::GradMode::is_enabled();
+            return a->head(fused_trunk(sp.contiguous(), grad ? a->trunk_flat(ch_scale) : inference_flat(p)), y);
+        }
+        auto x = sp.to(torch::kFloat32).view({sp.size(0), fe::ACTOR_CH, fe::PATCH, fe::PATCH});
         auto y = actor_features(sc.to(torch::kFloat32));
-        return actors[p]->as<Actor>()->forward(x, y);
+        return actors[p]->as<Actor>()->forward_unscaled(x, ch_scale, y);
+    }
+    // the critic's flat spatial parameters for no-grad forwards (see inference_flat)
+    torch::Tensor cflat_inf;
+    std::vector<std::pair<const void*, int64_t>> cflat_key;
+    const torch::Tensor& critic_inference_flat() {
+        std::vector<std::pair<const void*, int64_t>> key;
+        for (auto& t : critic->stem->parameters()) key.push_back({t.data_ptr(), t._version()});
+        for (auto& t : critic->blocks->parameters()) key.push_back({t.data_ptr(), t._version()});
+        if (!cflat_inf.defined() || key != cflat_key) {
+            torch::NoGradGuard ng;
+            auto f = critic->spatial_flat();
+            if (!cflat_inf.defined() || cflat_inf.device() != f.device()) { c10::InferenceMode off(false); cflat_inf = f.clone(); }
+            else cflat_inf.copy_(f);
+            cflat_key = std::move(key);
+        }
+        return cflat_inf;
     }
     torch::Tensor value_split(const torch::Tensor& sp, const torch::Tensor& sc) {
+        if (sp.is_cuda() && use_fused_critic()) {
+            auto y = critic_features(sc.to(torch::kFloat32));
+            const bool grad = torch::GradMode::is_enabled();
+            return critic->head(fused_critic(sp.contiguous(), grad ? critic->spatial_flat() : critic_inference_flat()), y);
+        }
         auto x = sp.to(torch::kFloat32).view({sp.size(0), fe::CRITIC_CH, fe::CRITIC_PAD, fe::CRITIC_PAD});
         auto y = critic_features(sc.to(torch::kFloat32));
         return critic->forward(x, y);
