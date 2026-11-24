@@ -197,6 +197,7 @@ static void start_game(Slot& s, const Setup& S) {
     if (!s.m.load(s.map_path, s.seed)) { std::cerr << "bad map " << s.map_path << "\n"; std::exit(3); }
     s.m.reset();
     s.m.game.round = s.start_round;
+    s.start_round = 0;              // staggered once (the games of iteration 0); every restart starts at round 0
     s.m.game.max_turns = S.K->game_rounds;
     s.m.game.limit_ore(S.K->ore_radius, s.rng());
     s.started = true; s.in_round = false; s.done = false;
