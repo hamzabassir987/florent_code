@@ -444,7 +444,7 @@ int main(int argc, char** argv) {
     const int G = env_int("GAMES", 100), R = env_int("ROUNDS", 100);
     const int N_MINI = env_int("N_MINI", 10);      // minibatches per pass (reference pipeline: 15)
     // Full-batch learner: do not split PPO minibatches into MICRO chunks.
-    MICRO = std::numeric_limits<int>::max();
+    MICRO = env_int("MICRO", std::numeric_limits<int>::max());   // default: no split
     CRITIC_BATCH = std::max(1, env_int("CRITIC_BATCH", 4000));
     S.value_keep = env_float("VALUE_KEEP", 1.0f);
     S.record_p = env_float("RECORD_P", 1.0f);
@@ -598,10 +598,7 @@ int main(int argc, char** argv) {
         // Memory: every forward/backward runs on at most MICRO rows; the
         // gradients of a minibatch's chunks add up before its one optimizer
         // step (the loss is a sum over records divided by the minibatch's
-        // record count, so the step is the same as one big batch). The
-        // per-head target entropy needs each head's mean entropy over the
-        // whole minibatch, so a no-grad pass measures it (and the KL, checked
-        // before any step) first.
+        // record count, so the step is the same as one big batch).
         net->train();
         double pl_sum = 0, vl_sum = 0, ent_sum = 0, kl_sum = 0; int n_steps = 0, v_steps = 0;
         long nrec = 0, clipped = 0;
@@ -622,11 +619,25 @@ int main(int argc, char** argv) {
         const size_t VB = std::max<size_t>(1, (kept.size() + N_MINI - 1) / N_MINI);
         std::vector<int> vo(kept.size()); std::iota(vo.begin(), vo.end(), 0);
 
-        // One chunk (rows of one policy): per-head sums. With `grad`, returns
-        // the chunk's loss term (scaled by the minibatch's totals).
-        struct HeadSums { double H[NUM_HEAD_IDS] = {}; long cnt[NUM_HEAD_IDS] = {}; double surr = 0, kl = 0; long n = 0, clip = 0; };
-        auto chunk = [&](int p, const int* rows, long nr, bool grad, HeadSums& hs,
-                         long n_total, const double* h_mean, int present) -> torch::Tensor {
+        // Per-minibatch sums, kept on the device and read back once per
+        // minibatch (no .item() per head).
+        struct Acc {
+            torch::Tensor surr, kl, clip, H;      // H: [NUM_HEAD_IDS]
+            long cnt[NUM_HEAD_IDS] = {}; long n = 0;
+            explicit Acc(torch::Device d) {
+                surr = torch::zeros({}, d); kl = torch::zeros({}, d); clip = torch::zeros({}, d);
+                H = torch::zeros({NUM_HEAD_IDS}, d);
+            }
+        };
+        // One chunk (rows of one policy). Always adds its sums to `acc`. With
+        // `grad`, also returns the chunk's loss term:
+        //   -surr / n_total  -  (1/present) * sum_h coef_h * Hbar_h / Hbar_h.detach()
+        // Hbar_h is head h's mean entropy over the minibatch. If the policy is in
+        // one chunk (h_mean == nullptr) it is computed here, exactly; otherwise
+        // h_mean comes from a no-grad pass over the whole minibatch, and the
+        // chunk's share is H_chunk / (cnt_h * h_mean_h).
+        auto chunk = [&](int p, const int* rows, long nr, bool grad, Acc& acc, long n_total,
+                         const long* cnt_total, const double* h_mean, int present) -> torch::Tensor {
             auto tsp = torch::empty({nr, fe::ACTOR_SPATIAL}, torch::kUInt8);
             auto tsc = torch::empty({nr, fe::ACTOR_SCALARS}, torch::kInt16);
             for (long b = 0; b < nr; b++) {
@@ -656,24 +667,18 @@ int main(int argc, char** argv) {
                 auto A = torch::tensor(adv).to(dev);
                 auto ratio = torch::exp(log_ratio);
                 auto surr = torch::min(ratio * A, torch::clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * A).sum();
-                auto H = -(lsm.exp().masked_fill(~mask, 0.f) * lsm.masked_fill(~mask, 0.f)).sum();
+                auto H = -(lsm.exp().masked_fill(~mask, 0.f) * lsm.masked_fill(~mask, 0.f)).sum();   // summed over k records
+                acc.surr += surr.detach();
+                acc.kl += ((ratio - 1) - log_ratio).detach().sum();                 // KL(old || new) estimate
+                acc.clip += ((ratio - 1).abs() > CLIP_EPS).sum().to(torch::kFloat32);
+                acc.H[head] += H.detach();
+                acc.cnt[head] += k; acc.n += k;
                 if (grad) {
-                    // During the first (and normally only) PPO epoch, collect
-                    // metrics from the training forward itself.  This avoids a
-                    // second identical no-grad forward pass.  Entropy is
-                    // normalized by the records in this chunk rather than by
-                    // a separately measured minibatch mean.
-                    loss = loss - surr / double(n_total)
-                         - H * (K.head_entropy[head] / double(std::max<long>(1, k)));
-                    hs.surr += surr.item<double>();
-                    hs.kl += ((ratio - 1) - log_ratio).sum().item<double>();
-                    hs.H[head] += H.item<double>(); hs.cnt[head] += k; hs.n += k;
-                    hs.clip += ((ratio - 1).abs() > CLIP_EPS).sum().item<long>();
-                } else {
-                    hs.surr += surr.item<double>();
-                    hs.kl += ((ratio - 1) - log_ratio).sum().item<double>();      // KL(old || new) estimate
-                    hs.H[head] += H.item<double>(); hs.cnt[head] += k; hs.n += k;
-                    hs.clip += ((ratio - 1).abs() > CLIP_EPS).sum().item<long>();
+                    const double w = K.head_entropy[head] / double(std::max(1, present));
+                    torch::Tensor ent;
+                    if (!h_mean) { auto hm = H / double(k); ent = hm / (hm.detach() + 1e-8); }       // whole head in this chunk
+                    else ent = H / (double(cnt_total[head]) * (h_mean[head] + 1e-8));
+                    loss = loss - surr / double(n_total) - w * ent;
                 }
             }
             return loss;
@@ -705,56 +710,50 @@ int main(int argc, char** argv) {
                 const size_t s1 = std::min(order.size(), s0 + MB);
                 std::vector<int> by_pol[NUM_POLICIES];
                 for (size_t k = s0; k < s1; k++) by_pol[samples[order[k]].policy].push_back(order[k]);
-                // For the first epoch, metrics are collected by the training
-                // forward below. Later epochs retain the pre-check pass so KL
-                // early stopping can prevent an unsafe update.
-                HeadSums hs;
-                const bool metric_pass = ep > 0;
-                if (metric_pass) {
+                // head record counts and the heads present, from the records (CPU, no forward)
+                long cnt_total[NUM_HEAD_IDS] = {}; long n_total = 0; int present = 0;
+                for (size_t k = s0; k < s1; k++)
+                    for (auto& rec : samples[order[k]].recs) { cnt_total[rec.head]++; n_total++; }
+                for (int h = 0; h < NUM_HEAD_IDS; h++) present += cnt_total[h] > 0;
+                if (!n_total) continue;
+                bool split = false;
+                for (int p = 0; p < NUM_POLICIES; p++) split |= by_pol[p].size() > size_t(MICRO);
+                // no-grad pass only when needed: the KL check (pass 2+) or a policy split into chunks
+                double h_mean[NUM_HEAD_IDS] = {};
+                if (ep > 0 || split) {
                     torch::NoGradGuard ng;
+                    Acc pre(dev);
                     for (int p = 0; p < NUM_POLICIES; p++)
                         for (size_t c = 0; c < by_pol[p].size(); c += MICRO)
-                            chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), false, hs, 0, nullptr, 0);
-                    if (!hs.n) continue;
-                    const double kl = hs.kl / double(hs.n);
-                    if (kl > KL_STOP) { kl_stop = true; stop_ep = ep; stop_kl = kl; break; }
+                            chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), false, pre, 0, nullptr, nullptr, 0);
+                    auto r = torch::cat({pre.kl.view({1}), pre.H}).to(torch::kCPU);
+                    const float* rp = r.data_ptr<float>();
+                    const double kl = rp[0] / double(pre.n);
+                    if (ep > 0 && kl > KL_STOP) { kl_stop = true; stop_ep = ep; stop_kl = kl; break; }
+                    for (int h = 0; h < NUM_HEAD_IDS; h++) if (pre.cnt[h]) h_mean[h] = rp[1 + h] / double(pre.cnt[h]);
                 }
-                double h_mean[NUM_HEAD_IDS] = {}; int present = 0; double ent_mean = 0;
-                for (int h = 0; h < NUM_HEAD_IDS; h++) {
-                    if (!hs.cnt[h]) continue;
-                    h_mean[h] = hs.H[h] / double(hs.cnt[h]);
-                    ent_mean += h_mean[h]; present++;
-                }
-                // Count head records once so the single-pass epoch-0 loss has
-                // a valid minibatch denominator before `chunk()` has filled
-                // its metric accumulator.
-                long total_records = 0;
-                for (int p = 0; p < NUM_POLICIES; p++)
-                    for (int row : by_pol[p]) total_records += long(samples[row].recs.size());
-                if (!total_records) continue;
+                // the gradient pass; its sums are the logged ones
+                Acc acc(dev);
                 opt_pol.zero_grad();
                 for (int p = 0; p < NUM_POLICIES; p++)
                     for (size_t c = 0; c < by_pol[p].size(); c += MICRO) {
-                        auto loss = chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), true, hs, total_records, h_mean, present);
+                        auto loss = chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), true, acc,
+                                          n_total, cnt_total, split ? h_mean : nullptr, present);
                         if (loss.requires_grad()) loss.backward();
                     }
-                if (!hs.n) continue;
-                if (ep == 0) {
-                    for (int h = 0; h < NUM_HEAD_IDS; h++) {
-                        head_ent[h] += hs.H[h];
-                        head_n[h] += hs.cnt[h];
-                    }
-                    ent_mean = 0; present = 0;
-                    for (int h = 0; h < NUM_HEAD_IDS; h++) if (hs.cnt[h]) {
-                        ent_mean += hs.H[h] / double(hs.cnt[h]);
-                        present++;
-                    }
-                }
-                const double kl = hs.kl / double(hs.n);
                 clip_norm(pol_params, CLIP_POL, 0);
                 opt_pol.step();
-                pl_sum += -hs.surr / double(hs.n); ent_sum += ent_mean / std::max(1, present);
-                kl_sum += kl; nrec += hs.n; clipped += hs.clip; n_steps++;
+                // one read-back per minibatch
+                auto r = torch::cat({acc.surr.view({1}), acc.kl.view({1}), acc.clip.view({1}), acc.H}).to(torch::kCPU);
+                const float* rp = r.data_ptr<float>();
+                double ent_mean = 0;
+                for (int h = 0; h < NUM_HEAD_IDS; h++) {
+                    if (!acc.cnt[h]) continue;
+                    ent_mean += rp[3 + h] / double(acc.cnt[h]);
+                    if (ep == 0) { head_ent[h] += rp[3 + h]; head_n[h] += acc.cnt[h]; }
+                }
+                pl_sum += -rp[0] / double(acc.n); ent_sum += ent_mean / std::max(1, present);
+                kl_sum += rp[1] / double(acc.n); nrec += acc.n; clipped += long(rp[2]); n_steps++;
                 value_step(j);
             }
         }
