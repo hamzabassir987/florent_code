@@ -42,7 +42,10 @@ constexpr int CH_THREAT = 4;         // own/enemy remembered turret reach: possi
 constexpr int CH_RAY = 11;           // ray aggregates, written on boundary cells only
 constexpr int ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY;  // 57
 constexpr int ACTOR_SPATIAL = ACTOR_CH * PATCH * PATCH;
-constexpr int ACTOR_SCALARS = 40;
+// 40 base scalars, then the team's current price of each buildable type
+// (controller get_*_cost(), in ACTOR_COST_TYPES order)
+constexpr int ACTOR_SCALARS = 50;
+constexpr int ACTOR_COSTS = 40;
 
 constexpr int C_TERRAIN = 0;
 constexpr int C_OWN = C_TERRAIN + CH_TERRAIN;

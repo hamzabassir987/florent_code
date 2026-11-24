@@ -127,7 +127,15 @@ class EngineAdapter:
         if t != self.tm:
             return 0, 0, 0, 0, 0
         o = team(self.L, self.g, t)
-        return o[0], o[1], o[2], 0, o[6]
+        return o[0], o[1], o[2], o[5], o[6]
+
+    # engine BASE_COST (conveyor, splitter, harvester, barrier, gunner, sentinel,
+    # launcher, spike, mine, builder bot) x team scale / 100
+    _BASE = (3, 6, 20, 3, 20, 30, 20, 20, 6, 30)
+
+    def costs(self):
+        sc = team(self.L, self.g, self.tm)[5]
+        return [b * sc // 100 for b in self._BASE]
 
     def store(self, i):
         return self.L.fe_get_store(self.g, self.tm, i)

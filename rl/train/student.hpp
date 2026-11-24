@@ -48,6 +48,8 @@ inline void quantize_actor(const int16_t* raw, int32_t* q) {
         else if (i == 10 || i == 11) o = v / 100;
         else if (i == 12) o = v / 50;
         else if (i == 14) o = v / 4;
+        else if (i == 13) o = (v - 100) / 25;                 // scale percent: 100 -> 0, +25 % a step
+        else if (i >= fe::ACTOR_COSTS) o = v / 4;              // current prices
         qs[i] = o < 0 ? 0 : (o > 15 ? 15 : o);
     }
 }

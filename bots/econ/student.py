@@ -12,7 +12,8 @@ import sys
 from array import array
 
 PATCH, HALF = 17, 8
-ACTOR_CH, SCALARS = 59, 40
+ACTOR_CH, SCALARS = 59, 50
+COSTS = 40
 BITS = 16
 # 4 residual blocks x 2 (1x1 -> depthwise 3x3) layers = 8 depthwise convs:
 # receptive field 17x17, exactly the patch.
@@ -98,6 +99,10 @@ def quantize(raw):
         elif i == 12:
             o = v // 50
         elif i == 14:
+            o = v // 4
+        elif i == 13:
+            o = (v - 100) // 25 if v >= 100 else -((100 - v) // 25)   # truncates toward 0, like C++
+        elif i >= COSTS:
             o = v // 4
         q[s0 + i] = 0 if o < 0 else (15 if o > 15 else o)
     return q

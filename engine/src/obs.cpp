@@ -265,7 +265,7 @@ void encode_actor(const Game& g, const ObsMemory& m, int actor,
     scalars[10] = me.ti;
     scalars[11] = me.vo;
     scalars[12] = me.ammo;
-    scalars[13] = 0;  // total team scale is not exposed by the production controller
+    scalars[13] = me.scale;  // get_scale_percent()
     scalars[14] = me.units;
     scalars[15] = 0;  // opponent economy is not exposed to the deployed controller
     scalars[16] = 0;
@@ -277,6 +277,10 @@ void encode_actor(const Game& g, const ObsMemory& m, int actor,
     scalars[37] = friendly_confirmed;
     scalars[38] = enemy_reaches_friendly_core;
     scalars[39] = enemy_confirmed;
+    // current prices: conveyor, splitter, harvester, barrier, gunner, sentinel,
+    // launcher, spike, mine, builder bot
+    static const int COST_TYPES[10] = {CONVEYOR, SPLITTER, HARVESTER, BARRIER, GUNNER, SENTINEL, LAUNCHER, SPIKE, MINE, BUILDER};
+    for (int i = 0; i < 10; i++) scalars[ACTOR_COSTS + i] = g.cost(team, COST_TYPES[i]);
 }
 
 // ---------------------------------------------------------------- critic

@@ -17,7 +17,9 @@ CH_STALE, CH_VISIT, CH_ATTR_STALE = 1, 1, 2
 CH_DIR, CH_HP, CH_THREAT, CH_RAY = 9, 2, 4, 11
 ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY
 ACTOR_SPATIAL = ACTOR_CH * PATCH * PATCH
-ACTOR_SCALARS = 40
+ACTOR_SCALARS = 50
+ACTOR_COSTS = 40   # 40..49: current prices (conveyor, splitter, harvester, barrier, gunner,
+                   # sentinel, launcher, spike, mine, builder bot)
 C_TERRAIN = 0
 C_OWN = C_TERRAIN + CH_TERRAIN
 C_ENEMY = C_OWN + CH_OWN
@@ -254,6 +256,7 @@ class ObsMemory:
         scalars[15:20] = ad.team_resources(1 - team)
         for i in range(16):
             scalars[20 + i] = ad.store(i)
+        scalars[ACTOR_COSTS:ACTOR_COSTS + 10] = ad.costs()
         scalars[36:40] = [int(own_reaches_enemy_core), int(own_core_confirmed),
                           int(enemy_reaches_own_core), int(enemy_core_confirmed)]
         return out, scalars
@@ -353,7 +356,14 @@ class ControllerAdapter:
         ct = self.ct
         # The production controller exposes only our own global economy.
         return (ct.get_global_resources(), ct.get_global_voltium(), ct.get_global_ammo(),
-                0, ct.get_unit_count())
+                int(round(ct.get_scale_percent())), ct.get_unit_count())
+
+    def costs(self):
+        ct = self.ct
+        return [ct.get_conveyor_cost(), ct.get_splitter_cost(), ct.get_harvester_cost(),
+                ct.get_barrier_cost(), ct.get_gunner_cost(), ct.get_sentinel_cost(),
+                ct.get_launcher_cost(), ct.get_spike_cost(), ct.get_mine_cost(),
+                ct.get_builder_bot_cost()]
 
     def store(self, i):
         return self.ct.read_store(i)
