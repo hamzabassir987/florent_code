@@ -40,16 +40,18 @@ inline torch::Tensor actor_scalar_scale() {
     // 13 (scale, always 0), 15-19 (opponent, always 0), 20-35 (packed store words): ignored
     return torch::tensor(s).view({1, fe::ACTOR_SCALARS});
 }
-inline torch::Tensor critic_scalar_scale() {
-    std::vector<float> s(fe::CRITIC_SCALARS, 1.f / 10.f);  // per-type entity counts
-    s[0] = 1.f / 1000.f;                                     // round
-    for (int i = 1; i <= 10; i++) s[i] = 1.f / 1000.f;       // both teams' Ti/Vo/ammo/scale/units
-    const int e = fe::CRITIC_SCALARS - fe::CRITIC_EXTRA;
-    s[e + 0] = 1.f / 100.f;                                  // rounds left
-    for (int i = 1; i <= 4; i++) s[e + i] = 1.f / 100.f;     // Ti / Vo collected per team
-    s[e + 5] = 1.f / 10.f;                                   // Ti collected, A - B
-    s[e + 6] = 1.f / 10.f;                                   // Ti stored, A - B
-    return torch::tensor(s).view({1, fe::CRITIC_SCALARS});
+// Critic scalars at several scales: every raw scalar x becomes
+// clamp(x / d, -CRIT_CLIP, CRIT_CLIP) for each d in CRIT_SCALES, so small
+// differences (3 Ti) show at the fine scales and large values (4000 Ti) stay
+// apart at the coarse ones.
+constexpr float CRIT_SCALES[] = {1.f, 10.f, 100.f, 1000.f};
+constexpr int N_CRIT_SCALES = 4;
+constexpr float CRIT_CLIP = 5.f;
+constexpr int CRITIC_FEATURES = fe::CRITIC_SCALARS * N_CRIT_SCALES;
+inline torch::Tensor critic_scalar_scale() {                  // [1, 1, N_CRIT_SCALES]: 1/d
+    std::vector<float> s;
+    for (float d : CRIT_SCALES) s.push_back(1.f / d);
+    return torch::tensor(s).view({1, 1, N_CRIT_SCALES});
 }
 
 struct ResBlockImpl : torch::nn::Module {
@@ -107,7 +109,7 @@ struct CriticImpl : torch::nn::Module {
         stem = register_module("stem", torch::nn::Conv2d(torch::nn::Conv2dOptions(fe::CRITIC_CH, TRUNK_CH, 1)));
         for (int b = 0; b < 3; b++) blocks->push_back(ResBlock(TRUNK_CH));
         register_module("blocks", blocks);
-        hidden = register_module("hidden", torch::nn::Linear(TRUNK_CH * 3 * 3 + fe::CRITIC_SCALARS, CRITIC_HIDDEN));
+        hidden = register_module("hidden", torch::nn::Linear(TRUNK_CH * 3 * 3 + CRITIC_FEATURES, CRITIC_HIDDEN));
         value = register_module("value", torch::nn::Linear(CRITIC_HIDDEN, 1));
     }
     torch::Tensor forward(torch::Tensor spatial, torch::Tensor scalars) {
@@ -139,6 +141,10 @@ struct TeacherImpl : torch::nn::Module {
         auto sc = raw.narrow(1, fe::ACTOR_SPATIAL, fe::ACTOR_SCALARS) * sc_scale;
         return actors[p]->as<Actor>()->forward(sp, sc);
     }
+    // [B, CRITIC_SCALARS] raw -> [B, CRITIC_FEATURES]: each scalar at every scale, clamped
+    torch::Tensor critic_features(const torch::Tensor& sc) {
+        return (sc.unsqueeze(2) * crit_scale).clamp_(-CRIT_CLIP, CRIT_CLIP).flatten(1);
+    }
     // Compact inputs, already on the device: spatial uint8 [B, ACTOR_SPATIAL],
     // scalars any integer type [B, ACTOR_SCALARS]; converted to float here.
     torch::Tensor logits_split(int p, const torch::Tensor& sp, const torch::Tensor& sc) {
@@ -148,13 +154,13 @@ struct TeacherImpl : torch::nn::Module {
     }
     torch::Tensor value_split(const torch::Tensor& sp, const torch::Tensor& sc) {
         auto x = sp.to(torch::kFloat32).view({sp.size(0), fe::CRITIC_CH, fe::CRITIC_PAD, fe::CRITIC_PAD});
-        auto y = sc.to(torch::kFloat32).mul_(crit_scale);
+        auto y = critic_features(sc.to(torch::kFloat32));
         return critic->forward(x, y);
     }
     // raw: [B, CRITIC_SPATIAL + CRITIC_SCALARS]
     torch::Tensor value(torch::Tensor raw) {
         auto sp = raw.narrow(1, 0, fe::CRITIC_SPATIAL).view({raw.size(0), fe::CRITIC_CH, fe::CRITIC_PAD, fe::CRITIC_PAD});
-        auto sc = raw.narrow(1, fe::CRITIC_SPATIAL, fe::CRITIC_SCALARS) * crit_scale;
+        auto sc = critic_features(raw.narrow(1, fe::CRITIC_SPATIAL, fe::CRITIC_SCALARS));
         return critic->forward(sp, sc);
     }
 };
