@@ -26,6 +26,8 @@ void ObsMemory::init(const Game& g, int team_) {
     attr_seen_round.assign(n, -1);
     known.clear(); pending.clear();
     sym_alive = 7; sym = -1;
+    // a pit lies on the mirror axis (controller get_pit): x pit -> mirror x, y pit -> mirror y
+    if (g_bus.use_pit && g.pit_axis >= 0) sym_alive = uint8_t(1u << (g.pit_axis == 0 ? 1 : 2));
 }
 
 // ---------------------------------------------------------------- report bus
@@ -40,7 +42,10 @@ void ObsMemory::init(const Game& g, int team_) {
 // units with (id + round) % 4 == 0): slot ((id + round) / 4) % 16.
 static constexpr uint32_t REP_MARK = 1u << 31, REP_REMOVE = 1u << 30;
 enum : int { REP_ORE_TI = 1, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE,
-             REP_OWN_LAUNCHER };          // 8: one of OUR launchers (for the launcher cap)
+             REP_OWN_LAUNCHER,            // 8: one of OUR launchers (for the launcher cap)
+             REP_SYM };                   // 9: the map symmetry (tile field = sym); experiment knob
+// experiment knobs (bus_stats); the defaults are the deployed behaviour
+BusConfig g_bus;
 static int rep_cat_of_type(int type) {
     switch (type) {
     case CORE: return REP_CORE; case GUNNER: return REP_GUNNER; case SENTINEL: return REP_SENTINEL;
@@ -98,6 +103,18 @@ void ObsMemory::resolve_symmetry() {
             if (bld_id[mt] >= 0 && bld_team[mt] == team && bld_type[mt] == CORE) { sym_alive &= uint8_t(~(1u << s)); break; }
         }
     }
+    // a known enemy core tile (seen or reported) must be the mirror of one of ours
+    if (g_bus.use_enemy_core && !own_core.empty() && sym < 0) {
+        for (int t = 0; t < N; t++) {
+            if (!(bld_id[t] >= 0 && bld_team[t] != team && bld_type[t] == CORE)) continue;
+            for (int s = 0; s < 3; s++) {
+                if (!(sym_alive >> s & 1)) continue;
+                bool match = false;
+                for (int o : own_core) if (mirror(o, s) == t) { match = true; break; }
+                if (!match) sym_alive &= uint8_t(~(1u << s));
+            }
+        }
+    }
     if (sym < 0 && (sym_alive == 1 || sym_alive == 2 || sym_alive == 4)) {
         sym = sym_alive == 1 ? 0 : (sym_alive == 2 ? 1 : 2);
         for (int t = 0; t < N; t++) {
@@ -119,6 +136,7 @@ void ObsMemory::resolve_symmetry() {
 }
 
 void ObsMemory::merge_store(const int64_t* store) {
+    snap_sym = false; snap_mask = 7;
     for (int i = 0; i < 16; i++) {
         const int64_t v = store[i];
         if (v < 0 || v > 0xFFFFFFFFll || !(uint64_t(v) & REP_MARK)) continue;
@@ -126,6 +144,16 @@ void ObsMemory::merge_store(const int64_t* store) {
         const int cat = (p >> 26) & 15, t = p & 0x7FF;
         const uint32_t bits = (p >> 11) & 0x7FFF;
         const bool remove = p & REP_REMOVE;
+        if (cat == REP_SYM) {
+            // tile field: bits 0..2 = the sender's candidate set (1 << sym when it knows it)
+            const uint8_t mask = uint8_t(t & 7);
+            if (!remove && !bits && mask) {
+                snap_mask &= mask;
+                if (__builtin_popcount(mask) == 1) snap_sym = true;
+                if (sym < 0 && (sym_alive & mask)) sym_alive &= mask;
+            }
+            continue;
+        }
         if (cat < REP_ORE_TI || cat > REP_OWN_LAUNCHER || t >= W * H) continue;
         if (rep_is_ore(cat)) {
             if (remove) continue;
@@ -145,7 +173,7 @@ void ObsMemory::merge_store(const int64_t* store) {
         }
         // non-ore reports carry the sender's map symmetry in bits 11..12 (0 unknown, else sym + 1)
         if (bits & ~3u) continue;
-        if (const int ss = int(bits & 3u); ss && sym < 0 && (sym_alive >> (ss - 1) & 1)) sym_alive = uint8_t(1u << (ss - 1));
+        if (const int ss = int(bits & 3u); ss) { snap_sym = true; snap_mask &= uint8_t(1u << (ss - 1)); if (sym < 0 && (sym_alive >> (ss - 1) & 1)) sym_alive = uint8_t(1u << (ss - 1)); }
         const uint32_t f = p & ~(0x7FFFu << 11);     // the fact itself
         rep_note(known, f);
         pending.erase(f);
@@ -205,7 +233,18 @@ bool ObsMemory::next_report(uint64_t unit_id, int round, int& slot, uint32_t& re
         slot = int(k % 16);
         return true;
     }
-    if (k % 4 != 0) return false;
+    if (g_bus.sym_report && k % uint64_t(g_bus.sym_div) == 0) {
+        // post our candidate set when it says more than last round's store did:
+        // the symmetry itself, or (mode 2) eliminations the team has not shared
+        const uint8_t mine = sym >= 0 ? uint8_t(1u << sym) : sym_alive;
+        const bool news = sym >= 0 ? !snap_sym : (g_bus.sym_report >= 2 && mine && (snap_mask & ~mine & 7));
+        if (news) {
+            report = REP_MARK | (uint32_t(REP_SYM) << 26) | uint32_t(mine);
+            slot = int(k % 16);
+            return true;
+        }
+    }
+    if (k % uint64_t(g_bus.rot_div) != 0) return false;
     std::vector<uint32_t> live;
     const int enemy = 1 - team;
     for (uint32_t f : known) {                  // std::set: ascending
@@ -216,9 +255,9 @@ bool ObsMemory::next_report(uint64_t unit_id, int round, int& slot, uint32_t& re
         else if (bld_id[t] >= 0 && bld_team[t] == enemy && bld_type[t] == rep_type_of_cat(cat)) live.push_back(f);
     }
     if (live.empty()) return false;
-    const uint32_t f = live[(k / 4) % live.size()];
+    const uint32_t f = live[(k / uint64_t(g_bus.rot_div)) % live.size()];
     report = rep_is_ore((f >> 26) & 15) ? ore_report(f) : (f | sym_bits());
-    slot = int((k / 4) % 16);
+    slot = int((k / uint64_t(g_bus.rot_div)) % 16);
     return true;
 }
 

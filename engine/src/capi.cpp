@@ -101,6 +101,7 @@ void fe_obs_merge(void* p, const long long* store16) {
     reinterpret_cast<fe::ObsMemory*>(p)->merge_store(s);
 }
 // the report to post (0: none) and its slot
+int fe_pit_axis(Game* g) { return g->pit_axis; }     // -1 none, 0 x (east / west halves), 1 y
 long long fe_obs_next_report(void* p, long long unit_id, int round, int* slot) {
     uint32_t r = 0; int sl = -1;
     if (!reinterpret_cast<fe::ObsMemory*>(p)->next_report(uint64_t(unit_id), round, sl, r)) { *slot = -1; return 0; }

@@ -231,7 +231,10 @@ class Player:
         except Exception as e:  # never let a unit die from a bug
             import sys
 
+            import traceback
+
             print("ERR", t, repr(e), file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
     def learned_turn(self, ct):
         """One turn of the int4 student (same heads and masks as training).

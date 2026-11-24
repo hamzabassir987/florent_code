@@ -245,7 +245,7 @@ def run_game(L, map_path, seed, rounds, rng, stats):
                 aid, typ, tm = o[0], o[1], o[2]
                 if a not in cpp_mem:
                     cpp_mem[a] = ctypes.c_void_p(L.fe_obs_new(g, tm))
-                    py_mem[a] = E.ObsMemory(W, H, tm)
+                    py_mem[a] = E.ObsMemory(W, H, tm, L.fe_pit_axis(g))
                 ad = EngineAdapter(L, g, a)
                 # team report bus: both merge the same store snapshot, see, choose a report
                 snap = [L.fe_get_store(g, tm, i) for i in range(16)]
@@ -319,7 +319,7 @@ def leakage_check(L, map_path, seed, rng, stats):
                 break
         if victim is None:
             return
-        m = E.ObsMemory(W, H, tm)
+        m = E.ObsMemory(W, H, tm, L.fe_pit_axis(g))
         ad = EngineAdapter(L, g, a)
         m.update(ad)
         before, _ = m.encode(ad)
@@ -362,7 +362,7 @@ def visit_history_check(L, map_path, seed, stats):
         actor, x0, y0 = spawned
         tm = ent(L, g, actor)[2]
         cpp_mem = ctypes.c_void_p(L.fe_obs_new(g, tm))
-        py_mem = E.ObsMemory(W, H, tm)
+        py_mem = E.ObsMemory(W, H, tm, L.fe_pit_axis(g))
 
         def check():
             ad = EngineAdapter(L, g, actor)
@@ -495,7 +495,7 @@ def timing(L, map_path, seed, rng, n_units=200):
         while done < n_units:
             for a in turn_order(L, g):
                 ad = EngineAdapter(L, g, a)
-                m = E.ObsMemory(W, H, ent(L, g, a)[2])
+                m = E.ObsMemory(W, H, ent(L, g, a)[2], L.fe_pit_axis(g))
                 t0 = time.perf_counter()
                 m.update(ad)
                 m.encode(ad)

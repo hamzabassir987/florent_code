@@ -26,6 +26,14 @@ static double pct(std::vector<int> v, double q) {
 int main(int argc, char** argv) {
     if (argc < 4) { std::fprintf(stderr, "usage: bus_stats N_GAMES ROUNDS MAP...\n"); return 2; }
     const int NG = std::atoi(argv[1]), R = std::atoi(argv[2]);
+    if (const char* v = std::getenv("ROT_DIV")) fe::g_bus.rot_div = std::max(1, std::atoi(v));
+    if (const char* v = std::getenv("SYM_REPORT")) fe::g_bus.sym_report = std::atoi(v);
+    if (const char* v = std::getenv("SYM_DIV")) fe::g_bus.sym_div = std::max(1, std::atoi(v));
+    if (const char* v = std::getenv("USE_PIT")) fe::g_bus.use_pit = std::atoi(v) != 0;
+    if (const char* v = std::getenv("USE_ECORE")) fe::g_bus.use_enemy_core = std::atoi(v) != 0;
+    std::printf("bus: rot_div %d  sym_report %d  sym_div %d  use_pit %d  use_enemy_core %d\n", fe::g_bus.rot_div, fe::g_bus.sym_report, fe::g_bus.sym_div, int(fe::g_bus.use_pit), int(fe::g_bus.use_enemy_core));
+    std::map<int, std::vector<double>> late_sym;          // k -> share of late units knowing the symmetry
+    long store_writes = 0, unit_turns = 0;
     std::vector<std::string> maps(argv + 3, argv + argc);
     std::mt19937_64 rng(7);
     std::vector<int> ore_lat, bld_lat, ore_before;       // before: known before anyone saw it (symmetry)
@@ -83,6 +91,7 @@ int main(int argc, char** argv) {
                     if (enemy_b && kb[t] < 0 && mem.bld_id[t] >= 0 && mem.bld_team[t] != team && mem.bld_type[t] == G.ents[b].type) kb[t] = r;
                 }
             }
+            for (auto& [ent, mem] : m.memories) if (ent < int(G.ents.size()) && G.ents[ent].alive) { unit_turns++; store_writes += mem.sym >= 0; }
             // late units: share of the team's known ore, k rounds after birth
             for (auto& [ent, mem] : m.memories) {
                 if (ent >= int(G.ents.size()) || !G.ents[ent].alive) continue;
@@ -100,6 +109,12 @@ int main(int argc, char** argv) {
                     mine += mem.terrain[t] == fe::T_ORE_TI || mem.terrain[t] == fe::T_ORE_VO;
                 }
                 if (team_known) late[k].push_back(double(mine) / team_known);
+                late_sym[k].push_back(mem.sym >= 0 ? 1.0 : 0.0);
+                if (std::getenv("DEBUG_SYM") && k == 0 && mem.sym < 0) {
+                    int team_sym = 0; for (auto& [e2, m2] : m.memories) if (e2 < int(G.ents.size()) && G.ents[e2].alive && G.ents[e2].team == team && m2.sym >= 0) team_sym++;
+                    std::printf("DBG late unit %d type %d r %d: sym_alive %d snap_sym %d snap_mask %d  teammates knowing sym %d\n",
+                                ent, G.ents[ent].type, r, mem.sym_alive, int(mem.snap_sym), int(mem.snap_mask), team_sym);
+                }
             }
         }
         // latencies: for every unit alive when its team first saw the fact, and that did not see it itself first
@@ -137,9 +152,12 @@ int main(int argc, char** argv) {
     std::printf("  never learned (unit alive 10+ rounds after it was seen): %ld\n", ore_never);
     std::printf("enemy buildings (core / turrets), units alive when first seen: %ld pairs  rounds: median %.0f  p75 %.0f  p90 %.0f\n",
                 bld_pairs, pct(bld_lat, .5), pct(bld_lat, .75), pct(bld_lat, .9));
+    std::printf("unit-rounds with the symmetry known: %.1f%%\n", 100.0 * store_writes / std::max(1L, unit_turns));
     std::printf("late units (born after round 5): share of the team's known ore they know\n");
     for (auto& [k, v] : late) {
         double s = 0; for (double x : v) s += x;
-        std::printf("  %2d rounds after birth: %5.1f%%  (%zu samples)\n", k, 100 * s / std::max<size_t>(1, v.size()), v.size());
+        double sy = 0; for (double x : late_sym[k]) sy += x;
+        std::printf("  %2d rounds after birth: %5.1f%% of the team's ore   symmetry known %5.1f%%  (%zu samples)\n", k,
+                    100 * s / std::max<size_t>(1, v.size()), 100 * sy / std::max<size_t>(1, late_sym[k].size()), v.size());
     }
 }

@@ -63,9 +63,18 @@ takes part every turn: core, builders, gunners, sentinels, launchers and spikes.
 - Slots are not partitioned: every unit in round r + 1 reads what was written in
   round r (one start-of-round snapshot), so a later overwrite loses nothing; a
   fresh fact that loses a same-round race is posted again.
+- Symmetry report (category 9; tile field = 1 << symmetry): a unit that knows
+  the symmetry posts it, on rounds where (id + round) % 4 == 0, if the last
+  snapshot carried no symmetry (neither this report nor bits 11..12).
+- Reposts: an idle unit reposts on rounds where (id + round) % 8 == 0.
+- Parameters chosen with rl/tests/bus_stats.cpp (BusConfig in engine/src/obs.hpp):
+  late units know ~93% of the team's ore when they appear and ~100% after 40
+  rounds; the symmetry is known in ~96% of unit-rounds.
 - Map symmetry: each unit keeps the symmetries (180 rotation, mirror x, mirror y)
   its known terrain does not contradict (and that do not map our core onto
-  itself). Once one is left, every known tile is mirrored, and so is every tile
+  itself; a pit fixes it: a pit along x means mirror x, along y mirror y; a
+  known enemy core tile must be the mirror of one of ours). Once one is left,
+  every known tile is mirrored, and so is every tile
   learned later; the enemy core is placed on the mirror of ours where never seen.
 - Reported or inferred buildings have no direction and an unchanged attribute
   age, inferred / reported terrain keeps "never seen": the policy can tell them

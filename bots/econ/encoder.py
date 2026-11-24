@@ -58,7 +58,9 @@ def ray_path(x0, y0, dx, dy, maxlen=RAY_LEN):
 # the fact collection in ObsMemory::update, engine/src/obs.cpp). A report is one
 # u32: bit 31 marker, bit 30 removal, bits 26..29 category, bits 0..10 tile.
 REP_MARK, REP_REMOVE = 1 << 31, 1 << 30
-REP_ORE_TI, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE, REP_OWN_LAUNCHER = range(1, 9)
+REP_ORE_TI, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE, REP_OWN_LAUNCHER, REP_SYM = range(1, 10)
+# bus parameters (as BusConfig defaults in engine/src/obs.hpp)
+ROT_DIV, SYM_DIV = 8, 4
 _REP_CAT = {CORE: REP_CORE, GUNNER: REP_GUNNER, SENTINEL: REP_SENTINEL, LAUNCHER: REP_LAUNCHER, SPIKE: REP_SPIKE}
 _REP_TYPE = {v: k for k, v in _REP_CAT.items()}
 
@@ -73,7 +75,7 @@ def _rep_key(p):
 
 
 class ObsMemory:
-    def __init__(self, W, H, team):
+    def __init__(self, W, H, team, pit_axis=-1):
         self.W, self.H, self.team = W, H, team
         n = W * H
         self.terrain = [T_UNKNOWN] * n
@@ -90,6 +92,10 @@ class ObsMemory:
         self.attr_seen_round = [-1] * n
         self.known, self.pending = set(), set()
         self.sym_alive, self.sym = 7, -1
+        self.snap_sym = False
+        # a pit lies on the mirror axis: x pit -> mirror x (1), y pit -> mirror y (2)
+        if pit_axis >= 0:
+            self.sym_alive = 1 << (1 if pit_axis == 0 else 2)
 
     # ---- map symmetry (identical to ObsMemory::mirror / learn_terrain / resolve_symmetry)
     def mirror(self, t, s):
@@ -125,6 +131,14 @@ class ObsMemory:
                 if bid[mt] >= 0 and btm[mt] == team and bty[mt] == CORE:
                     self.sym_alive &= ~(1 << s) & 7
                     break
+        # a known enemy core tile (seen or reported) must be the mirror of one of ours
+        if own_core and self.sym < 0:
+            for t in range(n):
+                if not (bid[t] >= 0 and btm[t] != team and bty[t] == CORE):
+                    continue
+                for s in range(3):
+                    if (self.sym_alive >> s) & 1 and not any(self.mirror(o, s) == t for o in own_core):
+                        self.sym_alive &= ~(1 << s) & 7
         if self.sym < 0 and self.sym_alive in (1, 2, 4):
             self.sym = {1: 0, 2: 1, 4: 2}[self.sym_alive]
             terrain = self.terrain
@@ -146,11 +160,20 @@ class ObsMemory:
     def merge_store(self, store):
         """Apply the team store snapshot (16 values): every report merges into memory."""
         W, H, n, enemy = self.W, self.H, self.W * self.H, 1 - self.team
+        self.snap_sym = False
         for v in store:
             if v < 0 or v > 0xFFFFFFFF or not (v & REP_MARK):
                 continue
             cat, t, remove = (v >> 26) & 15, v & 0x7FF, bool(v & REP_REMOVE)
             bits = (v >> 11) & 0x7FFF
+            if cat == REP_SYM:
+                mask = t & 7
+                if not remove and not bits and mask:
+                    if bin(mask).count("1") == 1:
+                        self.snap_sym = True
+                    if self.sym < 0 and self.sym_alive & mask:
+                        self.sym_alive &= mask
+                continue
             if cat < REP_ORE_TI or cat > REP_OWN_LAUNCHER or t >= n:
                 continue
             if cat in (REP_ORE_TI, REP_ORE_VO):
@@ -177,8 +200,10 @@ class ObsMemory:
             if bits & ~3:
                 continue
             ss = bits & 3
-            if ss and self.sym < 0 and (self.sym_alive >> (ss - 1)) & 1:
-                self.sym_alive = 1 << (ss - 1)
+            if ss:
+                self.snap_sym = True
+                if self.sym < 0 and (self.sym_alive >> (ss - 1)) & 1:
+                    self.sym_alive = 1 << (ss - 1)
             v &= ~(0x7FFF << 11)                     # the fact itself
             self.known.add(v)
             self.known.discard(v ^ REP_REMOVE)
@@ -230,7 +255,10 @@ class ObsMemory:
             cat = (best >> 26) & 15
             ore = cat in (REP_ORE_TI, REP_ORE_VO)
             return k % 16, (self.ore_report(best) if ore else best | self.sym_bits())
-        if k % 4:
+        if self.sym >= 0 and not self.snap_sym and k % SYM_DIV == 0:
+            # nobody carried the symmetry last round: post it (tile field = 1 << sym)
+            return k % 16, REP_MARK | (REP_SYM << 26) | (1 << self.sym)
+        if k % ROT_DIV:
             return None
         enemy, live = 1 - self.team, []
         for f in sorted(self.known):
@@ -247,9 +275,9 @@ class ObsMemory:
                 live.append(f)
         if not live:
             return None
-        f = live[(k // 4) % len(live)]
+        f = live[(k // ROT_DIV) % len(live)]
         ore = ((f >> 26) & 15) in (REP_ORE_TI, REP_ORE_VO)
-        return (k // 4) % 16, (self.ore_report(f) if ore else f | self.sym_bits())
+        return (k // ROT_DIV) % 16, (self.ore_report(f) if ore else f | self.sym_bits())
 
     def sym_bits(self):
         """Non-ore reports carry the map symmetry: bits 11..12 = sym + 1 (0 unknown)."""
@@ -679,7 +707,8 @@ class ActorEncoder:
         uid = ct.get_id()
         memory = self.memories.get(uid)
         if memory is None:
-            memory = ObsMemory(ad.W, ad.H, ad.team())
+            pit = ct.get_pit()
+            memory = ObsMemory(ad.W, ad.H, ad.team(), -1 if pit is None else (0 if pit[0] == "x" else 1))
             self.memories[uid] = memory
         # team report bus: merge the store snapshot, see, post one report
         memory.merge_store([ct.read_store(i) for i in range(16)])

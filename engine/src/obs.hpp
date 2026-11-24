@@ -62,6 +62,18 @@ constexpr int C_THREAT = C_HP + CH_HP;
 constexpr int C_RAY = C_THREAT + CH_THREAT;
 constexpr int C_PATH = C_RAY + CH_RAY;
 
+// report-bus parameters (experiments: rl/tests/bus_stats.cpp); defaults = deployed
+// Chosen with bus_stats (late units: ~93% of the team's ore at birth, ~100%
+// after 40 rounds; symmetry known in ~96% of unit-rounds):
+//   rot_div 8: an idle unit reposts on rounds where (id + round) % 8 == 0
+//   sym_report 1: a unit that knows the symmetry posts it when the last
+//     snapshot did not carry it (every 4th unit-round: sym_div)
+//   use_pit: a pit fixes the symmetry (mirror along its axis)
+//   use_enemy_core: a known enemy core tile must mirror one of ours
+struct BusConfig { int rot_div = 8; int sym_report = 1; int sym_div = 4;     // sym_report: 0 off, 1 symmetry, 2 + partial sets
+                   bool use_pit = true, use_enemy_core = true; };
+extern BusConfig g_bus;
+
 // per-unit fog memory (one instance per unit)
 struct ObsMemory {
     int W = 0, H = 0, team = 0;
@@ -85,6 +97,8 @@ struct ObsMemory {
     // the map symmetry), then posts one report (next_report: the caller writes
     // it to the returned slot). Identical in bots/econ/encoder.py.
     std::set<uint32_t> known, pending;
+    bool snap_sym = false;                  // the last merged snapshot carried the symmetry
+    uint8_t snap_mask = 7;                  // AND of the candidate sets in the last snapshot
     void merge_store(const int64_t* store16);
     // the report to post this turn and its slot; false: nothing to post
     bool next_report(uint64_t unit_id, int round, int& slot, uint32_t& report) const;
