@@ -24,7 +24,11 @@ void ObsMemory::init(const Game& g, int team_) {
     bot_dir.assign(n, -1);
     bot_hp.assign(n, -1);
     attr_seen_round.assign(n, -1);
-    known.clear(); pending.clear();
+    for (auto& q : bus_q) q.clear();
+    snap.clear(); snap_ore.assign(n, 0);
+    rep_bot_tile.assign(128, -1); rep_bot_round.assign(128, -1);
+    born = -1; last_spawn_react = -1000; snap_spawn = false; core_alarm_round = -1;
+    last_hp = -1; spawned_now = false; core_alarm_now = false; is_builder = false;
     sym_alive = 7; sym = -1;
     // a pit lies on the mirror axis (controller get_pit): x pit -> mirror x, y pit -> mirror y
     if (g_bus.use_pit && g.pit_axis >= 0) sym_alive = uint8_t(1u << (g.pit_axis == 0 ? 1 : 2));
@@ -32,47 +36,44 @@ void ObsMemory::init(const Game& g, int team_) {
 
 // ---------------------------------------------------------------- report bus
 // Identical in bots/econ/encoder.py (checked by engine/tools/obs_parity.py).
-// A FACT is one tile: rep_pack(cat, tile, remove); `known` / `pending` hold facts.
-// A REPORT (store word) is a fact, or for ore an anchor fact plus bits 11..25:
-// the other cells of the 4x4 block right / below the anchor holding the same ore.
-// Slots are not partitioned: a write in round r is read by every unit in round
-// r + 1 (all read the same start-of-round snapshot), so overwriting it later
-// loses nothing; a fresh fact that loses a same-round slot race stays pending
-// and goes out again. Fresh reports: slot (id + round) % 16; rotation (idle
-// units with (id + round) % 4 == 0): slot ((id + round) / 4) % 16.
-static constexpr uint32_t REP_MARK = 1u << 31, REP_REMOVE = 1u << 30;
-enum : int { REP_ORE_TI = 1, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE,
-             REP_OWN_LAUNCHER,            // 8: one of OUR launchers (for the launcher cap)
-             REP_SYM };                   // 9: the map symmetry (tile field = sym); experiment knob
-// experiment knobs (bus_stats); the defaults are the deployed behaviour
+// The 16 slots are split in groups (BusGroup, obs.hpp); the slot's group tells
+// what a report means. A report (u32):
+//   bit 31 marker; bit 30 spawn (a builder was just spawned); bits 28..29 the
+//   sender's map symmetry + 1 (0 unknown); bits 0..10 tile; then per group:
+//   G_MYB / G_EB  bits 11..16 tag (unit id % 63; 63 = the core's status),
+//                 bits 17..22 round % 64, bit 27 core under attack (tag 63)
+//   G_ORE         bit 11 kind (0 Ti, 1 Vo), bits 12..26 the other cells of the
+//                 4x4 block right / below holding the same ore
+//   G_EATK        bits 11..13 type (core, gunner, sentinel, launcher, spike), bit 14 removal
+//   G_MINE        bits 11..13 type (launcher, spike, gunner, sentinel, mine, harvester), bit 14 removal
+// Each unit keeps a send queue per group: one write per group per turn (slot
+// base + (id + round) % size); an item is delivered when a snapshot shows its
+// content, whoever wrote it; a sent item missing from the next snapshot is
+// sent again; a delivered item is due again `refresh` rounds later; never-
+// delivered items go first (enemy attacking buildings: nearest to our core
+// first). A spawn bit makes everything due (once per spawn_cooldown rounds);
+// a builder spawned after quiet_after writes nothing for its first quiet_rounds.
 BusConfig g_bus;
-static int rep_cat_of_type(int type) {
-    switch (type) {
-    case CORE: return REP_CORE; case GUNNER: return REP_GUNNER; case SENTINEL: return REP_SENTINEL;
-    case LAUNCHER: return REP_LAUNCHER; case SPIKE: return REP_SPIKE; default: return 0;
-    }
-}
-static int rep_type_of_cat(int cat) {
-    switch (cat) {
-    case REP_CORE: return CORE; case REP_GUNNER: return GUNNER; case REP_SENTINEL: return SENTINEL;
-    case REP_LAUNCHER: return LAUNCHER; case REP_SPIKE: return SPIKE; default: return -1;
-    }
-}
-static bool rep_is_ore(int cat) { return cat == REP_ORE_TI || cat == REP_ORE_VO; }
-static uint32_t rep_pack(int cat, int t, bool remove) { return REP_MARK | (remove ? REP_REMOVE : 0u) | (uint32_t(cat) << 26) | uint32_t(t); }
-static int rep_rank(uint32_t p) { int c = (p >> 26) & 15; return c == REP_CORE ? 0 : (c >= REP_GUNNER ? 1 : 2); }
+static constexpr uint32_t W_MARK = 1u << 31, W_SPAWN = 1u << 30, W_ALARM = 1u << 27, W_REMOVE = 1u << 14;
+static constexpr int TAG_CORE = 63;
+static const int EATK_TYPES[5] = {CORE, GUNNER, SENTINEL, LAUNCHER, SPIKE};
+static const int MINE_TYPES[6] = {LAUNCHER, SPIKE, GUNNER, SENTINEL, MINE, HARVESTER};
+static int code_of(const int* types, int n, int type) { for (int i = 0; i < n; i++) if (types[i] == type) return i; return -1; }
+static uint32_t content(uint32_t w) { return w & ~(W_MARK | W_SPAWN | (3u << 28)); }
+static int round_from6(int now, int r6) { return now - ((now - r6) & 63); }
+static int cheb(int a, int b, int W) { return std::max(std::abs(a % W - b % W), std::abs(a / W - b / W)); }
+
 int ObsMemory::own_count(int type) const {
     int n = 0;
     for (size_t t = 0; t < bld_id.size(); t++) n += bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == type;
     return n;
 }
-static void rep_note(std::set<uint32_t>& known, uint32_t f) { known.insert(f); known.erase(f ^ REP_REMOVE); }
+uint32_t ObsMemory::extra_bits() const { return sym >= 0 ? uint32_t(sym + 1) << 28 : 0u; }
 
 int ObsMemory::mirror(int t, int s) const {
     const int x = t % W, y = t / W;
     return ((s == 1) ? y : H - 1 - y) * W + ((s == 2) ? x : W - 1 - x);
 }
-
 // A tile's terrain is known: rule out the symmetries it contradicts; once the
 // symmetry is known, its mirror tile gets the same terrain.
 void ObsMemory::learn_terrain(int t) {
@@ -87,7 +88,6 @@ void ObsMemory::learn_terrain(int t) {
         if (terrain[mt] == T_UNKNOWN) terrain[mt] = terrain[t];
     }
 }
-
 // End of a turn's update: a symmetry that maps our core onto itself is out;
 // when one symmetry is left it becomes THE symmetry (every known tile is
 // mirrored once), and the enemy core is placed on the mirror of ours where that
@@ -135,148 +135,87 @@ void ObsMemory::resolve_symmetry() {
     }
 }
 
-void ObsMemory::merge_store(const int64_t* store) {
-    snap_sym = false; snap_mask = 7;
+// A reported builder (team tm, tag): moved to tile t, the round it was seen.
+static void place_reported_bot(ObsMemory& m, int tm, int tag, int t, int rr) {
+    const int idx = tm * 64 + tag, sid = (1 << 28) | idx;
+    const int old = m.rep_bot_tile[idx];
+    if (old >= 0 && old != t && m.bot_id[old] == sid) { m.bot_id[old] = -1; m.bot_team[old] = -1; m.bot_dir[old] = -1; m.bot_hp[old] = -1; }
+    if (m.bot_id[t] < 0 || m.bot_id[t] == sid) {
+        m.bot_id[t] = sid; m.bot_team[t] = int8_t(tm); m.bot_dir[t] = -1; m.bot_hp[t] = -1;
+        m.visit_round[t] = rr;
+        if (m.terrain[t] == T_UNKNOWN) { m.terrain[t] = T_EMPTY; m.learn_terrain(t); }
+    }
+    m.rep_bot_tile[idx] = t; m.rep_bot_round[idx] = rr;
+}
+
+void ObsMemory::merge_store(const int64_t* store, int round) {
+    const int N = W * H, enemy = 1 - team;
+    snap.clear(); snap_ore.assign(N, 0); snap_spawn = false;
     for (int i = 0; i < 16; i++) {
         const int64_t v = store[i];
-        if (v < 0 || v > 0xFFFFFFFFll || !(uint64_t(v) & REP_MARK)) continue;
-        const uint32_t p = uint32_t(v);
-        const int cat = (p >> 26) & 15, t = p & 0x7FF;
-        const uint32_t bits = (p >> 11) & 0x7FFF;
-        const bool remove = p & REP_REMOVE;
-        if (cat == REP_SYM) {
-            // tile field: bits 0..2 = the sender's candidate set (1 << sym when it knows it)
-            const uint8_t mask = uint8_t(t & 7);
-            if (!remove && !bits && mask) {
-                snap_mask &= mask;
-                if (__builtin_popcount(mask) == 1) snap_sym = true;
-                if (sym < 0 && (sym_alive & mask)) sym_alive &= mask;
-            }
-            continue;
-        }
-        if (cat < REP_ORE_TI || cat > REP_OWN_LAUNCHER || t >= W * H) continue;
-        if (rep_is_ore(cat)) {
-            if (remove) continue;
-            const int x = t % W, y = t / W;
+        if (v < 0 || v > 0xFFFFFFFFll || !(uint64_t(v) & W_MARK)) continue;
+        const uint32_t w = uint32_t(v);
+        int grp = 0; while (grp + 1 < BUS_GROUPS && i >= BUS_BASE[grp + 1]) grp++;
+        const int t = w & 0x7FF;
+        if (t >= N) continue;
+        if (const int ss = int(w >> 28 & 3u); ss && sym < 0 && (sym_alive >> (ss - 1) & 1)) sym_alive = uint8_t(1u << (ss - 1));
+        if (w & W_SPAWN) snap_spawn = true;
+        snap.insert(uint32_t(grp) << 28 | content(w));
+        if (grp == G_MYB || grp == G_EB) {
+            const int tag = (w >> 11) & 63, rr = round_from6(round, (w >> 17) & 63);
+            if (grp == G_MYB && tag == TAG_CORE) { if (w & W_ALARM) core_alarm_round = std::max(core_alarm_round, rr); continue; }
+            if (round - rr > g_bus.enemy_bot_ttl) continue;
+            place_reported_bot(*this, grp == G_MYB ? team : enemy, tag, t, rr);
+        } else if (grp == G_ORE) {
+            const int kind = (w >> 11) & 1, x = t % W, y = t / W;
+            const uint32_t bits = (w >> 12) & 0x7FFF;
             for (int k = 0; k < 16; k++) {
                 if (k > 0 && !(bits >> (k - 1) & 1)) continue;
                 const int xx = x + k % 4, yy = y + k / 4;
                 if (xx >= W || yy >= H) continue;
                 const int tt = yy * W + xx;
-                const uint32_t f = rep_pack(cat, tt, false);
-                rep_note(known, f);
-                pending.erase(f);
-                if (terrain[tt] == T_UNKNOWN) terrain[tt] = cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO;
+                snap_ore[tt] |= uint8_t(1u << kind);
+                if (terrain[tt] == T_UNKNOWN) terrain[tt] = kind ? T_ORE_VO : T_ORE_TI;
                 learn_terrain(tt);
             }
-            continue;
-        }
-        // non-ore reports carry the sender's map symmetry in bits 11..12 (0 unknown, else sym + 1)
-        if (bits & ~3u) continue;
-        if (const int ss = int(bits & 3u); ss) { snap_sym = true; snap_mask &= uint8_t(1u << (ss - 1)); if (sym < 0 && (sym_alive >> (ss - 1) & 1)) sym_alive = uint8_t(1u << (ss - 1)); }
-        const uint32_t f = p & ~(0x7FFFu << 11);     // the fact itself
-        rep_note(known, f);
-        pending.erase(f);
-        if (cat == REP_OWN_LAUNCHER) {
-            if (remove) {
-                if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == LAUNCHER) {
+        } else {
+            const bool eatk = grp == G_EATK;
+            const int code = (w >> 11) & 7;
+            if (code >= (eatk ? 5 : 6)) continue;
+            const int type = eatk ? EATK_TYPES[code] : MINE_TYPES[code], owner = eatk ? enemy : team;
+            if (w & W_REMOVE) {
+                if (bld_id[t] >= 0 && bld_team[t] == owner && bld_type[t] == type) {
                     bld_id[t] = -1; bld_type[t] = -1; bld_team[t] = -1; bld_dir[t] = -1; bld_hp[t] = -1;
                 }
             } else if (bld_id[t] < 0) {
-                bld_id[t] = (1 << 29) + t; bld_type[t] = int8_t(LAUNCHER); bld_team[t] = int8_t(team);
+                // reported: a core keeps its real id (team + 1: its 4 tiles count once);
+                // others get a per-tile id; direction and HP unknown, attribute age untouched
+                bld_id[t] = type == CORE ? owner + 1 : (eatk ? (1 << 30) : (1 << 29)) + t;
+                bld_type[t] = int8_t(type); bld_team[t] = int8_t(owner);
                 bld_dir[t] = -1; bld_hp[t] = 100;
                 if (terrain[t] == T_UNKNOWN) { terrain[t] = T_EMPTY; learn_terrain(t); }
             }
-            continue;
-        }
-        const int type = rep_type_of_cat(cat), enemy = 1 - team;
-        if (remove) {
-            if (bld_id[t] >= 0 && bld_team[t] == enemy && bld_type[t] == type) {
-                bld_id[t] = -1; bld_type[t] = -1; bld_team[t] = -1; bld_dir[t] = -1; bld_hp[t] = -1;
-            }
-        } else if (bld_id[t] < 0) {
-            // a reported enemy building: a core keeps its real id (team + 1), so
-            // its 4 tiles count once; a turret gets a per-tile id. Direction and
-            // HP unknown; attribute age untouched (not seen by this unit).
-            bld_id[t] = type == CORE ? enemy + 1 : (1 << 30) + t;
-            bld_type[t] = int8_t(type); bld_team[t] = int8_t(enemy);
-            bld_dir[t] = -1; bld_hp[t] = 100;
-            if (terrain[t] == T_UNKNOWN) { terrain[t] = T_EMPTY; learn_terrain(t); }
         }
     }
-}
-
-// The ore report for anchor fact f: f plus the 4x4 block's cells holding the same ore.
-uint32_t ObsMemory::ore_report(uint32_t f) const {
-    const int cat = (f >> 26) & 15, t = f & 0x7FF, x = t % W, y = t / W;
-    const uint8_t ore = cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO;
-    uint32_t bits = 0;
-    for (int k = 1; k < 16; k++) {
-        const int xx = x + k % 4, yy = y + k / 4;
-        if (xx < W && yy < H && terrain[yy * W + xx] == ore) bits |= 1u << (k - 1);
+    // reported builders older than the ttl are forgotten
+    for (int idx = 0; idx < 128; idx++) {
+        const int t = rep_bot_tile[idx];
+        if (t < 0 || round - rep_bot_round[idx] <= g_bus.enemy_bot_ttl) continue;
+        if (bot_id[t] == ((1 << 28) | idx)) { bot_id[t] = -1; bot_team[t] = -1; bot_dir[t] = -1; bot_hp[t] = -1; }
+        rep_bot_tile[idx] = -1;
     }
-    return f | (bits << 11);
-}
-
-// The report to post this turn: the most important pending fact (core, turrets,
-// ore; lowest tile) into slot (id + round) % 16; with nothing pending, on rounds
-// where (id + round) % 4 == 0, a known fact still true in memory, cycling
-// through them in order, into slot ((id + round) / 4) % 16.
-bool ObsMemory::next_report(uint64_t unit_id, int round, int& slot, uint32_t& report) const {
-    const uint64_t k = unit_id + uint64_t(round);
-    if (!pending.empty()) {
-        uint32_t best = 0;
-        const auto key = [](uint32_t q) { return std::make_tuple(rep_rank(q), int(q & 0x7FF), int((q >> 30) & 1), int((q >> 26) & 15)); };
-        for (uint32_t f : pending) if (!best || key(f) < key(best)) best = f;
-        const int cat = (best >> 26) & 15;
-        report = rep_is_ore(cat) ? ore_report(best) : (best | sym_bits());
-        slot = int(k % 16);
-        return true;
-    }
-    if (g_bus.sym_report && k % uint64_t(g_bus.sym_div) == 0) {
-        // post our candidate set when it says more than last round's store did:
-        // the symmetry itself, or (mode 2) eliminations the team has not shared
-        const uint8_t mine = sym >= 0 ? uint8_t(1u << sym) : sym_alive;
-        const bool news = sym >= 0 ? !snap_sym : (g_bus.sym_report >= 2 && mine && (snap_mask & ~mine & 7));
-        if (news) {
-            report = REP_MARK | (uint32_t(REP_SYM) << 26) | uint32_t(mine);
-            slot = int(k % 16);
-            return true;
-        }
-    }
-    if (k % uint64_t(g_bus.rot_div) != 0) return false;
-    std::vector<uint32_t> live;
-    const int enemy = 1 - team;
-    std::vector<uint8_t> covered;               // dedupe: ore tiles inside an earlier anchor's 4x4 block
-    if (g_bus.rot_dedupe) covered.assign(size_t(W) * H * 3, 0);
-    for (uint32_t f : known) {                  // std::set: ascending (by category, then tile)
-        if (f & REP_REMOVE) continue;
-        const int cat = (f >> 26) & 15, t = f & 0x7FF;
-        if (rep_is_ore(cat)) {
-            const uint8_t ore = cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO;
-            if (terrain[t] != ore) continue;
-            if (g_bus.rot_dedupe) {
-                if (covered[size_t(cat) * W * H + t]) continue;
-                const int x = t % W, y = t / W;
-                for (int dy = 0; dy < 4; dy++) for (int dx = 0; dx < 4; dx++)
-                    if (x + dx < W && y + dy < H) covered[size_t(cat) * W * H + (y + dy) * W + x + dx] = 1;
-            }
-            live.push_back(f);
-        }
-        else if (cat == REP_OWN_LAUNCHER) { if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == LAUNCHER) live.push_back(f); }
-        else if (bld_id[t] >= 0 && bld_team[t] == enemy && bld_type[t] == rep_type_of_cat(cat)) live.push_back(f);
-    }
-    if (live.empty()) return false;
-    const uint32_t f = live[(k / uint64_t(g_bus.rot_div)) % live.size()];
-    report = rep_is_ore((f >> 26) & 15) ? ore_report(f) : (f | sym_bits());
-    slot = int((k / uint64_t(g_bus.rot_div)) % 16);
-    return true;
 }
 
 void ObsMemory::update(const Game& g, int actor) {
     std::vector<int> tiles;
     g.nearby_tiles(actor, -1, tiles);
-    auto fact = [&](uint32_t p) { pending.erase(p ^ REP_REMOVE); if (!known.count(p)) pending.insert(p); };
+    const int round = g.round, enemy = 1 - team;
+    const Entity& me = g.ents[actor];
+    if (born < 0) born = round;
+    is_builder = me.type == BUILDER;
+    std::vector<std::pair<int, int>> gone_eatk, gone_mine;   // (tile, code) of buildings seen gone now
+    std::vector<std::pair<int, int>> enemy_bots;             // (tile, tag) visible now
+    bool enemy_near = false;
     for (int t : tiles) {
         int x = t % g.W, y = t / g.W;
         const int old_id = bld_id[t], old_type = bld_type[t], old_team = bld_team[t];
@@ -312,6 +251,7 @@ void ObsMemory::update(const Game& g, int actor) {
             // This is deliberately last *observed* visit. Under fog, production
             // cannot know about a later unseen visit; do not read hidden state.
             attr_seen_round[t] = g.round;
+            if (g.ents[u].team != team) { enemy_bots.push_back({t, int(uint32_t(observed_id) % 63u)}); enemy_near = true; }
         } else {
             bot_id[t] = -1;
             bot_team[t] = -1;
@@ -320,19 +260,151 @@ void ObsMemory::update(const Game& g, int actor) {
         }
         seen_round[t] = g.round;
         learn_terrain(t);
-        // reportable facts seen now
-        if (terrain[t] == T_ORE_TI || terrain[t] == T_ORE_VO) fact(rep_pack(terrain[t] == T_ORE_TI ? REP_ORE_TI : REP_ORE_VO, t, false));
-        const int cat_now = (bld_id[t] >= 0 && bld_team[t] != team) ? rep_cat_of_type(bld_type[t]) : 0;
-        if (cat_now) fact(rep_pack(cat_now, t, false));
-        const int cat_old = (old_id >= 0 && old_team != team) ? rep_cat_of_type(old_type) : 0;
-        if (cat_old && cat_old != cat_now) fact(rep_pack(cat_old, t, true));
-        // our own launchers (the launcher cap)
-        const bool own_l_now = bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == LAUNCHER;
-        const bool own_l_old = old_id >= 0 && old_team == team && old_type == LAUNCHER;
-        if (own_l_now) fact(rep_pack(REP_OWN_LAUNCHER, t, false));
-        else if (own_l_old) fact(rep_pack(REP_OWN_LAUNCHER, t, true));
+        if (bld_id[t] >= 0 && bld_team[t] != team) enemy_near = true;
+        // buildings seen gone (or replaced) now
+        if (old_id >= 0) {
+            const bool same = bld_id[t] >= 0 && bld_type[t] == old_type && bld_team[t] == old_team;
+            if (!same) {
+                if (old_team == enemy) { const int c = code_of(EATK_TYPES, 5, old_type); if (c >= 0) gone_eatk.push_back({t, c}); }
+                if (old_team == team) { const int c = code_of(MINE_TYPES, 6, old_type); if (c >= 0) gone_mine.push_back({t, c}); }
+            }
+        }
     }
     resolve_symmetry();
+    // the core's status: under attack when its HP dropped or an enemy is in view
+    if (me.type == CORE) {
+        core_alarm_now = (last_hp >= 0 && me.hp < last_hp) || enemy_near;
+        last_hp = me.hp;
+        if (core_alarm_now) core_alarm_round = round;
+    }
+
+    // ---- send queues: the items this unit should keep posting
+    const int N = W * H;
+    auto find = [](std::vector<BusItem>& q, uint32_t key) -> BusItem* { for (auto& it : q) if (it.key == key) return &it; return nullptr; };
+    auto want = [&](int grp, uint32_t key, uint32_t word, bool remove) -> BusItem& {
+        BusItem* it = find(bus_q[grp], key);
+        if (!it) { BusItem n; n.key = key; n.word = word; n.due = round; n.remove = remove; n.anchor = -1; bus_q[grp].push_back(n); it = &bus_q[grp].back(); }
+        it->word = word;
+        return *it;
+    };
+    std::set<uint32_t> keep[BUS_GROUPS];
+    // our builders: own position (moved 2+ tiles since the last delivered post: due now); core status
+    {
+        std::vector<BusItem> q;
+        for (auto& it : bus_q[G_MYB]) {
+            if (it.key == 0 && is_builder) q.push_back(it);
+            if (it.key == uint32_t(TAG_CORE) && me.type == CORE && (core_alarm_now || spawned_now)) q.push_back(it);
+        }
+        bus_q[G_MYB] = q;
+        const uint32_t r6 = uint32_t(round & 63) << 17;
+        if (is_builder) {
+            const int t = me.y * W + me.x;
+            BusItem& it = want(G_MYB, 0, uint32_t(t) | (uint32_t(uint32_t(me.id) % 63u) << 11) | r6, false);
+            if (it.anchor >= 0 && cheb(it.anchor, t, W) >= 2) it.due = std::min(it.due, round);
+        }
+        if (me.type == CORE && (core_alarm_now || spawned_now)) {
+            BusItem& it = want(G_MYB, TAG_CORE, uint32_t(me.y * W + me.x) | (uint32_t(TAG_CORE) << 11) | r6 | (core_alarm_now ? W_ALARM : 0u), false);
+            it.due = std::min(it.due, round);       // every turn while there is something to say
+        }
+    }
+    // enemy builders in view now (others are dropped)
+    {
+        std::vector<BusItem> q;
+        for (auto& it : bus_q[G_EB]) for (auto& eb : enemy_bots) if (it.key == uint32_t(eb.second)) { q.push_back(it); break; }
+        bus_q[G_EB] = q;
+        for (auto& [t, tag] : enemy_bots) {
+            BusItem& it = want(G_EB, uint32_t(tag), uint32_t(t) | (uint32_t(tag) << 11) | (uint32_t(round & 63) << 17), false);
+            if (it.anchor >= 0 && cheb(it.anchor, t, W) >= 2) it.due = std::min(it.due, round);
+        }
+    }
+    // ore, enemy attacking buildings, our buildings: everything memory holds
+    for (int t = 0; t < N; t++) {
+        if (terrain[t] == T_ORE_TI || terrain[t] == T_ORE_VO) {
+            const uint32_t key = uint32_t(t) | (terrain[t] == T_ORE_VO ? 1u << 11 : 0u);
+            want(G_ORE, key, key, false); keep[G_ORE].insert(key);
+        }
+        if (bld_id[t] < 0) continue;
+        if (bld_team[t] == enemy) {
+            const int c = code_of(EATK_TYPES, 5, bld_type[t]);
+            if (c >= 0) { const uint32_t key = uint32_t(t) | uint32_t(c) << 11; want(G_EATK, key, key, false); keep[G_EATK].insert(key); }
+        } else if (bld_team[t] == team) {
+            const int c = code_of(MINE_TYPES, 6, bld_type[t]);
+            if (c >= 0) { const uint32_t key = uint32_t(t) | uint32_t(c) << 11; want(G_MINE, key, key, false); keep[G_MINE].insert(key); }
+        }
+    }
+    for (auto& [t, c] : gone_eatk) { const uint32_t key = uint32_t(t) | uint32_t(c) << 11 | W_REMOVE; want(G_EATK, key, key, true); keep[G_EATK].insert(key); }
+    for (auto& [t, c] : gone_mine) { const uint32_t key = uint32_t(t) | uint32_t(c) << 11 | W_REMOVE; want(G_MINE, key, key, true); keep[G_MINE].insert(key); }
+    for (int grp : {G_ORE, G_EATK, G_MINE}) {
+        std::vector<BusItem> q;
+        for (auto& it : bus_q[grp]) if (keep[grp].count(it.key) || it.remove) q.push_back(it);   // removals stay until delivered
+        bus_q[grp] = q;
+    }
+
+    // ---- delivery checks against the snapshot merged this turn
+    for (int grp = 0; grp < BUS_GROUPS; grp++) {
+        std::vector<BusItem> q;
+        for (auto& it : bus_q[grp]) {
+            bool delivered;
+            if (grp == G_ORE) delivered = snap_ore[it.key & 0x7FF] >> ((it.key >> 11) & 1) & 1;
+            else if (grp == G_MYB || grp == G_EB) delivered = it.sent >= 0 && snap.count(uint32_t(grp) << 28 | it.sent_word);
+            else delivered = snap.count(uint32_t(grp) << 28 | it.word);
+            if (delivered) {
+                if (it.remove) continue;                                   // a delivered removal is done
+                if (it.sent >= 0 || it.due <= round) it.due = round + (grp <= G_EB ? g_bus.refresh : g_bus.refresh_facts);
+                it.fresh = false; it.sent = -1; it.anchor = int(it.word & 0x7FF);
+            } else if (it.sent >= 0 && it.sent < round) {
+                it.due = round; it.sent = -1;                               // overwritten: send again
+            }
+            q.push_back(it);
+        }
+        bus_q[grp] = q;
+    }
+    if (snap_spawn && round - last_spawn_react >= g_bus.spawn_cooldown) {
+        last_spawn_react = round;
+        for (auto& q : bus_q) for (auto& it : q) it.due = std::min(it.due, round);
+    }
+}
+
+void ObsMemory::next_reports(uint64_t unit_id, int round, std::vector<std::pair<int, uint32_t>>& out) {
+    out.clear();
+    if (is_builder && born > g_bus.quiet_after && round - born < g_bus.quiet_rounds) return;   // a late newcomer listens first
+    const int N = W * H;
+    std::vector<int> own_core;
+    for (int t = 0; t < N; t++) if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == CORE) own_core.push_back(t);
+    const uint64_t k = unit_id + uint64_t(round);
+    const uint32_t spread = uint32_t((unit_id * 2654435761ull + uint64_t(round) * 40503ull) & 0xFFFFFFFFull);
+    for (int grp = 0; grp < BUS_GROUPS; grp++) {
+        BusItem* best = nullptr;
+        std::tuple<int, int, uint32_t> bk;
+        const bool refresh_ok = grp <= G_EB || k % uint64_t(g_bus.refresh_gate) == 0;
+        for (auto& it : bus_q[grp]) {
+            if (it.due > round) continue;
+            if (!it.fresh && !refresh_ok) continue;     // refreshes are gated: fresh facts keep the slots
+            int prio = 0;
+            if (grp == G_EATK && !own_core.empty()) {
+                prio = 1 << 20;
+                for (int c : own_core) prio = std::min(prio, cheb(c, int(it.key & 0x7FF), W));
+            }
+            // spread: different units prefer different items (a per-unit key hash)
+            const auto key = std::make_tuple(it.fresh ? 0 : 1, prio, it.key ^ spread);
+            if (!best || key < bk) { best = &it; bk = key; }
+        }
+        if (!best) continue;
+        uint32_t w = best->word;
+        if (grp == G_ORE) {                                     // the 4x4 cluster from the anchor
+            const int t = w & 0x7FF, x = t % W, y = t / W;
+            const uint8_t ore = (w >> 11 & 1) ? T_ORE_VO : T_ORE_TI;
+            for (int c = 1; c < 16; c++) {
+                const int xx = x + c % 4, yy = y + c / 4;
+                if (xx < W && yy < H && terrain[yy * W + xx] == ore) w |= 1u << (11 + c);
+            }
+        }
+        best->sent = round;
+        best->sent_word = w;
+        uint32_t full = W_MARK | w | extra_bits();
+        if (grp == G_MYB && best->key == uint32_t(TAG_CORE) && spawned_now) { full |= W_SPAWN; spawned_now = false; }
+        out.push_back({BUS_BASE[grp] + int(k % uint64_t(BUS_SIZE[grp])), full});
+    }
 }
 
 // Walk `maxlen` tiles outward from (x0,y0) along (dx,dy), one rounded step at a
@@ -604,7 +676,8 @@ void encode_actor(const Game& g, const ObsMemory& m, int actor,
     scalars[12] = me.ammo;
     scalars[13] = me.scale;  // get_scale_percent()
     scalars[14] = me.units;
-    scalars[15] = 0;  // opponent economy is not exposed to the deployed controller
+    // rounds since our core last raised the under-attack alarm (team bus), cap 15
+    scalars[15] = m.core_alarm_round < 0 ? 15 : std::min(15, g.round - m.core_alarm_round);
     scalars[16] = 0;
     scalars[17] = 0;
     scalars[18] = 0;

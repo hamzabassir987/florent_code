@@ -29,6 +29,7 @@ detected next turn (the report is absent from the snapshot) and retried.
 
 from collections import deque
 import os
+import sys
 
 from fcode import Controller, Direction, EntityType, Environment, Position, Team
 try:
@@ -257,12 +258,14 @@ class Player:
             return True                              # only "wait" is legal: no forward
         if ct.get_cpu_time_elapsed() > LEARNED_START_LIMIT_US:
             self.fallback_turns += 1
-            print("FALLBACK", ct.get_current_round(), ct.get_cpu_time_elapsed())
-            return False
+            print("FALLBACK", ct.get_current_round(), ct.get_cpu_time_elapsed(), file=sys.stderr)
+            return True    # wait: the heuristic bot's store layout clashes with the team bus
         raw = spatial + scalars
         actions, _ = HEADS.decide(api, lambda: self.student.logits(p, raw))
         for a in actions:
             HEADS.apply(api, a)
+            if a[0] == "spawn":                     # team bus: the core's next report carries the spawn bit
+                self.actor_encoder.memories[ct.get_id()].spawned_now = True
         self.learned_turns += 1
         print("LEARNED", ct.get_current_round(), p, actions, ct.get_cpu_time_elapsed())
         return True

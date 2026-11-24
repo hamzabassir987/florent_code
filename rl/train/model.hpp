@@ -50,6 +50,7 @@ inline torch::Tensor actor_scalar_scale() {
     s[10] = s[11] = s[12] = 1.f / 1000.f;                // Ti, Vo, ammo
     s[13] = 1.f / 100.f;                                 // scale percent
     s[14] = 1.f / 50.f;                                  // unit count
+    s[15] = 1.f / 15.f;                                  // rounds since our core's under-attack alarm (cap 15)
     for (int i = fe::ACTOR_COSTS; i < fe::ACTOR_COSTS + 10; i++) s[i] = 1.f / 50.f;   // current prices
     for (int i = 36; i <= 39; i++) s[i] = 1.f;           // turret/core reach flags
     // 15-19 (opponent, always 0), 20-35 (packed store words): ignored

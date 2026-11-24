@@ -63,17 +63,26 @@ constexpr int C_RAY = C_THREAT + CH_THREAT;
 constexpr int C_PATH = C_RAY + CH_RAY;
 
 // report-bus parameters (experiments: rl/tests/bus_stats.cpp); defaults = deployed
-// Chosen with bus_stats (late units: ~93% of the team's ore at birth, ~100%
-// after 40 rounds; symmetry known in ~96% of unit-rounds):
-//   rot_div 8: an idle unit reposts on rounds where (id + round) % 8 == 0
-//   sym_report 1: a unit that knows the symmetry posts it when the last
-//     snapshot did not carry it (every 4th unit-round: sym_div)
-//   use_pit: a pit fixes the symmetry (mirror along its axis)
-//   use_enemy_core: a known enemy core tile must mirror one of ours
-struct BusConfig { int rot_div = 8; int sym_report = 1; int sym_div = 4;     // sym_report: 0 off, 1 symmetry, 2 + partial sets
-                   bool use_pit = true, use_enemy_core = true;
-                   bool rot_dedupe = false; };   // reposts: ore cluster anchors only
+struct BusConfig {
+    int refresh = 4;              // builder groups: a delivered item is due again after this many rounds
+    int refresh_facts = 16;       // ore / buildings: the same (chosen with bus_stats)
+    int refresh_gate = 4;         // ore / buildings: a refresh (non-fresh item) only on rounds where (id + round) % gate == 0
+    int spawn_cooldown = 4;       // a unit reacts to the spawn bit at most once per this many rounds
+    int quiet_after = 40;         // builders spawned after this round ...
+    int quiet_rounds = 4;         // ... write nothing for their first rounds
+    int enemy_bot_ttl = 10;       // reported enemy builders are forgotten after this many rounds
+    bool use_pit = true, use_enemy_core = true;   // symmetry from the pit / a known enemy core
+};
 extern BusConfig g_bus;
+
+// Team store layout (slot groups; the group tells what a slot holds):
+constexpr int BUS_GROUPS = 5;
+enum BusGroup { G_MYB = 0,    // slots 0..3: our builders' positions (+ the core's status, tag 63)
+                G_EB,         // slots 4..5: enemy builder sightings (with the round)
+                G_ORE,        // slots 6..9: ore clusters
+                G_EATK,       // slots 10..13: enemy attacking buildings (core, gunner, sentinel, launcher, spike)
+                G_MINE };     // slots 14..15: our buildings (launcher, spike, gunner, sentinel, mine, harvester)
+constexpr int BUS_BASE[BUS_GROUPS] = {0, 4, 6, 10, 14}, BUS_SIZE[BUS_GROUPS] = {4, 2, 4, 4, 2};
 
 // per-unit fog memory (one instance per unit)
 struct ObsMemory {
@@ -93,20 +102,38 @@ struct ObsMemory {
     std::vector<int32_t> attr_seen_round; // last round entity attributes were observed
 
     // ---- team report bus (the 16-slot team store; docs/team-memory.md).
-    // Each turn a unit merges the store snapshot (merge_store), updates its
-    // memory from its own vision (update: queues the new facts it saw, applies
-    // the map symmetry), then posts one report (next_report: the caller writes
-    // it to the returned slot). Identical in bots/econ/encoder.py.
-    std::set<uint32_t> known, pending;
-    bool snap_sym = false;                  // the last merged snapshot carried the symmetry
-    uint8_t snap_mask = 7;                  // AND of the candidate sets in the last snapshot
-    void merge_store(const int64_t* store16);
-    // the report to post this turn and its slot; false: nothing to post
-    bool next_report(uint64_t unit_id, int round, int& slot, uint32_t& report) const;
-    uint32_t ore_report(uint32_t fact) const;
+    // Each turn a unit: merge_store (apply the snapshot), update (own vision;
+    // refreshes its send queues, checks what was delivered), then next_reports
+    // (at most one write per slot group; the caller writes them). Identical in
+    // bots/econ/encoder.py, checked by engine/tools/obs_parity.py.
+    struct BusItem {
+        uint32_t key = 0;          // identity inside its group
+        uint32_t word = 0;         // report content (without the symmetry / spawn bits)
+        int due = 0;               // round it should be (re)sent from
+        int sent = -1;             // round it was last written, -1 not awaiting a check
+        bool fresh = true;         // never seen delivered yet
+        bool remove = false;       // a removal: dropped once delivered
+        uint32_t sent_word = 0;    // what was written (the delivery check)
+        int anchor = -1;           // builder groups: tile at the last delivered post
+    };
+    std::vector<BusItem> bus_q[BUS_GROUPS];
+    std::set<uint32_t> snap;               // the last snapshot's report contents (per group: group << 28 | content)
+    std::vector<uint8_t> snap_ore;         // the last snapshot's ore coverage per tile (bit 0 Ti, bit 1 Vo)
+    std::vector<int32_t> rep_bot_tile;     // builder tag (team * 64 + tag) -> tile of its reported position, -1
+    std::vector<int32_t> rep_bot_round;    //   and the round it was reported at
+    int born = -1;                         // round of this unit's first turn
+    int last_spawn_react = -1000;          // round this unit last reacted to a spawn bit
+    bool snap_spawn = false;               // the last snapshot carried a spawn bit
+    int core_alarm_round = -1;             // latest round our core raised the alarm (reported), -1 never
+    // the core's own status (its unit only)
+    int last_hp = -1;                      // its HP at its previous turn
+    bool spawned_now = false;              // it spawned a builder (set by the caller after the action)
+    bool is_builder = false;
+    void merge_store(const int64_t* store16, int round);
+    // the reports to write this turn: (slot, word) pairs, at most one per group
+    void next_reports(uint64_t unit_id, int round, std::vector<std::pair<int, uint32_t>>& out);
     int own_count(int type) const;          // own buildings of a type in memory (seen or reported)
-    // non-ore reports carry the map symmetry: bits 11..12 = sym + 1 (0 unknown)
-    uint32_t sym_bits() const { return sym >= 0 ? uint32_t(sym + 1) << 11 : 0u; }
+    uint32_t extra_bits() const;            // symmetry bits carried by every report
     // map symmetry (0: 180 rotation, 1: mirror x, 2: mirror y): candidates
     // still consistent with the known terrain (or adopted from a teammate's
     // report); once one is left, known tiles are mirrored and the enemy core is
@@ -122,6 +149,8 @@ struct ObsMemory {
     // planned conveyor direction (Dir N/E/S/W), 0 = not on a planned path.
     void plan_paths(std::vector<int8_t>& plan) const;
     void update(const Game& g, int actor);
+    // the core's status inputs (its own turn): HP now, enemy in view
+    bool core_alarm_now = false;
 };
 
 // flat int32 buffer; channel-major, index = channel * PATCH*PATCH + (dy+HALF)*PATCH + (dx+HALF)

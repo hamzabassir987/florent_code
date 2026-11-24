@@ -11,6 +11,7 @@ int fe_width(Game* g) { return g->W; }
 int fe_height(Game* g) { return g->H; }
 int fe_round(Game* g) { return g->round; }
 int fe_winner(Game* g) { return g->winner; }
+int fe_pit_axis(Game* g) { return g->pit_axis; }
 void fe_win_condition(Game* g, char* out, int n) { int k = 0; for (char c : g->win_condition) { if (k + 1 >= n) break; out[k++] = c; } out[k] = 0; }
 int fe_n_entities(Game* g) { return int(g->ents.size()); }
 int fe_find(Game* g, int id) { return g->find(id); }
@@ -96,16 +97,17 @@ void* fe_obs_new(Game* g, int team) {
 void fe_obs_free(void* p) { delete reinterpret_cast<fe::ObsMemory*>(p); }
 void fe_obs_update(void* p, Game* g, int actor) { reinterpret_cast<fe::ObsMemory*>(p)->update(*g, actor); }
 // report bus (parity tests): merge a 16-value store snapshot; the report to post (0: none)
-void fe_obs_merge(void* p, const long long* store16) {
+void fe_obs_merge(void* p, const long long* store16, int round) {
     int64_t s[16]; for (int i = 0; i < 16; i++) s[i] = store16[i];
-    reinterpret_cast<fe::ObsMemory*>(p)->merge_store(s);
+    reinterpret_cast<fe::ObsMemory*>(p)->merge_store(s, round);
 }
-// the report to post (0: none) and its slot
-int fe_pit_axis(Game* g) { return g->pit_axis; }     // -1 none, 0 x (east / west halves), 1 y
-long long fe_obs_next_report(void* p, long long unit_id, int round, int* slot) {
-    uint32_t r = 0; int sl = -1;
-    if (!reinterpret_cast<fe::ObsMemory*>(p)->next_report(uint64_t(unit_id), round, sl, r)) { *slot = -1; return 0; }
-    *slot = sl; return (long long)r;
+void fe_obs_set_spawned(void* p) { reinterpret_cast<fe::ObsMemory*>(p)->spawned_now = true; }
+// this turn's writes: up to 5 (slot, word) pairs; returns the count
+int fe_obs_next_reports(void* p, long long unit_id, int round, int* slots, long long* words) {
+    std::vector<std::pair<int, uint32_t>> out;
+    reinterpret_cast<fe::ObsMemory*>(p)->next_reports(uint64_t(unit_id), round, out);
+    for (size_t i = 0; i < out.size(); i++) { slots[i] = out[i].first; words[i] = (long long)out[i].second; }
+    return int(out.size());
 }
 int fe_obs_ch() { return fe::ACTOR_CH; }
 int fe_obs_patch() { return fe::PATCH; }

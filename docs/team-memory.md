@@ -42,34 +42,38 @@ on the same 16 slots, implemented identically in `ObsMemory` (engine/src/obs.cpp
 and `bots/econ/encoder.py`, checked by `engine/tools/obs_parity.py`. Every unit
 takes part every turn: core, builders, gunners, sentinels, launchers and spikes.
 
-- Fact: one tile, a u32: bit 31 marker (the heuristic packets above never set
-  it), bit 30 removal, bits 26..29 category (1 Ti ore, 2 Vo ore, 3 enemy core,
-  4 gunner, 5 sentinel, 6 launcher, 7 spike: enemy buildings; 8 one of our
-  launchers, for the launcher cap of 3), bits 0..10 tile.
-- Report (store word): a fact; for ore, plus bits 11..25 = the other cells of
-  the 4x4 block right / below the anchor holding the same ore (one cluster per report).
-  Every non-ore report (fresh or reposted) carries the sender's map symmetry in
-  bits 11..12 (0 unknown, else sym + 1); a receiver adopts it if its own terrain
-  has not ruled it out.
-- Each turn a unit: merges every marked report in the snapshot into its memory
-  (ore into unknown terrain; enemy buildings added / removed; a reported core
-  keeps its real id, team + 1), updates its memory from its own vision, queues
-  the facts it sees that the snapshot does not show, and posts one report:
-  - a pending fact (core, then turrets, then ore; lowest tile) into slot
-    (id + round) % 16; it leaves the queue once a snapshot shows it;
-  - else, on rounds where (id + round) % 4 == 0, a known fact still true in its
-    memory, cycling through them in order, into slot ((id + round) / 4) % 16, so
-    units created later catch up.
-- Slots are not partitioned: every unit in round r + 1 reads what was written in
-  round r (one start-of-round snapshot), so a later overwrite loses nothing; a
-  fresh fact that loses a same-round race is posted again.
-- Symmetry report (category 9; tile field = 1 << symmetry): a unit that knows
-  the symmetry posts it, on rounds where (id + round) % 4 == 0, if the last
-  snapshot carried no symmetry (neither this report nor bits 11..12).
-- Reposts: an idle unit reposts on rounds where (id + round) % 8 == 0.
-- Parameters chosen with rl/tests/bus_stats.cpp (BusConfig in engine/src/obs.hpp):
-  late units know ~93% of the team's ore when they appear and ~100% after 40
-  rounds; the symmetry is known in ~96% of unit-rounds.
+Slot groups (the group says what a slot holds; one write per group per turn,
+into slot base + (id + round) % size):
+
+| slots  | group                    | content |
+|--------|--------------------------|---------|
+| 0..3   | our builders' positions  | tag = id % 63 (bits 11..16), round & 63 (bits 17..22); tag 63 = the core's status |
+| 4..5   | enemy builder sightings  | tag, round as above; receivers forget them after 10 rounds |
+| 6..9   | ore clusters             | bit 11 kind (0 Ti, 1 Vo), bits 12..26 the other cells of the 4x4 block |
+| 10..13 | enemy attacking buildings| bits 11..13 core, gunner, sentinel, launcher, spike; bit 14 removal |
+| 14..15 | our buildings            | bits 11..13 launcher, spike, gunner, sentinel, mine, harvester; bit 14 removal |
+
+Every word: bit 31 marker, bit 30 spawn, bits 28..29 symmetry + 1 (0 unknown),
+bits 0..10 tile. Core status (tag 63) bit 27 = our core is under attack (its HP
+dropped or an enemy is in its view); actor scalar 15 = rounds since the last
+alarm (cap 15).
+
+- Send queues, one per group. A written item is checked against the next
+  snapshot: delivered (any unit's write counts) -> due again after 4 rounds
+  (builder groups) or 16 (ore / buildings); not there (overwritten) -> resent.
+  Never-delivered items go first; enemy buildings nearest our core first; ties
+  by a per-unit hash, so units cover different items. Ore / building refreshes
+  only on rounds where (id + round) % 4 == 0.
+- A builder posts its position when it moved 2+ tiles since its last delivered
+  post, plus the refresh. Enemy builders in view are posted the same way.
+- Spawn: the core's status word after a spawn carries bit 30; every unit then
+  makes all its items due now (at most once per 4 rounds), so the newborn
+  catches up. A builder spawned after round 40 writes nothing for its first
+  4 rounds.
+- Parameters: BusConfig in engine/src/obs.hpp, measured with
+  rl/tests/bus_stats.cpp (24 games, 300 rounds): fresh ore known by the team in
+  median 1 round, p90 2; late units know 82% of the team's ore when they appear,
+  96% after 5 rounds, 99.6% after 40; own builders believed within 2 tiles 97%.
 - Map symmetry: each unit keeps the symmetries (180 rotation, mirror x, mirror y)
   its known terrain does not contradict (and that do not map our core onto
   itself; a pit fixes it: a pit along x means mirror x, along y mirror y; a

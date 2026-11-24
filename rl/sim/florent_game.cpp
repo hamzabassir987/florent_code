@@ -6,17 +6,22 @@ void Match::reset(){ game.reset(seed); memories.clear(); critic_round=-1; }
 std::vector<int> Match::acting_units() const { return game.turn_order(); }
 bool Match::round_critic(){ if(critic_round==game.round) return false; fe::encode_critic(game,critic_channels,critic_scalars); critic_round=game.round; return true; }
 int Match::terminal_reward(int team) const { if(!game.over || game.winner<0) return 0; return game.winner==team ? 1 : -1; }
-int Match::act(int entity,const Candidate& c){ return apply_candidate(game,entity,c); }
+int Match::act(int entity,const Candidate& c){
+    const int r = apply_candidate(game,entity,c);
+    // the core just spawned a builder: its next report carries the spawn bit (team bus)
+    if (r == fe::OK && c.kind == ActionKind::Spawn) { auto it = memories.find(entity); if (it != memories.end()) it->second.spawned_now = true; }
+    return r;
+}
 void Match::observe(int entity) {
     if (!memories.count(entity)) { fe::ObsMemory m; m.init(game, game.ents[entity].team); memories.emplace(entity, std::move(m)); }
     fe::ObsMemory& mem = memories.at(entity);
     // team report bus (as bots/econ/encoder.py): merge the store snapshot, see, post one report
     const int team = game.ents[entity].team;
-    mem.merge_store(game.teams[team].store.data());
+    mem.merge_store(game.teams[team].store.data(), game.round);
     mem.update(game, entity);
-    int slot; uint32_t rep;
-    if (mem.next_report(uint64_t(uint32_t(game.ents[entity].id)), game.round, slot, rep))
-        game.write_store(team, slot, int64_t(rep));
+    std::vector<std::pair<int, uint32_t>> writes;
+    mem.next_reports(uint64_t(uint32_t(game.ents[entity].id)), game.round, writes);
+    for (auto& [slot, w] : writes) game.write_store(team, slot, int64_t(w));
 }
 void Match::encode_only(int entity, std::vector<float>& out) {
     auto& mem=memories.at(entity);

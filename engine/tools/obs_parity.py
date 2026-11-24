@@ -43,7 +43,7 @@ def load_lib():
     L.fe_find.restype = ctypes.c_int
     L.fe_get_store.restype = ctypes.c_longlong
     L.fe_obs_new.restype = ctypes.c_void_p
-    L.fe_obs_next_report.restype = ctypes.c_longlong
+    L.fe_obs_next_reports.restype = ctypes.c_int
     return L
 
 
@@ -80,6 +80,9 @@ class EngineAdapter:
 
     def team(self):
         return self.tm
+
+    def actor_id(self):
+        return self.aid
 
     def current_round(self):
         return self.L.fe_round(self.g)
@@ -184,8 +187,7 @@ def play_unit(L, g, a, typ, rng, W, H):
                 sx = x + rng.randint(-2, 2)
                 sy = y + rng.randint(-2, 2)
                 if L.fe_can_spawn(g, a, sx, sy) == 0:
-                    L.fe_spawn(g, a, sx, sy)
-                    break
+                    return L.fe_spawn(g, a, sx, sy) == 0
         else:
             vo = team(L, g, o[2])[1]
             if vo > 0 and L.fe_can_convert(g, a, vo) == 0:
@@ -249,25 +251,23 @@ def run_game(L, map_path, seed, rounds, rng, stats):
                 ad = EngineAdapter(L, g, a)
                 # team report bus: both merge the same store snapshot, see, choose a report
                 snap = [L.fe_get_store(g, tm, i) for i in range(16)]
-                L.fe_obs_merge(cpp_mem[a], (ctypes.c_longlong * 16)(*snap))
-                py_mem[a].merge_store(snap)
+                rnd = L.fe_round(g)
+                L.fe_obs_merge(cpp_mem[a], (ctypes.c_longlong * 16)(*snap), rnd)
+                py_mem[a].merge_store(snap, rnd)
                 L.fe_obs_update(cpp_mem[a], g, a)
                 py_mem[a].update(ad)
-                rnd = L.fe_round(g)
-                cslot = ctypes.c_int(-1)
-                c_rep = L.fe_obs_next_report(cpp_mem[a], ctypes.c_longlong(aid), rnd, ctypes.byref(cslot))
-                p_out = py_mem[a].next_report(aid, rnd)
-                c_out = (cslot.value, c_rep) if c_rep else None
+                cs, cw = (ctypes.c_int * 8)(), (ctypes.c_longlong * 8)()
+                nrep = L.fe_obs_next_reports(cpp_mem[a], ctypes.c_longlong(aid), rnd, cs, cw)
+                c_out = [(cs[i], cw[i]) for i in range(nrep)]
+                p_out = py_mem[a].next_reports(aid, rnd)
                 if c_out != p_out:
                     stats["bad"] += 1
                     print("  REPORT mismatch r", r, "unit", aid, c_out, p_out)
-                if c_out:
-                    L.fe_write_store(g, tm, c_out[0], ctypes.c_longlong(c_out[1]))
+                for slot, word in c_out:
+                    L.fe_write_store(g, tm, slot, ctypes.c_longlong(word))
                     stats["reports"] = stats.get("reports", 0) + 1
-                    if not py_mem[a].pending:
-                        stats["rotation_reports"] = stats.get("rotation_reports", 0) + 1
-                    if (c_rep >> 26) & 15 >= 3:
-                        stats["building_reports"] = stats.get("building_reports", 0) + 1
+                    if word & (1 << 30):
+                        stats["spawn_bits"] = stats.get("spawn_bits", 0) + 1
                 if py_mem[a].sym >= 0:
                     stats["sym_known"] = stats.get("sym_known", 0) + 1
                 L.fe_obs_encode(cpp_mem[a], g, a, cbuf, sbuf)
@@ -279,7 +279,9 @@ def run_game(L, map_path, seed, rounds, rng, stats):
                     stats["path_encodings"] = stats.get("path_encodings", 0) + 1
                 if bad:
                     stats["bad"] += bad
-                play_unit(L, g, a, typ, rng, W, H)
+                if play_unit(L, g, a, typ, rng, W, H) is True:
+                    L.fe_obs_set_spawned(cpp_mem[a])
+                    py_mem[a].spawned_now = True
             L.fe_end_round(g)
     finally:
         for p in cpp_mem.values():
@@ -544,7 +546,7 @@ def main():
     print(f"critic checks: {stats['critic_checks']}, failures: {stats['critic_bad']}")
     print(f"visit-history checks: {stats['visit_checks']}")
     print(f"encodings with a planned conveyor path: {stats.get('path_encodings', 0)}")
-    print(f"team reports posted: {stats.get('reports', 0)} (enemy buildings: {stats.get('building_reports', 0)}, rotation: {stats.get('rotation_reports', 0)})")
+    print(f"team reports posted: {stats.get('reports', 0)} (with the spawn bit: {stats.get('spawn_bits', 0)})")
     print(f"unit turns with the map symmetry resolved: {stats.get('sym_known', 0)} of {stats['units']}")
     print(f"turret/core reach checks: {stats['turret_core_checks']}")
     print(f"python encode: median {med:.3f} ms, p95 {p95:.3f} ms per unit")

@@ -26,15 +26,18 @@ static double pct(std::vector<int> v, double q) {
 int main(int argc, char** argv) {
     if (argc < 4) { std::fprintf(stderr, "usage: bus_stats N_GAMES ROUNDS MAP...\n"); return 2; }
     const int NG = std::atoi(argv[1]), R = std::atoi(argv[2]);
-    if (const char* v = std::getenv("ROT_DIV")) fe::g_bus.rot_div = std::max(1, std::atoi(v));
-    if (const char* v = std::getenv("SYM_REPORT")) fe::g_bus.sym_report = std::atoi(v);
-    if (const char* v = std::getenv("SYM_DIV")) fe::g_bus.sym_div = std::max(1, std::atoi(v));
-    if (const char* v = std::getenv("USE_PIT")) fe::g_bus.use_pit = std::atoi(v) != 0;
-    if (const char* v = std::getenv("USE_ECORE")) fe::g_bus.use_enemy_core = std::atoi(v) != 0;
-    if (const char* v = std::getenv("ROT_DEDUPE")) fe::g_bus.rot_dedupe = std::atoi(v) != 0;
-    std::printf("bus: rot_div %d  sym_report %d  sym_div %d  use_pit %d  use_enemy_core %d  rot_dedupe %d\n", fe::g_bus.rot_div, fe::g_bus.sym_report, fe::g_bus.sym_div, int(fe::g_bus.use_pit), int(fe::g_bus.use_enemy_core), int(fe::g_bus.rot_dedupe));
+    if (const char* v = std::getenv("REFRESH")) fe::g_bus.refresh = std::max(1, std::atoi(v));
+    if (const char* v = std::getenv("REFRESH_FACTS")) fe::g_bus.refresh_facts = std::max(1, std::atoi(v));
+    if (const char* v = std::getenv("REFRESH_GATE")) fe::g_bus.refresh_gate = std::max(1, std::atoi(v));
+    if (const char* v = std::getenv("SPAWN_CD")) fe::g_bus.spawn_cooldown = std::atoi(v);
+    if (const char* v = std::getenv("QUIET_ROUNDS")) fe::g_bus.quiet_rounds = std::atoi(v);
+    std::printf("bus: refresh_facts %d  refresh_gate %d\n", fe::g_bus.refresh_facts, fe::g_bus.refresh_gate);
+    std::printf("bus: refresh %d  spawn_cooldown %d  quiet_after %d  quiet_rounds %d  enemy_bot_ttl %d\n", fe::g_bus.refresh,
+                fe::g_bus.spawn_cooldown, fe::g_bus.quiet_after, fe::g_bus.quiet_rounds, fe::g_bus.enemy_bot_ttl);
     std::map<int, std::vector<double>> late_sym;          // k -> share of late units knowing the symmetry
     long store_writes = 0, unit_turns = 0;
+    long own_pairs = 0, own_close = 0;                    // (unit, other own builder): believed within 2 tiles
+    long alarm_rounds = 0, alarm_known = 0;
     std::vector<std::string> maps(argv + 3, argv + argc);
     std::mt19937_64 rng(7);
     std::vector<int> ore_lat, bld_lat, ore_before;       // before: known before anyone saw it (symmetry)
@@ -93,6 +96,24 @@ int main(int argc, char** argv) {
                 }
             }
             for (auto& [ent, mem] : m.memories) if (ent < int(G.ents.size()) && G.ents[ent].alive) { unit_turns++; store_writes += mem.sym >= 0; }
+            // builder position accuracy: for every unit, the team's other builders
+            for (auto& [ent, mem] : m.memories) {
+                if (ent >= int(G.ents.size()) || !G.ents[ent].alive) continue;
+                const int team = G.ents[ent].team;
+                for (int b = 0; b < int(G.ents.size()); b++) {
+                    const auto& e = G.ents[b];
+                    if (!e.alive || e.type != fe::BUILDER || e.team != team || b == ent) continue;
+                    own_pairs++;
+                    bool close = false;
+                    for (int dy = -2; dy <= 2 && !close; dy++) for (int dx = -2; dx <= 2 && !close; dx++) {
+                        const int x = e.x + dx, y = e.y + dy;
+                        if (x < 0 || y < 0 || x >= G.W || y >= G.H) continue;
+                        const int t = y * G.W + x;
+                        close = mem.bot_id[t] >= 0 && mem.bot_team[t] == team;
+                    }
+                    own_close += close;
+                }
+            }
             // late units: share of the team's known ore, k rounds after birth
             for (auto& [ent, mem] : m.memories) {
                 if (ent >= int(G.ents.size()) || !G.ents[ent].alive) continue;
@@ -111,11 +132,6 @@ int main(int argc, char** argv) {
                 }
                 if (team_known) late[k].push_back(double(mine) / team_known);
                 late_sym[k].push_back(mem.sym >= 0 ? 1.0 : 0.0);
-                if (std::getenv("DEBUG_SYM") && k == 0 && mem.sym < 0) {
-                    int team_sym = 0; for (auto& [e2, m2] : m.memories) if (e2 < int(G.ents.size()) && G.ents[e2].alive && G.ents[e2].team == team && m2.sym >= 0) team_sym++;
-                    std::printf("DBG late unit %d type %d r %d: sym_alive %d snap_sym %d snap_mask %d  teammates knowing sym %d\n",
-                                ent, G.ents[ent].type, r, mem.sym_alive, int(mem.snap_sym), int(mem.snap_mask), team_sym);
-                }
             }
         }
         // latencies: for every unit alive when its team first saw the fact, and that did not see it itself first
@@ -154,6 +170,8 @@ int main(int argc, char** argv) {
     std::printf("enemy buildings (core / turrets), units alive when first seen: %ld pairs  rounds: median %.0f  p75 %.0f  p90 %.0f\n",
                 bld_pairs, pct(bld_lat, .5), pct(bld_lat, .75), pct(bld_lat, .9));
     std::printf("unit-rounds with the symmetry known: %.1f%%\n", 100.0 * store_writes / std::max(1L, unit_turns));
+    std::printf("own builders a unit believes within 2 tiles of their real position: %.1f%% (%ld unit-builder pairs)\n",
+                100.0 * own_close / std::max(1L, own_pairs), own_pairs);
     std::printf("late units (born after round 5): share of the team's known ore they know\n");
     for (auto& [k, v] : late) {
         double s = 0; for (double x : v) s += x;

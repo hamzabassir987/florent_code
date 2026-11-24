@@ -100,6 +100,8 @@ def quantize(raw):
             o = v // 50
         elif i == 14:
             o = v // 4
+        elif i == 15:
+            o = v
         elif i == 13:
             o = (v - 100) // 25 if v >= 100 else -((100 - v) // 25)   # truncates toward 0, like C++
         elif i >= COSTS:

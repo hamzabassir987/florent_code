@@ -54,24 +54,33 @@ def ray_path(x0, y0, dx, dy, maxlen=RAY_LEN):
     return out
 
 
-# ---- team report bus (identical to ObsMemory::merge_store / next_report /
-# the fact collection in ObsMemory::update, engine/src/obs.cpp). A report is one
-# u32: bit 31 marker, bit 30 removal, bits 26..29 category, bits 0..10 tile.
-REP_MARK, REP_REMOVE = 1 << 31, 1 << 30
-REP_ORE_TI, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE, REP_OWN_LAUNCHER, REP_SYM = range(1, 10)
-# bus parameters (as BusConfig defaults in engine/src/obs.hpp)
-ROT_DIV, SYM_DIV = 8, 4
-_REP_CAT = {CORE: REP_CORE, GUNNER: REP_GUNNER, SENTINEL: REP_SENTINEL, LAUNCHER: REP_LAUNCHER, SPIKE: REP_SPIKE}
-_REP_TYPE = {v: k for k, v in _REP_CAT.items()}
+# ---- team report bus (identical to engine/src/obs.cpp; see its "report bus"
+# comment and BusConfig / BusGroup in obs.hpp; checked by engine/tools/obs_parity.py)
+G_MYB, G_EB, G_ORE, G_EATK, G_MINE = range(5)
+BUS_BASE, BUS_SIZE = (0, 4, 6, 10, 14), (4, 2, 4, 4, 2)
+SLOT_GROUP = [g for g in range(5) for _ in range(BUS_SIZE[g])]
+W_MARK, W_SPAWN, W_ALARM, W_REMOVE = 1 << 31, 1 << 30, 1 << 27, 1 << 14
+TAG_CORE = 63
+EATK_TYPES = (CORE, GUNNER, SENTINEL, LAUNCHER, SPIKE)
+MINE_TYPES = (LAUNCHER, SPIKE, GUNNER, SENTINEL, MINE, HARVESTER)
+REFRESH, REFRESH_FACTS, REFRESH_GATE = 4, 16, 4
+SPAWN_COOLDOWN, QUIET_AFTER, QUIET_ROUNDS, ENEMY_BOT_TTL = 4, 40, 4, 10
 
 
-def rep_pack(cat, t, remove):
-    return REP_MARK | (REP_REMOVE if remove else 0) | (cat << 26) | t
+def _content(w):
+    return w & ~(W_MARK | W_SPAWN | (3 << 28))
 
 
-def _rep_key(p):
-    c = (p >> 26) & 15
-    return (0 if c == REP_CORE else (1 if c >= REP_GUNNER else 2), p & 0x7FF, (p >> 30) & 1, c)
+def _cheb(a, b, W):
+    return max(abs(a % W - b % W), abs(a // W - b // W))
+
+
+class BusItem:
+    __slots__ = ("key", "word", "due", "sent", "fresh", "remove", "sent_word", "anchor")
+
+    def __init__(self, key, word, due, remove):
+        self.key, self.word, self.due, self.sent = key, word, due, -1
+        self.fresh, self.remove, self.sent_word, self.anchor = True, remove, 0, -1
 
 
 class ObsMemory:
@@ -90,9 +99,13 @@ class ObsMemory:
         self.seen_round = [-1] * n
         self.visit_round = [-1] * n
         self.attr_seen_round = [-1] * n
-        self.known, self.pending = set(), set()
+        self.bus_q = [[] for _ in range(5)]
+        self.snap, self.snap_ore = set(), [0] * n
+        self.rep_bot_tile, self.rep_bot_round = [-1] * 128, [-1] * 128
+        self.born, self.last_spawn_react, self.snap_spawn = -1, -1000, False
+        self.core_alarm_round, self.last_hp = -1, -1
+        self.spawned_now = self.core_alarm_now = self.is_builder = False
         self.sym_alive, self.sym = 7, -1
-        self.snap_sym = False
         # a pit lies on the mirror axis: x pit -> mirror x (1), y pit -> mirror y (2)
         if pit_axis >= 0:
             self.sym_alive = 1 << (1 if pit_axis == 0 else 2)
@@ -156,31 +169,63 @@ class ObsMemory:
                     if self.terrain[mt] == T_UNKNOWN:
                         self.terrain[mt] = T_EMPTY
 
-    # ---- report bus (identical to ObsMemory::merge_store / ore_report / next_report)
-    def merge_store(self, store):
-        """Apply the team store snapshot (16 values): every report merges into memory."""
-        W, H, n, enemy = self.W, self.H, self.W * self.H, 1 - self.team
-        self.snap_sym = False
-        for v in store:
-            if v < 0 or v > 0xFFFFFFFF or not (v & REP_MARK):
+    # ---- report bus (identical to engine/src/obs.cpp)
+    def own_count(self, typ):
+        """Own buildings of a type in memory (seen or reported)."""
+        team, bid, bty, btm = self.team, self.bld_id, self.bld_type, self.bld_team
+        return sum(1 for t in range(len(bid)) if bid[t] >= 0 and btm[t] == team and bty[t] == typ)
+
+    def extra_bits(self):
+        return (self.sym + 1) << 28 if self.sym >= 0 else 0
+
+    def _clear_bot(self, t):
+        self.bot_id[t] = self.bot_team[t] = self.bot_hp[t] = -1
+
+    def _place_reported_bot(self, tm, tag, t, rr):
+        idx = tm * 64 + tag
+        sid = (1 << 28) | idx
+        old = self.rep_bot_tile[idx]
+        if old >= 0 and old != t and self.bot_id[old] == sid:
+            self._clear_bot(old)
+        if self.bot_id[t] < 0 or self.bot_id[t] == sid:
+            self.bot_id[t], self.bot_team[t], self.bot_hp[t] = sid, tm, -1
+            self.visit_round[t] = rr
+            if self.terrain[t] == T_UNKNOWN:
+                self.terrain[t] = T_EMPTY
+                self.learn_terrain(t)
+        self.rep_bot_tile[idx], self.rep_bot_round[idx] = t, rr
+
+    def merge_store(self, store, rnd):
+        W, H, n, team = self.W, self.H, self.W * self.H, self.team
+        enemy = 1 - team
+        self.snap = set()
+        self.snap_ore = [0] * n
+        self.snap_spawn = False
+        for i, v in enumerate(store):
+            if v < 0 or v > 0xFFFFFFFF or not (v & W_MARK):
                 continue
-            cat, t, remove = (v >> 26) & 15, v & 0x7FF, bool(v & REP_REMOVE)
-            bits = (v >> 11) & 0x7FFF
-            if cat == REP_SYM:
-                mask = t & 7
-                if not remove and not bits and mask:
-                    if bin(mask).count("1") == 1:
-                        self.snap_sym = True
-                    if self.sym < 0 and self.sym_alive & mask:
-                        self.sym_alive &= mask
+            grp, t = SLOT_GROUP[i], v & 0x7FF
+            if t >= n:
                 continue
-            if cat < REP_ORE_TI or cat > REP_OWN_LAUNCHER or t >= n:
-                continue
-            if cat in (REP_ORE_TI, REP_ORE_VO):
-                if remove:
+            ss = (v >> 28) & 3
+            if ss and self.sym < 0 and (self.sym_alive >> (ss - 1)) & 1:
+                self.sym_alive = 1 << (ss - 1)
+            if v & W_SPAWN:
+                self.snap_spawn = True
+            self.snap.add((grp << 28) | _content(v))
+            if grp == G_MYB or grp == G_EB:
+                tag = (v >> 11) & 63
+                rr = rnd - ((rnd - ((v >> 17) & 63)) & 63)
+                if grp == G_MYB and tag == TAG_CORE:
+                    if v & W_ALARM:
+                        self.core_alarm_round = max(self.core_alarm_round, rr)
                     continue
-                x, y = t % W, t // W
-                ore = T_ORE_TI if cat == REP_ORE_TI else T_ORE_VO
+                if rnd - rr > ENEMY_BOT_TTL:
+                    continue
+                self._place_reported_bot(team if grp == G_MYB else enemy, tag, t, rr)
+            elif grp == G_ORE:
+                kind, x, y = (v >> 11) & 1, t % W, t // W
+                bits = (v >> 12) & 0x7FFF
                 for k in range(16):
                     if k > 0 and not (bits >> (k - 1)) & 1:
                         continue
@@ -188,114 +233,178 @@ class ObsMemory:
                     if xx >= W or yy >= H:
                         continue
                     tt = yy * W + xx
-                    f = rep_pack(cat, tt, False)
-                    self.known.add(f)
-                    self.known.discard(f ^ REP_REMOVE)
-                    self.pending.discard(f)
+                    self.snap_ore[tt] |= 1 << kind
                     if self.terrain[tt] == T_UNKNOWN:
-                        self.terrain[tt] = ore
+                        self.terrain[tt] = T_ORE_VO if kind else T_ORE_TI
                     self.learn_terrain(tt)
-                continue
-            # non-ore reports carry the sender's map symmetry in bits 11..12 (0 unknown, else sym + 1)
-            if bits & ~3:
-                continue
-            ss = bits & 3
-            if ss:
-                self.snap_sym = True
-                if self.sym < 0 and (self.sym_alive >> (ss - 1)) & 1:
-                    self.sym_alive = 1 << (ss - 1)
-            v &= ~(0x7FFF << 11)                     # the fact itself
-            self.known.add(v)
-            self.known.discard(v ^ REP_REMOVE)
-            self.pending.discard(v)
-            if cat == REP_OWN_LAUNCHER:
-                team = self.team
-                if remove:
-                    if self.bld_id[t] >= 0 and self.bld_team[t] == team and self.bld_type[t] == LAUNCHER:
+            else:
+                eatk = grp == G_EATK
+                code = (v >> 11) & 7
+                if code >= (5 if eatk else 6):
+                    continue
+                typ = (EATK_TYPES if eatk else MINE_TYPES)[code]
+                owner = enemy if eatk else team
+                if v & W_REMOVE:
+                    if self.bld_id[t] >= 0 and self.bld_team[t] == owner and self.bld_type[t] == typ:
                         self.bld_id[t] = self.bld_type[t] = self.bld_team[t] = -1
                         self.bld_dir[t] = self.bld_hp[t] = -1
                 elif self.bld_id[t] < 0:
-                    self.bld_id[t] = (1 << 29) + t
-                    self.bld_type[t], self.bld_team[t] = LAUNCHER, team
+                    self.bld_id[t] = owner + 1 if typ == CORE else ((1 << 30) if eatk else (1 << 29)) + t
+                    self.bld_type[t], self.bld_team[t] = typ, owner
                     self.bld_dir[t], self.bld_hp[t] = -1, 100
                     if self.terrain[t] == T_UNKNOWN:
                         self.terrain[t] = T_EMPTY
                         self.learn_terrain(t)
+        for idx in range(128):
+            t = self.rep_bot_tile[idx]
+            if t < 0 or rnd - self.rep_bot_round[idx] <= ENEMY_BOT_TTL:
                 continue
-            typ = _REP_TYPE[cat]
-            if remove:
-                if self.bld_id[t] >= 0 and self.bld_team[t] == enemy and self.bld_type[t] == typ:
-                    self.bld_id[t] = self.bld_type[t] = self.bld_team[t] = -1
-                    self.bld_dir[t] = self.bld_hp[t] = -1
-            elif self.bld_id[t] < 0:
-                self.bld_id[t] = enemy + 1 if typ == CORE else (1 << 30) + t
-                self.bld_type[t], self.bld_team[t] = typ, enemy
-                self.bld_dir[t], self.bld_hp[t] = -1, 100
-                if self.terrain[t] == T_UNKNOWN:
-                    self.terrain[t] = T_EMPTY
-                    self.learn_terrain(t)
+            if self.bot_id[t] == ((1 << 28) | idx):
+                self._clear_bot(t)
+            self.rep_bot_tile[idx] = -1
 
-    def ore_report(self, f):
-        W, H = self.W, self.H
-        cat, t = (f >> 26) & 15, f & 0x7FF
-        x, y = t % W, t // W
-        ore = T_ORE_TI if cat == REP_ORE_TI else T_ORE_VO
-        bits = 0
-        for k in range(1, 16):
-            xx, yy = x + k % 4, y + k // 4
-            if xx < W and yy < H and self.terrain[yy * W + xx] == ore:
-                bits |= 1 << (k - 1)
-        return f | (bits << 11)
+    def _bus_after_update(self, ad, rnd, gone_eatk, gone_mine, enemy_bots, enemy_near):
+        W, n, team = self.W, self.W * self.H, self.team
+        enemy = 1 - team
+        typ, hp = ad.actor_state()[:2]
+        ax, ay = ad.actor_pos()
+        uid = ad.actor_id()
+        if typ == CORE:
+            self.core_alarm_now = (self.last_hp >= 0 and hp < self.last_hp) or enemy_near
+            self.last_hp = hp
+            if self.core_alarm_now:
+                self.core_alarm_round = rnd
 
-    def next_report(self, unit_id, rnd):
-        """(slot, report) to post this turn, or None."""
+        def want(grp, key, word, remove):
+            for it in self.bus_q[grp]:
+                if it.key == key:
+                    it.word = word
+                    return it
+            it = BusItem(key, word, rnd, remove)
+            self.bus_q[grp].append(it)
+            return it
+
+        r6 = (rnd & 63) << 17
+        core_status = typ == CORE and (self.core_alarm_now or self.spawned_now)
+        self.bus_q[G_MYB] = [it for it in self.bus_q[G_MYB]
+                             if (it.key == 0 and self.is_builder) or (it.key == TAG_CORE and core_status)]
+        if self.is_builder:
+            t = ay * W + ax
+            it = want(G_MYB, 0, t | ((uid % 63) << 11) | r6, False)
+            if it.anchor >= 0 and _cheb(it.anchor, t, W) >= 2:
+                it.due = min(it.due, rnd)
+        if core_status:
+            it = want(G_MYB, TAG_CORE, (ay * W + ax) | (TAG_CORE << 11) | r6 | (W_ALARM if self.core_alarm_now else 0), False)
+            it.due = min(it.due, rnd)
+        tags = set(tag for _, tag in enemy_bots)
+        self.bus_q[G_EB] = [it for it in self.bus_q[G_EB] if it.key in tags]
+        for t, tag in enemy_bots:
+            it = want(G_EB, tag, t | (tag << 11) | r6, False)
+            if it.anchor >= 0 and _cheb(it.anchor, t, W) >= 2:
+                it.due = min(it.due, rnd)
+        keep = [set() for _ in range(5)]
+        terrain, bid, bty, btm = self.terrain, self.bld_id, self.bld_type, self.bld_team
+        for t in range(n):
+            ter = terrain[t]
+            if ter == T_ORE_TI or ter == T_ORE_VO:
+                key = t | ((1 << 11) if ter == T_ORE_VO else 0)
+                want(G_ORE, key, key, False)
+                keep[G_ORE].add(key)
+            if bid[t] < 0:
+                continue
+            if btm[t] == enemy:
+                if bty[t] in EATK_TYPES:
+                    key = t | (EATK_TYPES.index(bty[t]) << 11)
+                    want(G_EATK, key, key, False)
+                    keep[G_EATK].add(key)
+            elif btm[t] == team:
+                if bty[t] in MINE_TYPES:
+                    key = t | (MINE_TYPES.index(bty[t]) << 11)
+                    want(G_MINE, key, key, False)
+                    keep[G_MINE].add(key)
+        for t, c in gone_eatk:
+            key = t | (c << 11) | W_REMOVE
+            want(G_EATK, key, key, True)
+            keep[G_EATK].add(key)
+        for t, c in gone_mine:
+            key = t | (c << 11) | W_REMOVE
+            want(G_MINE, key, key, True)
+            keep[G_MINE].add(key)
+        for grp in (G_ORE, G_EATK, G_MINE):
+            self.bus_q[grp] = [it for it in self.bus_q[grp] if it.key in keep[grp] or it.remove]
+        # delivery checks against this turn's snapshot
+        for grp in range(5):
+            q = []
+            for it in self.bus_q[grp]:
+                if grp == G_ORE:
+                    delivered = bool((self.snap_ore[it.key & 0x7FF] >> ((it.key >> 11) & 1)) & 1)
+                elif grp <= G_EB:
+                    delivered = it.sent >= 0 and ((grp << 28) | it.sent_word) in self.snap
+                else:
+                    delivered = ((grp << 28) | it.word) in self.snap
+                if delivered:
+                    if it.remove:
+                        continue
+                    if it.sent >= 0 or it.due <= rnd:
+                        it.due = rnd + (REFRESH if grp <= G_EB else REFRESH_FACTS)
+                    it.fresh, it.sent, it.anchor = False, -1, it.word & 0x7FF
+                elif it.sent >= 0 and it.sent < rnd:
+                    it.due, it.sent = rnd, -1
+                q.append(it)
+            self.bus_q[grp] = q
+        if self.snap_spawn and rnd - self.last_spawn_react >= SPAWN_COOLDOWN:
+            self.last_spawn_react = rnd
+            for q in self.bus_q:
+                for it in q:
+                    it.due = min(it.due, rnd)
+
+    def next_reports(self, unit_id, rnd):
+        """This turn's writes: [(slot, word)], at most one per slot group."""
+        out = []
+        if self.is_builder and self.born > QUIET_AFTER and rnd - self.born < QUIET_ROUNDS:
+            return out
+        W, H, n, team = self.W, self.H, self.W * self.H, self.team
+        own_core = [t for t in range(n) if self.bld_id[t] >= 0 and self.bld_team[t] == team and self.bld_type[t] == CORE]
         k = unit_id + rnd
-        if self.pending:
-            best = min(self.pending, key=_rep_key)
-            cat = (best >> 26) & 15
-            ore = cat in (REP_ORE_TI, REP_ORE_VO)
-            return k % 16, (self.ore_report(best) if ore else best | self.sym_bits())
-        if self.sym >= 0 and not self.snap_sym and k % SYM_DIV == 0:
-            # nobody carried the symmetry last round: post it (tile field = 1 << sym)
-            return k % 16, REP_MARK | (REP_SYM << 26) | (1 << self.sym)
-        if k % ROT_DIV:
-            return None
-        enemy, live = 1 - self.team, []
-        for f in sorted(self.known):
-            if f & REP_REMOVE:
+        spread = (unit_id * 2654435761 + rnd * 40503) & 0xFFFFFFFF
+        for grp in range(5):
+            refresh_ok = grp <= G_EB or k % REFRESH_GATE == 0
+            best, bk = None, None
+            for it in self.bus_q[grp]:
+                if it.due > rnd or (not it.fresh and not refresh_ok):
+                    continue
+                prio = 0
+                if grp == G_EATK and own_core:
+                    prio = min(_cheb(c, it.key & 0x7FF, W) for c in own_core)
+                key = (0 if it.fresh else 1, prio, it.key ^ spread)
+                if best is None or key < bk:
+                    best, bk = it, key
+            if best is None:
                 continue
-            cat, t = (f >> 26) & 15, f & 0x7FF
-            if cat in (REP_ORE_TI, REP_ORE_VO):
-                if self.terrain[t] == (T_ORE_TI if cat == REP_ORE_TI else T_ORE_VO):
-                    live.append(f)
-            elif cat == REP_OWN_LAUNCHER:
-                if self.bld_id[t] >= 0 and self.bld_team[t] == self.team and self.bld_type[t] == LAUNCHER:
-                    live.append(f)
-            elif self.bld_id[t] >= 0 and self.bld_team[t] == enemy and self.bld_type[t] == _REP_TYPE[cat]:
-                live.append(f)
-        if not live:
-            return None
-        f = live[(k // ROT_DIV) % len(live)]
-        ore = ((f >> 26) & 15) in (REP_ORE_TI, REP_ORE_VO)
-        return (k // ROT_DIV) % 16, (self.ore_report(f) if ore else f | self.sym_bits())
-
-    def sym_bits(self):
-        """Non-ore reports carry the map symmetry: bits 11..12 = sym + 1 (0 unknown)."""
-        return (self.sym + 1) << 11 if self.sym >= 0 else 0
-
-    def own_count(self, typ):
-        """Own buildings of a type in memory (seen or reported)."""
-        team, bid, bty, btm = self.team, self.bld_id, self.bld_type, self.bld_team
-        return sum(1 for t in range(len(bid)) if bid[t] >= 0 and btm[t] == team and bty[t] == typ)
-
-    def _fact(self, p):
-        self.pending.discard(p ^ REP_REMOVE)
-        if p not in self.known:
-            self.pending.add(p)
+            w = best.word
+            if grp == G_ORE:
+                t = w & 0x7FF
+                x, y = t % W, t // W
+                ore = T_ORE_VO if (w >> 11) & 1 else T_ORE_TI
+                for c in range(1, 16):
+                    xx, yy = x + c % 4, y + c // 4
+                    if xx < W and yy < H and self.terrain[yy * W + xx] == ore:
+                        w |= 1 << (11 + c)
+            best.sent, best.sent_word = rnd, w
+            full = W_MARK | w | self.extra_bits()
+            if grp == G_MYB and best.key == TAG_CORE and self.spawned_now:
+                full |= W_SPAWN
+                self.spawned_now = False
+            out.append((BUS_BASE[grp] + k % BUS_SIZE[grp], full))
+        return out
 
     def update(self, ad):
         r, W = ad.current_round(), self.W
         team = self.team
+        if self.born < 0:
+            self.born = r
+        self.is_builder = ad.actor_state()[0] == BUILDER
+        gone_eatk, gone_mine, enemy_bots, enemy_near = [], [], [], False
         for x, y in ad.visible_tiles():
             t = y * W + x
             old_id, old_type, old_team = self.bld_id[t], self.bld_type[t], self.bld_team[t]
@@ -323,22 +432,20 @@ class ObsMemory:
                 self.attr_seen_round[t] = r
             self.seen_round[t] = r
             self.learn_terrain(t)
-            # reportable facts seen now
-            ter = self.terrain[t]
-            if ter == T_ORE_TI or ter == T_ORE_VO:
-                self._fact(rep_pack(REP_ORE_TI if ter == T_ORE_TI else REP_ORE_VO, t, False))
-            cat_now = _REP_CAT.get(self.bld_type[t], 0) if self.bld_id[t] >= 0 and self.bld_team[t] != team else 0
-            if cat_now:
-                self._fact(rep_pack(cat_now, t, False))
-            cat_old = _REP_CAT.get(old_type, 0) if old_id >= 0 and old_team != team else 0
-            if cat_old and cat_old != cat_now:
-                self._fact(rep_pack(cat_old, t, True))
-            # our own launchers (the launcher cap)
-            if self.bld_id[t] >= 0 and self.bld_team[t] == team and self.bld_type[t] == LAUNCHER:
-                self._fact(rep_pack(REP_OWN_LAUNCHER, t, False))
-            elif old_id >= 0 and old_team == team and old_type == LAUNCHER:
-                self._fact(rep_pack(REP_OWN_LAUNCHER, t, True))
+            if self.bot_id[t] >= 0 and self.bot_team[t] != team and u is not None:
+                enemy_bots.append((t, u % 63))
+                enemy_near = True
+            if self.bld_id[t] >= 0 and self.bld_team[t] != team:
+                enemy_near = True
+            if old_id >= 0:
+                same = self.bld_id[t] >= 0 and self.bld_type[t] == old_type and self.bld_team[t] == old_team
+                if not same:
+                    if old_team == 1 - team and old_type in EATK_TYPES:
+                        gone_eatk.append((t, EATK_TYPES.index(old_type)))
+                    if old_team == team and old_type in MINE_TYPES:
+                        gone_mine.append((t, MINE_TYPES.index(old_type)))
         self.resolve_symmetry()
+        self._bus_after_update(ad, r, gone_eatk, gone_mine, enemy_bots, enemy_near)
 
     def plan_paths(self):
         """Conveyor planner, identical to ObsMemory::plan_paths (engine/src/obs.cpp):
@@ -556,6 +663,8 @@ class ObsMemory:
         scalars[7:10] = [acd, mcd, rnd]
         scalars[10:15] = ad.team_resources(team)
         scalars[15:20] = ad.team_resources(1 - team)
+        # rounds since our core last raised the under-attack alarm (team bus), cap 15
+        scalars[15] = 15 if self.core_alarm_round < 0 else min(15, rnd - self.core_alarm_round)
         for i in range(16):                      # as int32, like the engine (u32 reports set bit 31)
             v = ad.store(i) & 0xFFFFFFFF
             scalars[20 + i] = v - (1 << 32) if v >= (1 << 31) else v
@@ -658,6 +767,9 @@ class ControllerAdapter:
         maximum = self.ct.get_max_hp(eid)
         return (100 * self.ct.get_hp(eid)) // maximum if maximum else 0
 
+    def actor_id(self):
+        return self.ct.get_id()
+
     def actor_pos(self):
         p = self.ct.get_position()
         return p.x, p.y
@@ -710,12 +822,12 @@ class ActorEncoder:
             pit = ct.get_pit()
             memory = ObsMemory(ad.W, ad.H, ad.team(), -1 if pit is None else (0 if pit[0] == "x" else 1))
             self.memories[uid] = memory
-        # team report bus: merge the store snapshot, see, post one report
-        memory.merge_store([ct.read_store(i) for i in range(16)])
+        # team report bus: merge the store snapshot, see, post (one write per slot group)
+        rnd = ct.get_current_round()
+        memory.merge_store([ct.read_store(i) for i in range(16)], rnd)
         memory.update(ad)
-        rep = memory.next_report(uid, ct.get_current_round())
-        if rep:
-            ct.write_store(rep[0], rep[1])
+        for slot, word in memory.next_reports(uid, rnd):
+            ct.write_store(slot, word)
         return memory, ad
 
     def forget(self, entity_id):
