@@ -40,20 +40,65 @@ inline torch::Tensor actor_scalar_scale() {
     // 13 (scale, always 0), 15-19 (opponent, always 0), 20-35 (packed store words): ignored
     return torch::tensor(s).view({1, fe::ACTOR_SCALARS});
 }
-// Scalars at several scales (actor and critic): every raw scalar x becomes
-// clamp(x / d, -SCALAR_CLIP, SCALAR_CLIP) for each d in SCALAR_SCALES, so
-// small differences (3 Ti) show at the fine scales and large values (4000 Ti)
-// stay apart at the coarse ones.
+// Scalars that can reach ~1000 enter at several scales: x becomes
+// clamp(x / d, -SCALAR_CLIP, SCALAR_CLIP) for each d in SCALAR_SCALES, so a
+// difference of 3 Ti shows at the fine scales and 400 vs 4000 stays apart at
+// the coarse ones. Every other scalar is one feature at its fixed scale.
 constexpr float SCALAR_SCALES[] = {1.f, 10.f, 100.f, 1000.f};
 constexpr int N_SCALAR_SCALES = 4;
 constexpr float SCALAR_CLIP = 2.f;
-constexpr int CRITIC_FEATURES = fe::CRITIC_SCALARS * N_SCALAR_SCALES;
-constexpr int ACTOR_FEATURES = fe::ACTOR_SCALARS * N_SCALAR_SCALES;
 inline torch::Tensor multi_scale() {                          // [1, 1, N_SCALAR_SCALES]: 1/d
     std::vector<float> s;
     for (float d : SCALAR_SCALES) s.push_back(1.f / d);
     return torch::tensor(s).view({1, 1, N_SCALAR_SCALES});
 }
+// actor: round, Ti, Vo, ammo
+inline std::vector<int64_t> actor_big() { return {9, 10, 11, 12}; }
+// critic: round; per team Ti, Vo, ammo, scale; rounds left; Ti / Vo collected
+// per team; Ti collected A - B; Ti stored A - B
+inline std::vector<int64_t> critic_big() {
+    const int e = fe::CRITIC_SCALARS - fe::CRITIC_EXTRA;
+    return {0, 1, 2, 3, 4, 6, 7, 8, 9, e, e + 1, e + 2, e + 3, e + 4, e + 5, e + 6};
+}
+// The single-scale scalars: (index, scale). Actor scalars with scale 0 are dropped.
+inline void single_scalars(const torch::Tensor& scale, const std::vector<int64_t>& big,
+                           std::vector<int64_t>& idx, std::vector<float>& sc) {
+    auto s = scale.flatten().contiguous();
+    for (int64_t i = 0; i < s.numel(); i++) {
+        const float v = s[i].item<float>();
+        if (v == 0.f || std::find(big.begin(), big.end(), i) != big.end()) continue;
+        idx.push_back(i); sc.push_back(v);
+    }
+}
+inline torch::Tensor critic_single_scale() {
+    std::vector<float> s(fe::CRITIC_SCALARS, 1.f / 10.f);    // entity counts per team and type
+    s[5] = s[10] = 1.f / 50.f;                               // units per team
+    return torch::tensor(s);
+}
+inline int actor_features() {
+    std::vector<int64_t> i; std::vector<float> v;
+    single_scalars(actor_scalar_scale(), actor_big(), i, v);
+    return int(i.size() + actor_big().size() * N_SCALAR_SCALES);
+}
+inline int critic_features() {
+    std::vector<int64_t> i; std::vector<float> v;
+    single_scalars(critic_single_scale(), critic_big(), i, v);
+    return int(i.size() + critic_big().size() * N_SCALAR_SCALES);
+}
+
+// raw scalars [B, N] -> features: the single ones scaled, then the big ones at every scale
+struct ScalarFeatures {
+    torch::Tensor single_idx, single_scale, big_idx;
+    static ScalarFeatures make(const torch::Tensor& scale, const std::vector<int64_t>& big) {
+        std::vector<int64_t> i; std::vector<float> v;
+        single_scalars(scale, big, i, v);
+        ScalarFeatures f;
+        f.single_idx = torch::tensor(i, torch::kLong);
+        f.single_scale = torch::tensor(v).view({1, -1});
+        f.big_idx = torch::tensor(big, torch::kLong);
+        return f;
+    }
+};
 
 struct ResBlockImpl : torch::nn::Module {
     // two (1x1 -> depthwise 3x3) pairs, then residual: +-2 tiles per block
@@ -84,10 +129,10 @@ struct ActorImpl : torch::nn::Module {
         stem = register_module("stem", torch::nn::Conv2d(torch::nn::Conv2dOptions(fe::ACTOR_CH, TRUNK_CH, 1)));
         for (int b = 0; b < 4; b++) blocks->push_back(ResBlock(TRUNK_CH));
         register_module("blocks", blocks);
-        fc = register_module("fc", torch::nn::Linear(TRUNK_CH + ACTOR_FEATURES, ACTOR_HIDDEN));
+        fc = register_module("fc", torch::nn::Linear(TRUNK_CH + actor_features(), ACTOR_HIDDEN));
         out = register_module("out", torch::nn::Linear(ACTOR_HIDDEN, policy_logit_count(p)));
     }
-    // spatial: [B, 59, 17, 17] already scaled; scalars: [B, ACTOR_FEATURES] (multi-scale)
+    // spatial: [B, 59, 17, 17] already scaled; scalars: [B, actor_features()]
     torch::Tensor forward(torch::Tensor spatial, torch::Tensor scalars) {
         auto h = stem->forward(spatial).relu_();
         for (auto& b : *blocks) h = b->as<ResBlock>()->forward(h);
@@ -110,7 +155,7 @@ struct CriticImpl : torch::nn::Module {
         stem = register_module("stem", torch::nn::Conv2d(torch::nn::Conv2dOptions(fe::CRITIC_CH, TRUNK_CH, 1)));
         for (int b = 0; b < 3; b++) blocks->push_back(ResBlock(TRUNK_CH));
         register_module("blocks", blocks);
-        hidden = register_module("hidden", torch::nn::Linear(TRUNK_CH * 3 * 3 + CRITIC_FEATURES, CRITIC_HIDDEN));
+        hidden = register_module("hidden", torch::nn::Linear(TRUNK_CH * 3 * 3 + critic_features(), CRITIC_HIDDEN));
         value = register_module("value", torch::nn::Linear(CRITIC_HIDDEN, 1));
     }
     torch::Tensor forward(torch::Tensor spatial, torch::Tensor scalars) {
@@ -127,13 +172,19 @@ TORCH_MODULE(Critic);
 struct TeacherImpl : torch::nn::Module {
     torch::nn::ModuleList actors;
     Critic critic{nullptr};
-    torch::Tensor ch_scale, sc_mask, scales;    // sc_mask: 1 = scalar used, 0 = ignored (always 0)
+    torch::Tensor ch_scale, scales;
+    torch::Tensor a_idx, a_scale, a_big, c_idx, c_scale, c_big;   // scalar feature maps (buffers)
     TeacherImpl() {
         for (int p = 0; p < NUM_POLICIES; p++) actors->push_back(Actor(p));
         register_module("actors", actors);
         critic = register_module("critic", Critic());
         ch_scale = register_buffer("ch_scale", actor_channel_scale());
-        sc_mask = register_buffer("sc_mask", (actor_scalar_scale() != 0).to(torch::kFloat32));
+        auto af = ScalarFeatures::make(actor_scalar_scale(), actor_big());
+        auto cf = ScalarFeatures::make(critic_single_scale(), critic_big());
+        a_idx = register_buffer("a_idx", af.single_idx); a_scale = register_buffer("a_scale", af.single_scale);
+        a_big = register_buffer("a_big", af.big_idx);
+        c_idx = register_buffer("c_idx", cf.single_idx); c_scale = register_buffer("c_scale", cf.single_scale);
+        c_big = register_buffer("c_big", cf.big_idx);
         scales = register_buffer("scales", multi_scale());
     }
     // raw: [B, ACTOR_SPATIAL + ACTOR_SCALARS] unscaled encoder output
@@ -143,13 +194,13 @@ struct TeacherImpl : torch::nn::Module {
         return actors[p]->as<Actor>()->forward(sp, sc);
     }
     // [B, CRITIC_SCALARS] raw -> [B, CRITIC_FEATURES]: each scalar at every scale, clamped
-    torch::Tensor critic_features(const torch::Tensor& sc) {
-        return (sc.unsqueeze(2) * scales).clamp_(-SCALAR_CLIP, SCALAR_CLIP).flatten(1);
+    torch::Tensor features(const torch::Tensor& sc, const torch::Tensor& idx, const torch::Tensor& scale, const torch::Tensor& big) {
+        auto single = sc.index_select(1, idx) * scale;
+        auto multi = (sc.index_select(1, big).unsqueeze(2) * scales).clamp_(-SCALAR_CLIP, SCALAR_CLIP).flatten(1);
+        return torch::cat({single, multi}, 1);
     }
-    // [B, ACTOR_SCALARS] raw -> [B, ACTOR_FEATURES]; ignored scalars stay 0
-    torch::Tensor actor_features(const torch::Tensor& sc) {
-        return ((sc * sc_mask).unsqueeze(2) * scales).clamp_(-SCALAR_CLIP, SCALAR_CLIP).flatten(1);
-    }
+    torch::Tensor critic_features(const torch::Tensor& sc) { return features(sc, c_idx, c_scale, c_big); }
+    torch::Tensor actor_features(const torch::Tensor& sc) { return features(sc, a_idx, a_scale, a_big); }
     // Compact inputs, already on the device: spatial uint8 [B, ACTOR_SPATIAL],
     // scalars any integer type [B, ACTOR_SCALARS]; converted to float here.
     torch::Tensor logits_split(int p, const torch::Tensor& sp, const torch::Tensor& sc) {
