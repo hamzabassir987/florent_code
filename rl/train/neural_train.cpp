@@ -47,6 +47,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -74,8 +75,8 @@ constexpr double KL_STOP = 0.03;
 constexpr double CLIP_POL = 1.0, CLIP_VAL = 1.0;    // gradient-norm clip per model
 constexpr float VALUE_COEF = 0.5f;
 constexpr float PROMOTE = 0.85f;
-static int CRITIC_BATCH = 1024;                      // rows per critic inference forward (env CRITIC_BATCH)
-static int MICRO = 512;                              // rows per forward/backward when training (env MICRO)
+static int CRITIC_BATCH = 4000;                      // rows per critic inference forward (env CRITIC_BATCH)
+static int MICRO = 4000;                              // rows per forward/backward when training (env MICRO)
 constexpr int CRITIC_QUEUE = 40000;                 // queued critic rows before an early flush
 
 // ===========================================================================
@@ -164,6 +165,7 @@ struct Slot {
     std::mt19937_64 rng;
     bool started = false, done = false, paused = false;
     std::vector<int> order; size_t pos = 0; bool in_round = false;
+    int start_round = 0;
     int played = 0;                                  // rounds this stretch
     // the unit waiting for a forward
     bool need = false; int ent = -1, policy = -1, net = 0; std::vector<float> obs, logits;
@@ -186,12 +188,15 @@ struct Setup {
     float record_p = 1.f, value_keep = 0.25f;
 };
 
+static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool train);
+
 static void start_game(Slot& s, const Setup& S) {
     s.m = Match();
     s.map_path = S.maps[s.rng() % S.maps.size()];
     s.seed = s.rng() & 0xFFFFFFFFull;
     if (!s.m.load(s.map_path, s.seed)) { std::cerr << "bad map " << s.map_path << "\n"; std::exit(3); }
     s.m.reset();
+    s.m.game.round = s.start_round;
     s.m.game.max_turns = S.K->game_rounds;
     s.m.game.limit_ore(S.K->ore_radius, s.rng());
     s.started = true; s.in_round = false; s.done = false;
@@ -435,12 +440,13 @@ int main(int argc, char** argv) {
     const std::string out = argv[2];
     Setup S;
     S.maps.assign(argv + 3, argv + argc);
-    const int G = env_int("GAMES", 950), R = env_int("ROUNDS", 150);
-    const int N_MINI = env_int("N_MINI", 15);      // minibatches per pass (reference pipeline: 15)
-    MICRO = std::max(1, env_int("MICRO", 512));
-    CRITIC_BATCH = std::max(1, env_int("CRITIC_BATCH", 1024));
-    S.value_keep = env_float("VALUE_KEEP", 0.1f);
-    S.record_p = env_float("RECORD_P", 0.05f);
+    const int G = env_int("GAMES", 100), R = env_int("ROUNDS", 100);
+    const int N_MINI = env_int("N_MINI", 10);      // minibatches per pass (reference pipeline: 15)
+    // Full-batch learner: do not split PPO minibatches into MICRO chunks.
+    MICRO = std::numeric_limits<int>::max();
+    CRITIC_BATCH = std::max(1, env_int("CRITIC_BATCH", 4000));
+    S.value_keep = env_float("VALUE_KEEP", 1.0f);
+    S.record_p = env_float("RECORD_P", 1.0f);
     const int start_iter = env_int("START_ITER", 0);
     if (std::getenv("THREADS")) { omp_set_num_threads(env_int("THREADS", 1)); torch::set_num_threads(env_int("THREADS", 1)); }
     const int T = omp_get_max_threads();
@@ -525,7 +531,12 @@ int main(int argc, char** argv) {
             s.decisions = 0; s.oob = 0;
             std::fill(std::begin(s.tried), std::end(s.tried), 0L); std::fill(std::begin(s.refused), std::end(s.refused), 0L);
             s.greedy = false; s.record = true; s.log = nullptr; s.net_of[0] = s.net_of[1] = 0;
-            if (!s.started) start_game(s, S);
+            if (!s.started) {
+                const int game_len = std::max(1, S.K->game_rounds);
+                const int step = env_int("START_TURN_STEP", 10);
+                s.start_round = ((i % game_len) * (step % game_len)) % game_len;
+                start_game(s, S);
+            }
             else s.segs.push_back(Segment());      // the running game continues in a new segment
         }
         net->eval();
@@ -646,9 +657,17 @@ int main(int argc, char** argv) {
                 auto surr = torch::min(ratio * A, torch::clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * A).sum();
                 auto H = -(lsm.exp().masked_fill(~mask, 0.f) * lsm.masked_fill(~mask, 0.f)).sum();
                 if (grad) {
-                    // -surr / N  -  (1/present) * coef_h * H_chunk / (cnt_h * Hmean_h)
+                    // During the first (and normally only) PPO epoch, collect
+                    // metrics from the training forward itself.  This avoids a
+                    // second identical no-grad forward pass.  Entropy is
+                    // normalized by the records in this chunk rather than by
+                    // a separately measured minibatch mean.
                     loss = loss - surr / double(n_total)
-                         - H * (K.head_entropy[head] / (double(hs.cnt[head]) * (h_mean[head] + 1e-8) * std::max(1, present)));
+                         - H * (K.head_entropy[head] / double(std::max<long>(1, k)));
+                    hs.surr += surr.item<double>();
+                    hs.kl += ((ratio - 1) - log_ratio).sum().item<double>();
+                    hs.H[head] += H.item<double>(); hs.cnt[head] += k; hs.n += k;
+                    hs.clip += ((ratio - 1).abs() > CLIP_EPS).sum().item<long>();
                 } else {
                     hs.surr += surr.item<double>();
                     hs.kl += ((ratio - 1) - log_ratio).sum().item<double>();      // KL(old || new) estimate
@@ -685,31 +704,52 @@ int main(int argc, char** argv) {
                 const size_t s1 = std::min(order.size(), s0 + MB);
                 std::vector<int> by_pol[NUM_POLICIES];
                 for (size_t k = s0; k < s1; k++) by_pol[samples[order[k]].policy].push_back(order[k]);
-                // pass 1 (no grad): entropy per head, KL, clipping, surrogate
+                // For the first epoch, metrics are collected by the training
+                // forward below. Later epochs retain the pre-check pass so KL
+                // early stopping can prevent an unsafe update.
                 HeadSums hs;
-                {
+                const bool metric_pass = ep > 0;
+                if (metric_pass) {
                     torch::NoGradGuard ng;
                     for (int p = 0; p < NUM_POLICIES; p++)
                         for (size_t c = 0; c < by_pol[p].size(); c += MICRO)
                             chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), false, hs, 0, nullptr, 0);
+                    if (!hs.n) continue;
+                    const double kl = hs.kl / double(hs.n);
+                    if (kl > KL_STOP) { kl_stop = true; stop_ep = ep; stop_kl = kl; break; }
                 }
-                if (!hs.n) continue;
-                const double kl = hs.kl / double(hs.n);
-                if (ep > 0 && kl > KL_STOP) { kl_stop = true; stop_ep = ep; stop_kl = kl; break; }
                 double h_mean[NUM_HEAD_IDS] = {}; int present = 0; double ent_mean = 0;
                 for (int h = 0; h < NUM_HEAD_IDS; h++) {
                     if (!hs.cnt[h]) continue;
                     h_mean[h] = hs.H[h] / double(hs.cnt[h]);
                     ent_mean += h_mean[h]; present++;
-                    if (ep == 0) { head_ent[h] += hs.H[h]; head_n[h] += hs.cnt[h]; }
                 }
-                // pass 2: forward + backward per chunk, gradients accumulate
+                // Count head records once so the single-pass epoch-0 loss has
+                // a valid minibatch denominator before `chunk()` has filled
+                // its metric accumulator.
+                long total_records = 0;
+                for (int p = 0; p < NUM_POLICIES; p++)
+                    for (int row : by_pol[p]) total_records += long(samples[row].recs.size());
+                if (!total_records) continue;
                 opt_pol.zero_grad();
                 for (int p = 0; p < NUM_POLICIES; p++)
                     for (size_t c = 0; c < by_pol[p].size(); c += MICRO) {
-                        auto loss = chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), true, hs, hs.n, h_mean, present);
+                        auto loss = chunk(p, by_pol[p].data() + c, long(std::min(by_pol[p].size() - c, size_t(MICRO))), true, hs, total_records, h_mean, present);
                         if (loss.requires_grad()) loss.backward();
                     }
+                if (!hs.n) continue;
+                if (ep == 0) {
+                    for (int h = 0; h < NUM_HEAD_IDS; h++) {
+                        head_ent[h] += hs.H[h];
+                        head_n[h] += hs.cnt[h];
+                    }
+                    ent_mean = 0; present = 0;
+                    for (int h = 0; h < NUM_HEAD_IDS; h++) if (hs.cnt[h]) {
+                        ent_mean += hs.H[h] / double(hs.cnt[h]);
+                        present++;
+                    }
+                }
+                const double kl = hs.kl / double(hs.n);
                 clip_norm(pol_params, CLIP_POL, 0);
                 opt_pol.step();
                 pl_sum += -hs.surr / double(hs.n); ent_sum += ent_mean / std::max(1, present);
