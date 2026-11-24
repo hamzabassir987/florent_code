@@ -265,6 +265,7 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
             if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) { s.pos++; continue; }
             const int type = m.game.ents[a].type;
             if (type == fe::SPIKE) {                   // deterministic, as deployed
+                m.observe(a);                          // its memory + the team report bus, as every unit
                 Candidate c;
                 if (spike_action(m.game, a, c) && m.act(a, c) == fe::OK && s.log) s.log->push_back({m.game.round, m.game.ents[a].id, c});
                 s.pos++; continue;

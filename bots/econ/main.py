@@ -239,6 +239,7 @@ class Player:
         api = HEADS.Api(ct)
         typ = api.Tinv[ct.get_entity_type()]
         if typ == HEADS.SPIKE:                       # deterministic, as in training
+            self.actor_encoder.observe(ct)           # its memory + the team report bus
             act = HEADS.spike_action(api)
             if act:
                 HEADS.apply(api, act)

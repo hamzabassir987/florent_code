@@ -629,6 +629,12 @@ class ActorEncoder:
         self.size = None
 
     def encode(self, ct):
+        """observe(ct), then the actor observation."""
+        memory, ad = self.observe(ct)
+        return memory.encode(ad)
+
+    def observe(self, ct):
+        """Memory and team report bus only (every unit, every turn; spikes too)."""
         ad = ControllerAdapter(ct)
         key = (ad.W, ad.H, ad.team())
         if key != self.size:
@@ -645,7 +651,7 @@ class ActorEncoder:
         rep = memory.next_report(uid, ct.get_current_round())
         if rep:
             ct.write_store(rep[0], rep[1])
-        return memory.encode(ad)
+        return memory, ad
 
     def forget(self, entity_id):
         self.memories.pop(entity_id, None)
