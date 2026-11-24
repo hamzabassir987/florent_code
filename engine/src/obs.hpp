@@ -61,6 +61,7 @@ constexpr int C_HP = C_DIR + CH_DIR;
 constexpr int C_THREAT = C_HP + CH_HP;
 constexpr int C_RAY = C_THREAT + CH_THREAT;
 constexpr int C_PATH = C_RAY + CH_RAY;
+constexpr int LINE_CAP = 4;          // conveyor planner: harvesters per line into the core
 
 // report-bus parameters (experiments: rl/tests/bus_stats.cpp); defaults = deployed
 struct BusConfig {

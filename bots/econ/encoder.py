@@ -75,6 +75,9 @@ def _cheb(a, b, W):
     return max(abs(a % W - b % W), abs(a // W - b // W))
 
 
+LINE_CAP = 4   # conveyor planner: harvesters per line into the core (1 stack / round)
+
+
 class BusItem:
     __slots__ = ("key", "word", "due", "sent", "fresh", "remove", "sent_word", "anchor")
 
@@ -476,59 +479,84 @@ class ObsMemory:
 
     def plan_paths(self):
         """Conveyor planner, identical to ObsMemory::plan_paths (engine/src/obs.cpp):
-        per tile the planned conveyor direction (Dir code), 0 = not on a path."""
+        per tile the planned conveyor direction (Dir code), 0 = not on a path.
+        A line (the path's last tile before the core) takes at most LINE_CAP
+        own harvesters; once full, its tiles are closed and later sources are
+        planned around it."""
         W, H, team = self.W, self.H, self.team
         N = W * H
         terrain, bid, bty, btm = self.terrain, self.bld_id, self.bld_type, self.bld_team
-        dist = [-1] * N
-        q = [t for t in range(N) if bid[t] >= 0 and btm[t] == team and bty[t] == CORE]
-        for t in q:
-            dist[t] = 0
+        cores = [t for t in range(N) if bid[t] >= 0 and btm[t] == team and bty[t] == CORE]
+        blocked = [False] * N
+        free = [terrain[t] == T_EMPTY and (bid[t] < 0 or (btm[t] == team and (bty[t] == CONVEYOR or bty[t] == SPLITTER)))
+                for t in range(N)]
 
-        def passable(t):
-            if terrain[t] != T_EMPTY:
-                return False
-            if bid[t] < 0:
-                return True
-            return btm[t] == team and (bty[t] == CONVEYOR or bty[t] == SPLITTER)
-
-        h = 0
-        while h < len(q):
-            t = q[h]; h += 1
-            x, y = t % W, t // W
-            for dx, dy in _NXY:
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < W and 0 <= ny < H:
-                    nt = ny * W + nx
-                    if dist[nt] < 0 and passable(nt):
-                        dist[nt] = dist[t] + 1
-                        q.append(nt)
-        plan = [0] * N
-        for s in range(N):
-            if terrain[s] != T_ORE_TI and terrain[s] != T_ORE_VO:
-                continue
-            if bid[s] >= 0 and not (btm[s] == team and bty[s] == HARVESTER):
-                continue
-            sx, sy = s % W, s // W
-            best, bd = -1, 1 << 30
-            for dx, dy in _NXY:
-                nx, ny = sx + dx, sy + dy
-                if 0 <= nx < W and 0 <= ny < H:
-                    nt = ny * W + nx
-                    if 0 <= dist[nt] < bd:
-                        best, bd = nt, dist[nt]
-            if best < 0 or bd == 0:
-                continue
-            c = best
-            while dist[c] > 0:
-                x, y = c % W, c // W
-                for k, (dx, dy) in enumerate(_NXY):
+        def bfs():
+            dist = [-1] * N
+            q = list(cores)
+            for t in q:
+                dist[t] = 0
+            h = 0
+            while h < len(q):
+                t = q[h]; h += 1
+                x, y = t % W, t // W
+                for dx, dy in _NXY:
                     nx, ny = x + dx, y + dy
-                    if 0 <= nx < W and 0 <= ny < H and dist[ny * W + nx] == dist[c] - 1:
-                        if plan[c] == 0:
-                            plan[c] = _NDIR[k]
-                        c = ny * W + nx
-                        break
+                    if 0 <= nx < W and 0 <= ny < H:
+                        nt = ny * W + nx
+                        if dist[nt] < 0 and free[nt] and not blocked[nt]:
+                            dist[nt] = dist[t] + 1
+                            q.append(nt)
+            return dist
+
+        dist = bfs()
+        plan = [0] * N
+        owner = [-1] * N
+        load = [0] * N
+        for pas in (0, 1):
+            for s in range(N):
+                if terrain[s] != T_ORE_TI and terrain[s] != T_ORE_VO:
+                    continue
+                harv = bid[s] >= 0 and btm[s] == team and bty[s] == HARVESTER
+                if bid[s] >= 0 and not harv:
+                    continue
+                if harv != (pas == 0):
+                    continue
+                sx, sy = s % W, s // W
+                best, bd = -1, 1 << 30
+                for dx, dy in _NXY:
+                    nx, ny = sx + dx, sy + dy
+                    if 0 <= nx < W and 0 <= ny < H:
+                        nt = ny * W + nx
+                        if 0 <= dist[nt] < bd:
+                            best, bd = nt, dist[nt]
+                if best < 0 or bd == 0:
+                    continue
+                path = []
+                c, joined = best, -1
+                while dist[c] > 0:
+                    if plan[c] != 0 and joined < 0:
+                        joined = owner[c]
+                    x, y = c % W, c // W
+                    for k, (dx, dy) in enumerate(_NXY):
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < W and 0 <= ny < H and dist[ny * W + nx] == dist[c] - 1:
+                            if plan[c] == 0:
+                                plan[c] = _NDIR[k]
+                                path.append(c)
+                            if dist[c] == 1 and joined < 0:
+                                joined = c
+                            c = ny * W + nx
+                            break
+                for t in path:
+                    owner[t] = joined
+                if harv:
+                    load[joined] += 1
+                    if load[joined] == LINE_CAP:
+                        for t in range(N):
+                            if owner[t] == joined:
+                                blocked[t] = True
+                        dist = bfs()
         return plan
 
     def encode(self, ad):

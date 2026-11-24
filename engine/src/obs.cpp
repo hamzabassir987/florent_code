@@ -466,7 +466,10 @@ static bool has(const std::vector<int>& v, int x) {
     return false;
 }
 
-// Conveyor planner (identical in bots/econ/encoder.py, checked by obs_parity):
+// Conveyor planner (identical in bots/econ/encoder.py, checked by obs_parity).
+// A line moves at most 1 stack per round and a harvester makes 1 per 4 rounds,
+// so a line takes at most LINE_CAP = 4 harvesters (see the loop below).
+//
 // only what this unit remembers. A BFS from the remembered own-core tiles
 // (distance 0) over known EMPTY tiles that hold no building, or the team's own
 // conveyor / splitter; neighbours in N, E, S, W order. Then for every known ore
@@ -480,29 +483,41 @@ void ObsMemory::plan_paths(std::vector<int8_t>& plan) const {
     plan.assign(N, 0);
     static const int NX[4] = {0, 1, 0, -1}, NY[4] = {-1, 0, 1, 0};
     static const int8_t NDIR[4] = {1, 3, 5, 7};          // Dir codes of N, E, S, W (a local N below is the tile count)
-    std::vector<int> dist(N, -1), q;
+    std::vector<int> dist(N, -1), q, owner(N, -1), load(N, 0), path;
+    std::vector<char> blocked(N, 0);
     q.reserve(N);
-    for (int t = 0; t < N; t++)
-        if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == CORE) { dist[t] = 0; q.push_back(t); }
     auto passable = [&](int t) {
-        if (terrain[t] != T_EMPTY) return false;
+        if (blocked[t] || terrain[t] != T_EMPTY) return false;
         if (bld_id[t] < 0) return true;
         return bld_team[t] == team && (bld_type[t] == CONVEYOR || bld_type[t] == SPLITTER);
     };
-    for (size_t h = 0; h < q.size(); h++) {
-        const int t = q[h], x = t % W, y = t / W;
-        for (int k = 0; k < 4; k++) {
-            const int nx = x + NX[k], ny = y + NY[k];
-            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
-            const int nt = ny * W + nx;
-            if (dist[nt] >= 0 || !passable(nt)) continue;
-            dist[nt] = dist[t] + 1;
-            q.push_back(nt);
+    auto bfs = [&]() {
+        std::fill(dist.begin(), dist.end(), -1);
+        q.clear();
+        for (int t = 0; t < N; t++)
+            if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == CORE) { dist[t] = 0; q.push_back(t); }
+        for (size_t h = 0; h < q.size(); h++) {
+            const int t = q[h], x = t % W, y = t / W;
+            for (int k = 0; k < 4; k++) {
+                const int nx = x + NX[k], ny = y + NY[k];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                const int nt = ny * W + nx;
+                if (dist[nt] >= 0 || !passable(nt)) continue;
+                dist[nt] = dist[t] + 1;
+                q.push_back(nt);
+            }
         }
-    }
+    };
+    bfs();
+    // own harvesters first (row-major), then free ore: a line (the path's last
+    // tile before the core) carries at most LINE_CAP harvesters; once full, its
+    // tiles are closed and later sources are planned around it
+    for (int pass = 0; pass < 2; pass++)
     for (int s = 0; s < N; s++) {
         if (terrain[s] != T_ORE_TI && terrain[s] != T_ORE_VO) continue;
-        if (bld_id[s] >= 0 && !(bld_team[s] == team && bld_type[s] == HARVESTER)) continue;
+        const bool harv = bld_id[s] >= 0 && bld_team[s] == team && bld_type[s] == HARVESTER;
+        if (bld_id[s] >= 0 && !harv) continue;
+        if (harv != (pass == 0)) continue;
         const int sx = s % W, sy = s / W;
         int best = -1, bd = 1 << 30;
         for (int k = 0; k < 4; k++) {
@@ -512,8 +527,10 @@ void ObsMemory::plan_paths(std::vector<int8_t>& plan) const {
             if (dist[nt] >= 0 && dist[nt] < bd) { best = nt; bd = dist[nt]; }
         }
         if (best < 0 || bd == 0) continue;
-        int c = best;
+        path.clear();
+        int c = best, joined = -1;
         while (dist[c] > 0) {
+            if (plan[c] != 0 && joined < 0) joined = owner[c];   // from here the flow follows the earlier path
             const int x = c % W, y = c / W;
             int nxt = -1, kk = -1;
             for (int k = 0; k < 4; k++) {
@@ -522,8 +539,14 @@ void ObsMemory::plan_paths(std::vector<int8_t>& plan) const {
                 const int nt = ny * W + nx;
                 if (dist[nt] == dist[c] - 1) { nxt = nt; kk = k; break; }
             }
-            if (plan[c] == 0) plan[c] = NDIR[kk];
+            if (plan[c] == 0) { plan[c] = NDIR[kk]; path.push_back(c); }
+            if (dist[c] == 1 && joined < 0) joined = c;
             c = nxt;
+        }
+        for (int t : path) owner[t] = joined;
+        if (harv && ++load[joined] == LINE_CAP) {
+            for (int t = 0; t < N; t++) if (owner[t] == joined) blocked[t] = 1;
+            bfs();
         }
     }
 }
