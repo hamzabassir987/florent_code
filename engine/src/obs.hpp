@@ -14,6 +14,7 @@
 //    per unit.
 #pragma once
 #include <cstdint>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -77,6 +78,18 @@ struct ObsMemory {
     std::vector<int8_t> bot_dir;
     std::vector<int16_t> bot_hp;
     std::vector<int32_t> attr_seen_round; // last round entity attributes were observed
+
+    // ---- team report bus (the 16-slot team store; docs/team-memory.md).
+    // A report is one u32: bit 31 marker, bit 30 removal, bits 26..29
+    // category (REP_*), bits 0..10 tile index. Each turn a unit merges the
+    // store snapshot (merge_store), updates its memory from its own vision
+    // (update, which also queues the new reportable facts it saw), then posts
+    // its most important queued report (next_report; the caller writes it to
+    // slot (unit id + round) % 16). A queued report leaves the queue once the
+    // snapshot shows it. Identical in bots/econ/encoder.py.
+    std::set<uint32_t> known, pending;
+    void merge_store(const int64_t* store16);
+    uint32_t next_report() const;           // 0: nothing to post
 
     void init(const Game& g, int team_);
     // Conveyor plan from this memory (see plan_paths in obs.cpp): per tile the

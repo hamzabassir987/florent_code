@@ -1,6 +1,7 @@
 #include "obs.hpp"
 
 #include <algorithm>
+#include <tuple>
 #include <cmath>
 
 namespace fe {
@@ -25,11 +26,74 @@ void ObsMemory::init(const Game& g, int team_) {
     attr_seen_round.assign(n, -1);
 }
 
+// ---------------------------------------------------------------- report bus
+static constexpr uint32_t REP_MARK = 1u << 31, REP_REMOVE = 1u << 30;
+enum : int { REP_ORE_TI = 1, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE };
+static int rep_cat_of_type(int type) {
+    switch (type) {
+    case CORE: return REP_CORE; case GUNNER: return REP_GUNNER; case SENTINEL: return REP_SENTINEL;
+    case LAUNCHER: return REP_LAUNCHER; case SPIKE: return REP_SPIKE; default: return 0;
+    }
+}
+static int rep_type_of_cat(int cat) {
+    switch (cat) {
+    case REP_CORE: return CORE; case REP_GUNNER: return GUNNER; case REP_SENTINEL: return SENTINEL;
+    case REP_LAUNCHER: return LAUNCHER; case REP_SPIKE: return SPIKE; default: return -1;
+    }
+}
+static uint32_t rep_pack(int cat, int t, bool remove) { return REP_MARK | (remove ? REP_REMOVE : 0u) | (uint32_t(cat) << 26) | uint32_t(t); }
+static int rep_rank(uint32_t p) { int c = (p >> 26) & 15; return c == REP_CORE ? 0 : (c >= REP_GUNNER ? 1 : 2); }
+
+static void rep_note(std::set<uint32_t>& known, uint32_t p) { known.insert(p); known.erase(p ^ REP_REMOVE); }
+
+void ObsMemory::merge_store(const int64_t* store) {
+    for (int i = 0; i < 16; i++) {
+        const int64_t v = store[i];
+        if (v < 0 || v > 0xFFFFFFFFll || !(uint64_t(v) & REP_MARK)) continue;
+        const uint32_t p = uint32_t(v);
+        const int cat = (p >> 26) & 15, t = p & 0x7FF;
+        const bool remove = p & REP_REMOVE;
+        if (cat < REP_ORE_TI || cat > REP_SPIKE || t >= W * H) continue;
+        rep_note(known, p);
+        pending.erase(p);
+        if (cat == REP_ORE_TI || cat == REP_ORE_VO) {
+            if (!remove && terrain[t] == T_UNKNOWN) terrain[t] = cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO;
+            continue;
+        }
+        const int type = rep_type_of_cat(cat), enemy = 1 - team;
+        if (remove) {
+            if (bld_id[t] >= 0 && bld_team[t] == enemy && bld_type[t] == type) {
+                bld_id[t] = -1; bld_type[t] = -1; bld_team[t] = -1; bld_dir[t] = -1; bld_hp[t] = -1;
+            }
+        } else if (bld_id[t] < 0) {
+            // a reported enemy building: a core keeps its real id (team + 1), so
+            // its 4 tiles count once; a turret gets a per-tile id. Direction and
+            // HP unknown; attribute age untouched (not seen by this unit).
+            bld_id[t] = type == CORE ? enemy + 1 : (1 << 30) + t;
+            bld_type[t] = int8_t(type); bld_team[t] = int8_t(enemy);
+            bld_dir[t] = -1; bld_hp[t] = 100;
+            if (terrain[t] == T_UNKNOWN) terrain[t] = T_EMPTY;
+        }
+    }
+}
+
+uint32_t ObsMemory::next_report() const {
+    uint32_t best = 0;
+    for (uint32_t p : pending) {
+        if (!best) { best = p; continue; }
+        const auto key = [](uint32_t q) { return std::make_tuple(rep_rank(q), int(q & 0x7FF), int((q >> 30) & 1), int((q >> 26) & 15)); };
+        if (key(p) < key(best)) best = p;
+    }
+    return best;
+}
+
 void ObsMemory::update(const Game& g, int actor) {
     std::vector<int> tiles;
     g.nearby_tiles(actor, -1, tiles);
+    auto fact = [&](uint32_t p) { pending.erase(p ^ REP_REMOVE); if (!known.count(p)) pending.insert(p); };
     for (int t : tiles) {
         int x = t % g.W, y = t / g.W;
+        const int old_id = bld_id[t], old_type = bld_type[t], old_team = bld_team[t];
         uint8_t e = g.env[t];
         terrain[t] = e == WALL ? T_WALL
                    : e == ORE_TI ? T_ORE_TI
@@ -69,6 +133,12 @@ void ObsMemory::update(const Game& g, int actor) {
             bot_hp[t] = -1;
         }
         seen_round[t] = g.round;
+        // reportable facts seen now
+        if (terrain[t] == T_ORE_TI || terrain[t] == T_ORE_VO) fact(rep_pack(terrain[t] == T_ORE_TI ? REP_ORE_TI : REP_ORE_VO, t, false));
+        const int cat_now = (bld_id[t] >= 0 && bld_team[t] != team) ? rep_cat_of_type(bld_type[t]) : 0;
+        if (cat_now) fact(rep_pack(cat_now, t, false));
+        const int cat_old = (old_id >= 0 && old_team != team) ? rep_cat_of_type(old_type) : 0;
+        if (cat_old && cat_old != cat_now) fact(rep_pack(cat_old, t, true));
     }
 }
 

@@ -34,3 +34,22 @@ rounds and are stale after three rounds. Conveyors are not broadcast.
 
 A resource's symmetric counterpart is only a candidate until the receiver's
 observed terrain validates the symmetry; no hidden map state is assumed.
+
+## Learned-policy report bus
+
+The learned policy (training and `bots/econ` learned turns) uses its own bus
+on the same 16 slots, implemented identically in `ObsMemory` (engine/src/obs.cpp)
+and `bots/econ/encoder.py`, checked by `engine/tools/obs_parity.py`.
+
+- Report: one u32. Bit 31 marker (the heuristic packets above never set it),
+  bit 30 removal, bits 26..29 category (1 Ti ore, 2 Vo ore, 3 enemy core,
+  4 gunner, 5 sentinel, 6 launcher, 7 spike: enemy buildings), bits 0..10 tile.
+- Each turn a unit: merges every marked report in the snapshot into its memory
+  (ore into unknown terrain; enemy buildings added / removed; a reported core
+  keeps its real id, team + 1), updates its memory from its own vision, queues
+  the reportable facts it sees that the snapshot does not show, and writes the
+  most important one (core, then turrets, then ore; lowest tile first) to slot
+  (unit id + round) % 16. A queued report leaves the queue once a snapshot
+  shows it, so an overwritten report is posted again.
+- Reported (not seen) buildings have no direction and an unchanged attribute
+  age: the policy can tell them from what the unit saw itself.

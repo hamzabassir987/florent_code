@@ -43,6 +43,7 @@ def load_lib():
     L.fe_find.restype = ctypes.c_int
     L.fe_get_store.restype = ctypes.c_longlong
     L.fe_obs_new.restype = ctypes.c_void_p
+    L.fe_obs_next_report.restype = ctypes.c_longlong
     return L
 
 
@@ -246,8 +247,21 @@ def run_game(L, map_path, seed, rounds, rng, stats):
                     cpp_mem[a] = ctypes.c_void_p(L.fe_obs_new(g, tm))
                     py_mem[a] = E.ObsMemory(W, H, tm)
                 ad = EngineAdapter(L, g, a)
+                # team report bus: both merge the same store snapshot, see, choose a report
+                snap = [L.fe_get_store(g, tm, i) for i in range(16)]
+                L.fe_obs_merge(cpp_mem[a], (ctypes.c_longlong * 16)(*snap))
+                py_mem[a].merge_store(snap)
                 L.fe_obs_update(cpp_mem[a], g, a)
                 py_mem[a].update(ad)
+                c_rep, p_rep = L.fe_obs_next_report(cpp_mem[a]), py_mem[a].next_report()
+                if c_rep != p_rep:
+                    stats["bad"] += 1
+                    print("  REPORT mismatch r", r, "unit", aid, c_rep, p_rep)
+                if c_rep:
+                    L.fe_write_store(g, tm, (aid + L.fe_round(g)) % 16, ctypes.c_longlong(c_rep))
+                    stats["reports"] = stats.get("reports", 0) + 1
+                    if (c_rep >> 26) & 15 >= 3:
+                        stats["building_reports"] = stats.get("building_reports", 0) + 1
                 L.fe_obs_encode(cpp_mem[a], g, a, cbuf, sbuf)
                 pch, psc = py_mem[a].encode(ad)
                 bad = compare("actor", list(cbuf), list(sbuf), pch, psc, r, aid, typ, stats)
@@ -522,6 +536,7 @@ def main():
     print(f"critic checks: {stats['critic_checks']}, failures: {stats['critic_bad']}")
     print(f"visit-history checks: {stats['visit_checks']}")
     print(f"encodings with a planned conveyor path: {stats.get('path_encodings', 0)}")
+    print(f"team reports posted: {stats.get('reports', 0)} (enemy buildings: {stats.get('building_reports', 0)})")
     print(f"turret/core reach checks: {stats['turret_core_checks']}")
     print(f"python encode: median {med:.3f} ms, p95 {p95:.3f} ms per unit")
     print(f"elapsed {time.time() - t0:.1f}s")

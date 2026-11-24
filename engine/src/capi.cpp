@@ -95,6 +95,12 @@ void* fe_obs_new(Game* g, int team) {
 }
 void fe_obs_free(void* p) { delete reinterpret_cast<fe::ObsMemory*>(p); }
 void fe_obs_update(void* p, Game* g, int actor) { reinterpret_cast<fe::ObsMemory*>(p)->update(*g, actor); }
+// report bus (parity tests): merge a 16-value store snapshot; the report to post (0: none)
+void fe_obs_merge(void* p, const long long* store16) {
+    int64_t s[16]; for (int i = 0; i < 16; i++) s[i] = store16[i];
+    reinterpret_cast<fe::ObsMemory*>(p)->merge_store(s);
+}
+long long fe_obs_next_report(void* p) { return (long long)reinterpret_cast<fe::ObsMemory*>(p)->next_report(); }
 int fe_obs_ch() { return fe::ACTOR_CH; }
 int fe_obs_patch() { return fe::PATCH; }
 int fe_obs_spatial() { return fe::ACTOR_SPATIAL; }

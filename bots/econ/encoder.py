@@ -54,6 +54,24 @@ def ray_path(x0, y0, dx, dy, maxlen=RAY_LEN):
     return out
 
 
+# ---- team report bus (identical to ObsMemory::merge_store / next_report /
+# the fact collection in ObsMemory::update, engine/src/obs.cpp). A report is one
+# u32: bit 31 marker, bit 30 removal, bits 26..29 category, bits 0..10 tile.
+REP_MARK, REP_REMOVE = 1 << 31, 1 << 30
+REP_ORE_TI, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE = range(1, 8)
+_REP_CAT = {CORE: REP_CORE, GUNNER: REP_GUNNER, SENTINEL: REP_SENTINEL, LAUNCHER: REP_LAUNCHER, SPIKE: REP_SPIKE}
+_REP_TYPE = {v: k for k, v in _REP_CAT.items()}
+
+
+def rep_pack(cat, t, remove):
+    return REP_MARK | (REP_REMOVE if remove else 0) | (cat << 26) | t
+
+
+def _rep_key(p):
+    c = (p >> 26) & 15
+    return (0 if c == REP_CORE else (1 if c >= REP_GUNNER else 2), p & 0x7FF, (p >> 30) & 1, c)
+
+
 class ObsMemory:
     def __init__(self, W, H, team):
         self.W, self.H, self.team = W, H, team
@@ -70,11 +88,51 @@ class ObsMemory:
         self.seen_round = [-1] * n
         self.visit_round = [-1] * n
         self.attr_seen_round = [-1] * n
+        self.known, self.pending = set(), set()
+
+    def merge_store(self, store):
+        """Apply the team store snapshot (16 values): every report merges into memory."""
+        n, enemy = self.W * self.H, 1 - self.team
+        for v in store:
+            if v < 0 or v > 0xFFFFFFFF or not (v & REP_MARK):
+                continue
+            cat, t, remove = (v >> 26) & 15, v & 0x7FF, bool(v & REP_REMOVE)
+            if cat < REP_ORE_TI or cat > REP_SPIKE or t >= n:
+                continue
+            self.known.add(v)
+            self.known.discard(v ^ REP_REMOVE)
+            self.pending.discard(v)
+            if cat in (REP_ORE_TI, REP_ORE_VO):
+                if not remove and self.terrain[t] == T_UNKNOWN:
+                    self.terrain[t] = T_ORE_TI if cat == REP_ORE_TI else T_ORE_VO
+                continue
+            typ = _REP_TYPE[cat]
+            if remove:
+                if self.bld_id[t] >= 0 and self.bld_team[t] == enemy and self.bld_type[t] == typ:
+                    self.bld_id[t] = self.bld_type[t] = self.bld_team[t] = -1
+                    self.bld_dir[t] = self.bld_hp[t] = -1
+            elif self.bld_id[t] < 0:
+                self.bld_id[t] = enemy + 1 if typ == CORE else (1 << 30) + t
+                self.bld_type[t], self.bld_team[t] = typ, enemy
+                self.bld_dir[t], self.bld_hp[t] = -1, 100
+                if self.terrain[t] == T_UNKNOWN:
+                    self.terrain[t] = T_EMPTY
+
+    def next_report(self):
+        """The queued report to post this turn (0: none)."""
+        return min(self.pending, key=_rep_key) if self.pending else 0
+
+    def _fact(self, p):
+        self.pending.discard(p ^ REP_REMOVE)
+        if p not in self.known:
+            self.pending.add(p)
 
     def update(self, ad):
         r, W = ad.current_round(), self.W
+        team = self.team
         for x, y in ad.visible_tiles():
             t = y * W + x
+            old_id, old_type, old_team = self.bld_id[t], self.bld_type[t], self.bld_team[t]
             self.terrain[t] = ad.tile_terrain(x, y)
             b = ad.building_id(x, y)
             if b is None:
@@ -98,6 +156,16 @@ class ObsMemory:
                 self.bot_hp[t] = ad.entity_hp_percent(u)
                 self.attr_seen_round[t] = r
             self.seen_round[t] = r
+            # reportable facts seen now
+            ter = self.terrain[t]
+            if ter == T_ORE_TI or ter == T_ORE_VO:
+                self._fact(rep_pack(REP_ORE_TI if ter == T_ORE_TI else REP_ORE_VO, t, False))
+            cat_now = _REP_CAT.get(self.bld_type[t], 0) if self.bld_id[t] >= 0 and self.bld_team[t] != team else 0
+            if cat_now:
+                self._fact(rep_pack(cat_now, t, False))
+            cat_old = _REP_CAT.get(old_type, 0) if old_id >= 0 and old_team != team else 0
+            if cat_old and cat_old != cat_now:
+                self._fact(rep_pack(cat_old, t, True))
 
     def plan_paths(self):
         """Conveyor planner, identical to ObsMemory::plan_paths (engine/src/obs.cpp):
@@ -315,8 +383,9 @@ class ObsMemory:
         scalars[7:10] = [acd, mcd, rnd]
         scalars[10:15] = ad.team_resources(team)
         scalars[15:20] = ad.team_resources(1 - team)
-        for i in range(16):
-            scalars[20 + i] = ad.store(i)
+        for i in range(16):                      # as int32, like the engine (u32 reports set bit 31)
+            v = ad.store(i) & 0xFFFFFFFF
+            scalars[20 + i] = v - (1 << 32) if v >= (1 << 31) else v
         scalars[ACTOR_COSTS:ACTOR_COSTS + 10] = ad.costs()
         scalars[36:40] = [int(own_reaches_enemy_core), int(own_core_confirmed),
                           int(enemy_reaches_own_core), int(enemy_core_confirmed)]
@@ -461,7 +530,12 @@ class ActorEncoder:
         if memory is None:
             memory = ObsMemory(ad.W, ad.H, ad.team())
             self.memories[uid] = memory
+        # team report bus: merge the store snapshot, see, post one report
+        memory.merge_store([ct.read_store(i) for i in range(16)])
         memory.update(ad)
+        rep = memory.next_report()
+        if rep:
+            ct.write_store((uid + ct.get_current_round()) % 16, rep)
         return memory.encode(ad)
 
     def forget(self, entity_id):

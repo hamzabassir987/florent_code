@@ -9,7 +9,13 @@ int Match::terminal_reward(int team) const { if(!game.over || game.winner<0) ret
 int Match::act(int entity,const Candidate& c){ return apply_candidate(game,entity,c); }
 void Match::observe(int entity) {
     if (!memories.count(entity)) { fe::ObsMemory m; m.init(game, game.ents[entity].team); memories.emplace(entity, std::move(m)); }
-    memories.at(entity).update(game, entity);
+    fe::ObsMemory& mem = memories.at(entity);
+    // team report bus (as bots/econ/encoder.py): merge the store snapshot, see, post one report
+    const int team = game.ents[entity].team;
+    mem.merge_store(game.teams[team].store.data());
+    mem.update(game, entity);
+    if (const uint32_t rep = mem.next_report())
+        game.write_store(team, int((uint32_t(game.ents[entity].id) + uint32_t(game.round)) % 16u), int64_t(rep));
 }
 void Match::encode_only(int entity, std::vector<float>& out) {
     auto& mem=memories.at(entity);
