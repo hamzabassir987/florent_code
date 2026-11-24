@@ -44,6 +44,11 @@ inline torch::Tensor critic_scalar_scale() {
     std::vector<float> s(fe::CRITIC_SCALARS, 1.f / 10.f);  // per-type entity counts
     s[0] = 1.f / 1000.f;                                     // round
     for (int i = 1; i <= 10; i++) s[i] = 1.f / 1000.f;       // both teams' Ti/Vo/ammo/scale/units
+    const int e = fe::CRITIC_SCALARS - fe::CRITIC_EXTRA;
+    s[e + 0] = 1.f / 100.f;                                  // rounds left
+    for (int i = 1; i <= 4; i++) s[e + i] = 1.f / 100.f;     // Ti / Vo collected per team
+    s[e + 5] = 1.f / 10.f;                                   // Ti collected, A - B
+    s[e + 6] = 1.f / 10.f;                                   // Ti stored, A - B
     return torch::tensor(s).view({1, fe::CRITIC_SCALARS});
 }
 

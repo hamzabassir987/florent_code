@@ -89,7 +89,11 @@ constexpr int CC_ENEMY = 11;
 constexpr int CC_OCC = 2;            // builder bots
 constexpr int CRITIC_CH = CC_TERRAIN + CC_OWN + CC_ENEMY + CC_OCC;   // 29
 constexpr int CRITIC_SPATIAL = CRITIC_CH * CRITIC_PAD * CRITIC_PAD;
-constexpr int CRITIC_SCALARS = 1 + 10 + 2 * NTYPES;
+// round, 5 per team (Ti, Vo, ammo, scale, units), entity counts per team and
+// type, then what decides a game at the round limit: rounds left, Ti / Vo
+// collected per team, and the A - B differences of Ti collected and Ti stored.
+constexpr int CRITIC_EXTRA = 7;
+constexpr int CRITIC_SCALARS = 1 + 10 + 2 * NTYPES + CRITIC_EXTRA;
 
 void encode_critic(const Game& g, std::vector<int32_t>& ch, std::vector<int32_t>& scalars);
 

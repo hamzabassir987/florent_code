@@ -319,6 +319,14 @@ void encode_critic(const Game& g, std::vector<int32_t>& ch, std::vector<int32_t>
         if (!ent.alive) continue;
         scalars[base + ent.team * NTYPES + ent.type]++;
     }
+    const int e = base + 2 * NTYPES;
+    scalars[e + 0] = std::max(0, g.max_turns - g.round);                  // rounds left
+    scalars[e + 1] = g.teams[0].ti_collected;
+    scalars[e + 2] = g.teams[1].ti_collected;
+    scalars[e + 3] = g.teams[0].vo_collected;
+    scalars[e + 4] = g.teams[1].vo_collected;
+    scalars[e + 5] = g.teams[0].ti_collected - g.teams[1].ti_collected;   // first tie-break
+    scalars[e + 6] = g.teams[0].ti - g.teams[1].ti;                        // third tie-break
 }
 
 }  // namespace fe
