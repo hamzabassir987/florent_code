@@ -173,8 +173,13 @@ class ObsMemory:
                         self.terrain[tt] = ore
                     self.learn_terrain(tt)
                 continue
-            if bits:
+            # non-ore reports carry the sender's map symmetry in bits 11..12 (0 unknown, else sym + 1)
+            if bits & ~3:
                 continue
+            ss = bits & 3
+            if ss and self.sym < 0 and (self.sym_alive >> (ss - 1)) & 1:
+                self.sym_alive = 1 << (ss - 1)
+            v &= ~(0x7FFF << 11)                     # the fact itself
             self.known.add(v)
             self.known.discard(v ^ REP_REMOVE)
             self.pending.discard(v)
@@ -224,7 +229,7 @@ class ObsMemory:
             best = min(self.pending, key=_rep_key)
             cat = (best >> 26) & 15
             ore = cat in (REP_ORE_TI, REP_ORE_VO)
-            return k % 16, (self.ore_report(best) if ore else best)
+            return k % 16, (self.ore_report(best) if ore else best | self.sym_bits())
         if k % 4:
             return None
         enemy, live = 1 - self.team, []
@@ -244,7 +249,11 @@ class ObsMemory:
             return None
         f = live[(k // 4) % len(live)]
         ore = ((f >> 26) & 15) in (REP_ORE_TI, REP_ORE_VO)
-        return (k // 4) % 16, (self.ore_report(f) if ore else f)
+        return (k // 4) % 16, (self.ore_report(f) if ore else f | self.sym_bits())
+
+    def sym_bits(self):
+        """Non-ore reports carry the map symmetry: bits 11..12 = sym + 1 (0 unknown)."""
+        return (self.sym + 1) << 11 if self.sym >= 0 else 0
 
     def own_count(self, typ):
         """Own buildings of a type in memory (seen or reported)."""

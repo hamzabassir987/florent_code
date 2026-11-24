@@ -90,9 +90,12 @@ struct ObsMemory {
     bool next_report(uint64_t unit_id, int round, int& slot, uint32_t& report) const;
     uint32_t ore_report(uint32_t fact) const;
     int own_count(int type) const;          // own buildings of a type in memory (seen or reported)
+    // non-ore reports carry the map symmetry: bits 11..12 = sym + 1 (0 unknown)
+    uint32_t sym_bits() const { return sym >= 0 ? uint32_t(sym + 1) << 11 : 0u; }
     // map symmetry (0: 180 rotation, 1: mirror x, 2: mirror y): candidates
-    // still consistent with the known terrain; once one is left, known tiles are
-    // mirrored and the enemy core is placed on the mirror of ours.
+    // still consistent with the known terrain (or adopted from a teammate's
+    // report); once one is left, known tiles are mirrored and the enemy core is
+    // placed on the mirror of ours.
     uint8_t sym_alive = 7;
     int sym = -1;
     int mirror(int t, int s) const;

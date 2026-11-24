@@ -48,6 +48,9 @@ takes part every turn: core, builders, gunners, sentinels, launchers and spikes.
   launchers, for the launcher cap of 3), bits 0..10 tile.
 - Report (store word): a fact; for ore, plus bits 11..25 = the other cells of
   the 4x4 block right / below the anchor holding the same ore (one cluster per report).
+  Every non-ore report (fresh or reposted) carries the sender's map symmetry in
+  bits 11..12 (0 unknown, else sym + 1); a receiver adopts it if its own terrain
+  has not ruled it out.
 - Each turn a unit: merges every marked report in the snapshot into its memory
   (ore into unknown terrain; enemy buildings added / removed; a reported core
   keeps its real id, team + 1), updates its memory from its own vision, queues

@@ -143,9 +143,12 @@ void ObsMemory::merge_store(const int64_t* store) {
             }
             continue;
         }
-        if (bits) continue;
-        rep_note(known, p);
-        pending.erase(p);
+        // non-ore reports carry the sender's map symmetry in bits 11..12 (0 unknown, else sym + 1)
+        if (bits & ~3u) continue;
+        if (const int ss = int(bits & 3u); ss && sym < 0 && (sym_alive >> (ss - 1) & 1)) sym_alive = uint8_t(1u << (ss - 1));
+        const uint32_t f = p & ~(0x7FFFu << 11);     // the fact itself
+        rep_note(known, f);
+        pending.erase(f);
         if (cat == REP_OWN_LAUNCHER) {
             if (remove) {
                 if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == LAUNCHER) {
@@ -198,7 +201,7 @@ bool ObsMemory::next_report(uint64_t unit_id, int round, int& slot, uint32_t& re
         const auto key = [](uint32_t q) { return std::make_tuple(rep_rank(q), int(q & 0x7FF), int((q >> 30) & 1), int((q >> 26) & 15)); };
         for (uint32_t f : pending) if (!best || key(f) < key(best)) best = f;
         const int cat = (best >> 26) & 15;
-        report = rep_is_ore(cat) ? ore_report(best) : best;
+        report = rep_is_ore(cat) ? ore_report(best) : (best | sym_bits());
         slot = int(k % 16);
         return true;
     }
@@ -214,7 +217,7 @@ bool ObsMemory::next_report(uint64_t unit_id, int round, int& slot, uint32_t& re
     }
     if (live.empty()) return false;
     const uint32_t f = live[(k / 4) % live.size()];
-    report = rep_is_ore((f >> 26) & 15) ? ore_report(f) : f;
+    report = rep_is_ore((f >> 26) & 15) ? ore_report(f) : (f | sym_bits());
     slot = int((k / 4) % 16);
     return true;
 }
