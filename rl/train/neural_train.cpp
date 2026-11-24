@@ -40,6 +40,7 @@
 #ifdef FLORENT_CUDA_GRAPHS
 #include <ATen/cuda/CUDAEvent.h>
 #include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #endif
@@ -403,21 +404,52 @@ static RollIO g_io;
 static std::vector<c10::cuda::CUDAStream> g_group_streams;   // one per (net, policy) group of a step
 #endif
 
-// Decision inputs kept for PPO, on the device (grown as needed, reused across iterations).
+// Decision inputs kept for PPO, on the device, reused across iterations.
+// Memory: sized before each rollout (prepare: the previous rollout's count +
+// 10%, or an estimate), with the old buffer released first, so a full store is
+// never copied into a bigger one in the middle of a rollout. If it must still
+// grow and the device is out of memory (or past STORE_GB), the store stays
+// full: further decisions of that rollout are played but not recorded.
 struct SampleStore {
     torch::Tensor sp, sc;
-    long n = 0, cap = 0;
-    void reserve(long need, torch::Device dev) {
-        if (need <= cap) return;
-        const long nc = std::max(need, cap + cap / 2 + 4096);
+    long n = 0, cap = 0, limit = -1;   // limit: max rows (STORE_GB), -1 none
+    bool full = false;
+    long skipped = 0;
+    static constexpr long ROW = fe::ACTOR_SPATIAL + 2 * fe::ACTOR_SCALARS;
+    bool alloc(long nc, torch::Device dev, bool keep) {
+        if (limit >= 0) nc = std::min(nc, limit);
+        if (nc <= cap) return false;
         auto o = torch::TensorOptions().device(dev);
-        auto nsp = torch::empty({nc, fe::ACTOR_SPATIAL}, o.dtype(torch::kUInt8));
-        auto nsc = torch::empty({nc, fe::ACTOR_SCALARS}, o.dtype(torch::kInt16));
-        if (n > 0) { nsp.narrow(0, 0, n).copy_(sp.narrow(0, 0, n)); nsc.narrow(0, 0, n).copy_(sc.narrow(0, 0, n)); }
-        sp = nsp; sc = nsc; cap = nc;
+        try {
+            if (!keep) { sp = torch::Tensor(); sc = torch::Tensor(); cap = 0;
+#ifdef FLORENT_CUDA_GRAPHS
+                if (dev.is_cuda()) c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
+            }
+            auto nsp = torch::empty({nc, fe::ACTOR_SPATIAL}, o.dtype(torch::kUInt8));
+            auto nsc = torch::empty({nc, fe::ACTOR_SCALARS}, o.dtype(torch::kInt16));
+            if (keep && n > 0) { nsp.narrow(0, 0, n).copy_(sp.narrow(0, 0, n)); nsc.narrow(0, 0, n).copy_(sc.narrow(0, 0, n)); }
+            sp = nsp; sc = nsc; cap = nc;
+            return true;
+        } catch (const c10::Error&) {
+            return false;                  // out of memory: keep what we have
+        }
+    }
+    // before a rollout: empty, sized for `expect` rows
+    void prepare(long expect, torch::Device dev) {
+        n = 0; full = false; skipped = 0;
+        if (expect > cap) alloc(expect, dev, /*keep=*/false);
+    }
+    // room for `need` rows? (grows if it can; else the store is full)
+    bool reserve(long need, torch::Device dev) {
+        if (need <= cap) return true;
+        if (full) return false;
+        if (!alloc(std::max(need, cap + cap / 4 + 4096), dev, /*keep=*/true)) { full = true; return need <= cap; }
+        return true;
     }
 };
 static SampleStore g_store;
+static long g_store_last = 0;          // rows the previous rollout wanted (recorded + skipped)
 
 // ===========================================================================
 // ROLLOUT FORWARD, with CUDA graphs
@@ -630,7 +662,12 @@ static PlayStats play(std::vector<Slot>& slots, const Setup& S, const std::vecto
         s.lg = g_io.h_lg.data_ptr<float>() + long(i) * LW;
     }
     const bool store = train && kept;
-    if (store) g_store.n = 0;
+    if (store) {
+        // the previous rollout's count + 10%, or ~16 recorded decisions per game-round
+        const long expect = g_store_last > 0 ? g_store_last + g_store_last / 10
+                                             : long(double(G) * std::max(1, stretch) * 16 * S.record_p);
+        g_store.prepare(expect, dev);
+    }
     CriticRun crun;
     c10::InferenceMode im;
     for (;;) {
@@ -693,9 +730,14 @@ static PlayStats play(std::vector<Slot>& slots, const Setup& S, const std::vecto
             std::vector<long> from, to;
             for (int i = 0; i < G; i++)
                 if (slots[i].recorded) { slots[i].recorded = false; slots[i].samples.back().row = g_store.n + long(from.size()); from.push_back(i); }
+            if (!from.empty() && !g_store.reserve(g_store.n + long(from.size()), dev)) {
+                // store full: these decisions stay played but are not recorded
+                for (int i : from) slots[i].samples.pop_back();
+                g_store.skipped += long(from.size());
+                from.clear();
+            }
             if (!from.empty()) {
                 for (size_t j = 0; j < from.size(); j++) to.push_back(g_store.n + long(j));
-                g_store.reserve(g_store.n + long(from.size()), dev);
                 auto df = g_io.upload_idx(from, 2 * NUM_POLICIES * G, dev), dt = g_io.upload_idx(to, (2 * NUM_POLICIES + 1) * G, dev);
                 g_store.sp.index_copy_(0, dt, g_io.d_sp.index_select(0, df));
                 g_store.sc.index_copy_(0, dt, g_io.d_sc.index_select(0, df));
@@ -721,6 +763,7 @@ static PlayStats play(std::vector<Slot>& slots, const Setup& S, const std::vecto
         launch_critic(slots, *nets[0], dev, *cstore, crun, st);
         finish_critic(slots, *kept, *cstore, crun, st);
     }
+    if (store) g_store_last = g_store.n + g_store.skipped;
     return st;
 }
 
@@ -745,6 +788,8 @@ int main(int argc, char** argv) {
     const int N_MINI = env_int("N_MINI", 10);      // minibatches per pass (reference pipeline: 15)
     // Full-batch learner: do not split PPO minibatches into MICRO chunks.
     MICRO = env_int("MICRO", 65536);  // default: no split (the fused trunk keeps no activations, so memory allows it)
+    // STORE_GB: cap on the device sample store (GB); default: as much as fits
+    if (const char* sg = std::getenv("STORE_GB")) g_store.limit = long(std::atof(sg) * 1e9 / double(SampleStore::ROW));
     CRITIC_BATCH = std::max(1, env_int("CRITIC_BATCH", 4000));
     S.value_keep = env_float("VALUE_KEEP", 1.0f);
     S.record_p = env_float("RECORD_P", 1.0f);
@@ -847,6 +892,13 @@ int main(int argc, char** argv) {
         std::vector<ValueRow> kept;
         CriticStore cstore;
         const PlayStats ps = play(slots, S, {&net}, dev, R, /*restart=*/true, /*train=*/true, &kept, &cstore);
+        if (g_store.skipped > 0) {
+            // the store filled up: record a smaller share from the next rollout on, so
+            // what is recorded is spread over the whole rollout (not only its start)
+            const double fit = double(g_store.cap) / double(g_store.n + g_store.skipped);
+            S.record_p = float(std::max(0.01, S.record_p * fit * 0.95));
+            std::cout << "  " << lfmt::label("store") << "full at " << g_store.cap << " rows: RECORD_P -> " << S.record_p << std::endl;
+        }
 
         // ---- GAE per segment and team (team 1 sees -value)
         for (auto& s : slots)
@@ -1177,7 +1229,9 @@ int main(int argc, char** argv) {
         o << "---- iter " << it << "   lr " << K.lr << "   epochs " << EPOCHS << "   game_rounds " << K.game_rounds
           << "   ore_radius " << K.ore_radius << "\n";
         o << "  " << lfmt::label("rollout") << G << " games x " << R << " rounds   " << decisions << " decisions, "
-          << samples.size() << " recorded (" << recs << " head records)   " << kept.size() << " value rows   ~"
+          << samples.size() << " recorded (" << recs << " head records)"
+          << (g_store.skipped ? "   STORE FULL: " + std::to_string(g_store.skipped) + " not recorded (lower RECORD_P or set STORE_GB)" : std::string())
+          << "   " << kept.size() << " value rows   ~"
           << std::fixed << std::setprecision(2) << mem_gb << " GB\n" << std::defaultfloat;
         o << "  " << lfmt::label("profile") << std::fixed << std::setprecision(2) << ps.steps << " forwards   encode+engine "
           << ps.t_encode << " s   forward " << ps.t_forward << " s   decide+act " << ps.t_act << " s   critic " << ps.t_critic
