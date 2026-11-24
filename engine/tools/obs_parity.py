@@ -253,15 +253,23 @@ def run_game(L, map_path, seed, rounds, rng, stats):
                 py_mem[a].merge_store(snap)
                 L.fe_obs_update(cpp_mem[a], g, a)
                 py_mem[a].update(ad)
-                c_rep, p_rep = L.fe_obs_next_report(cpp_mem[a]), py_mem[a].next_report()
-                if c_rep != p_rep:
+                rnd = L.fe_round(g)
+                cslot = ctypes.c_int(-1)
+                c_rep = L.fe_obs_next_report(cpp_mem[a], ctypes.c_longlong(aid), rnd, ctypes.byref(cslot))
+                p_out = py_mem[a].next_report(aid, rnd)
+                c_out = (cslot.value, c_rep) if c_rep else None
+                if c_out != p_out:
                     stats["bad"] += 1
-                    print("  REPORT mismatch r", r, "unit", aid, c_rep, p_rep)
-                if c_rep:
-                    L.fe_write_store(g, tm, (aid + L.fe_round(g)) % 16, ctypes.c_longlong(c_rep))
+                    print("  REPORT mismatch r", r, "unit", aid, c_out, p_out)
+                if c_out:
+                    L.fe_write_store(g, tm, c_out[0], ctypes.c_longlong(c_out[1]))
                     stats["reports"] = stats.get("reports", 0) + 1
+                    if not py_mem[a].pending:
+                        stats["rotation_reports"] = stats.get("rotation_reports", 0) + 1
                     if (c_rep >> 26) & 15 >= 3:
                         stats["building_reports"] = stats.get("building_reports", 0) + 1
+                if py_mem[a].sym >= 0:
+                    stats["sym_known"] = stats.get("sym_known", 0) + 1
                 L.fe_obs_encode(cpp_mem[a], g, a, cbuf, sbuf)
                 pch, psc = py_mem[a].encode(ad)
                 bad = compare("actor", list(cbuf), list(sbuf), pch, psc, r, aid, typ, stats)
@@ -536,7 +544,8 @@ def main():
     print(f"critic checks: {stats['critic_checks']}, failures: {stats['critic_bad']}")
     print(f"visit-history checks: {stats['visit_checks']}")
     print(f"encodings with a planned conveyor path: {stats.get('path_encodings', 0)}")
-    print(f"team reports posted: {stats.get('reports', 0)} (enemy buildings: {stats.get('building_reports', 0)})")
+    print(f"team reports posted: {stats.get('reports', 0)} (enemy buildings: {stats.get('building_reports', 0)}, rotation: {stats.get('rotation_reports', 0)})")
+    print(f"unit turns with the map symmetry resolved: {stats.get('sym_known', 0)} of {stats['units']}")
     print(f"turret/core reach checks: {stats['turret_core_checks']}")
     print(f"python encode: median {med:.3f} ms, p95 {p95:.3f} ms per unit")
     print(f"elapsed {time.time() - t0:.1f}s")

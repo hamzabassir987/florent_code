@@ -80,16 +80,23 @@ struct ObsMemory {
     std::vector<int32_t> attr_seen_round; // last round entity attributes were observed
 
     // ---- team report bus (the 16-slot team store; docs/team-memory.md).
-    // A report is one u32: bit 31 marker, bit 30 removal, bits 26..29
-    // category (REP_*), bits 0..10 tile index. Each turn a unit merges the
-    // store snapshot (merge_store), updates its memory from its own vision
-    // (update, which also queues the new reportable facts it saw), then posts
-    // its most important queued report (next_report; the caller writes it to
-    // slot (unit id + round) % 16). A queued report leaves the queue once the
-    // snapshot shows it. Identical in bots/econ/encoder.py.
+    // Each turn a unit merges the store snapshot (merge_store), updates its
+    // memory from its own vision (update: queues the new facts it saw, applies
+    // the map symmetry), then posts one report (next_report: the caller writes
+    // it to the returned slot). Identical in bots/econ/encoder.py.
     std::set<uint32_t> known, pending;
     void merge_store(const int64_t* store16);
-    uint32_t next_report() const;           // 0: nothing to post
+    // the report to post this turn and its slot; false: nothing to post
+    bool next_report(uint64_t unit_id, int round, int& slot, uint32_t& report) const;
+    uint32_t ore_report(uint32_t fact) const;
+    // map symmetry (0: 180 rotation, 1: mirror x, 2: mirror y): candidates
+    // still consistent with the known terrain; once one is left, known tiles are
+    // mirrored and the enemy core is placed on the mirror of ours.
+    uint8_t sym_alive = 7;
+    int sym = -1;
+    int mirror(int t, int s) const;
+    void learn_terrain(int t);
+    void resolve_symmetry();
 
     void init(const Game& g, int team_);
     // Conveyor plan from this memory (see plan_paths in obs.cpp): per tile the

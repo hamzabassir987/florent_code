@@ -100,7 +100,12 @@ void fe_obs_merge(void* p, const long long* store16) {
     int64_t s[16]; for (int i = 0; i < 16; i++) s[i] = store16[i];
     reinterpret_cast<fe::ObsMemory*>(p)->merge_store(s);
 }
-long long fe_obs_next_report(void* p) { return (long long)reinterpret_cast<fe::ObsMemory*>(p)->next_report(); }
+// the report to post (0: none) and its slot
+long long fe_obs_next_report(void* p, long long unit_id, int round, int* slot) {
+    uint32_t r = 0; int sl = -1;
+    if (!reinterpret_cast<fe::ObsMemory*>(p)->next_report(uint64_t(unit_id), round, sl, r)) { *slot = -1; return 0; }
+    *slot = sl; return (long long)r;
+}
 int fe_obs_ch() { return fe::ACTOR_CH; }
 int fe_obs_patch() { return fe::PATCH; }
 int fe_obs_spatial() { return fe::ACTOR_SPATIAL; }

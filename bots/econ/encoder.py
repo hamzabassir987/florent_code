@@ -89,23 +89,95 @@ class ObsMemory:
         self.visit_round = [-1] * n
         self.attr_seen_round = [-1] * n
         self.known, self.pending = set(), set()
+        self.sym_alive, self.sym = 7, -1
 
+    # ---- map symmetry (identical to ObsMemory::mirror / learn_terrain / resolve_symmetry)
+    def mirror(self, t, s):
+        W, H = self.W, self.H
+        x, y = t % W, t // W
+        return (y if s == 1 else H - 1 - y) * W + (x if s == 2 else W - 1 - x)
+
+    def learn_terrain(self, t):
+        terrain = self.terrain
+        ter = terrain[t]
+        if ter == T_UNKNOWN:
+            return
+        for s in range(3):
+            if not (self.sym_alive >> s) & 1:
+                continue
+            mt = self.mirror(t, s)
+            if terrain[mt] != T_UNKNOWN and terrain[mt] != ter:
+                self.sym_alive &= ~(1 << s) & 7
+        if self.sym >= 0:
+            mt = self.mirror(t, self.sym)
+            if terrain[mt] == T_UNKNOWN:
+                terrain[mt] = ter
+
+    def resolve_symmetry(self):
+        n, team = self.W * self.H, self.team
+        bid, bty, btm = self.bld_id, self.bld_type, self.bld_team
+        own_core = [t for t in range(n) if bid[t] >= 0 and btm[t] == team and bty[t] == CORE]
+        for s in range(3):
+            if not (self.sym_alive >> s) & 1:
+                continue
+            for t in own_core:
+                mt = self.mirror(t, s)
+                if bid[mt] >= 0 and btm[mt] == team and bty[mt] == CORE:
+                    self.sym_alive &= ~(1 << s) & 7
+                    break
+        if self.sym < 0 and self.sym_alive in (1, 2, 4):
+            self.sym = {1: 0, 2: 1, 4: 2}[self.sym_alive]
+            terrain = self.terrain
+            for t in range(n):
+                mt = self.mirror(t, self.sym)
+                if terrain[t] != T_UNKNOWN and terrain[mt] == T_UNKNOWN:
+                    terrain[mt] = terrain[t]
+        if self.sym >= 0:
+            enemy = 1 - team
+            for t in own_core:
+                mt = self.mirror(t, self.sym)
+                if bid[mt] < 0 and self.seen_round[mt] < 0:
+                    bid[mt], bty[mt], btm[mt] = enemy + 1, CORE, enemy
+                    self.bld_dir[mt], self.bld_hp[mt] = -1, 100
+                    if self.terrain[mt] == T_UNKNOWN:
+                        self.terrain[mt] = T_EMPTY
+
+    # ---- report bus (identical to ObsMemory::merge_store / ore_report / next_report)
     def merge_store(self, store):
         """Apply the team store snapshot (16 values): every report merges into memory."""
-        n, enemy = self.W * self.H, 1 - self.team
+        W, H, n, enemy = self.W, self.H, self.W * self.H, 1 - self.team
         for v in store:
             if v < 0 or v > 0xFFFFFFFF or not (v & REP_MARK):
                 continue
             cat, t, remove = (v >> 26) & 15, v & 0x7FF, bool(v & REP_REMOVE)
+            bits = (v >> 11) & 0x7FFF
             if cat < REP_ORE_TI or cat > REP_SPIKE or t >= n:
+                continue
+            if cat in (REP_ORE_TI, REP_ORE_VO):
+                if remove:
+                    continue
+                x, y = t % W, t // W
+                ore = T_ORE_TI if cat == REP_ORE_TI else T_ORE_VO
+                for k in range(16):
+                    if k > 0 and not (bits >> (k - 1)) & 1:
+                        continue
+                    xx, yy = x + k % 4, y + k // 4
+                    if xx >= W or yy >= H:
+                        continue
+                    tt = yy * W + xx
+                    f = rep_pack(cat, tt, False)
+                    self.known.add(f)
+                    self.known.discard(f ^ REP_REMOVE)
+                    self.pending.discard(f)
+                    if self.terrain[tt] == T_UNKNOWN:
+                        self.terrain[tt] = ore
+                    self.learn_terrain(tt)
+                continue
+            if bits:
                 continue
             self.known.add(v)
             self.known.discard(v ^ REP_REMOVE)
             self.pending.discard(v)
-            if cat in (REP_ORE_TI, REP_ORE_VO):
-                if not remove and self.terrain[t] == T_UNKNOWN:
-                    self.terrain[t] = T_ORE_TI if cat == REP_ORE_TI else T_ORE_VO
-                continue
             typ = _REP_TYPE[cat]
             if remove:
                 if self.bld_id[t] >= 0 and self.bld_team[t] == enemy and self.bld_type[t] == typ:
@@ -117,10 +189,45 @@ class ObsMemory:
                 self.bld_dir[t], self.bld_hp[t] = -1, 100
                 if self.terrain[t] == T_UNKNOWN:
                     self.terrain[t] = T_EMPTY
+                    self.learn_terrain(t)
 
-    def next_report(self):
-        """The queued report to post this turn (0: none)."""
-        return min(self.pending, key=_rep_key) if self.pending else 0
+    def ore_report(self, f):
+        W, H = self.W, self.H
+        cat, t = (f >> 26) & 15, f & 0x7FF
+        x, y = t % W, t // W
+        ore = T_ORE_TI if cat == REP_ORE_TI else T_ORE_VO
+        bits = 0
+        for k in range(1, 16):
+            xx, yy = x + k % 4, y + k // 4
+            if xx < W and yy < H and self.terrain[yy * W + xx] == ore:
+                bits |= 1 << (k - 1)
+        return f | (bits << 11)
+
+    def next_report(self, unit_id, rnd):
+        """(slot, report) to post this turn, or None."""
+        k = unit_id + rnd
+        if self.pending:
+            best = min(self.pending, key=_rep_key)
+            cat = (best >> 26) & 15
+            ore = cat in (REP_ORE_TI, REP_ORE_VO)
+            return k % 16, (self.ore_report(best) if ore else best)
+        if k % 4:
+            return None
+        enemy, live = 1 - self.team, []
+        for f in sorted(self.known):
+            if f & REP_REMOVE:
+                continue
+            cat, t = (f >> 26) & 15, f & 0x7FF
+            if cat in (REP_ORE_TI, REP_ORE_VO):
+                if self.terrain[t] == (T_ORE_TI if cat == REP_ORE_TI else T_ORE_VO):
+                    live.append(f)
+            elif self.bld_id[t] >= 0 and self.bld_team[t] == enemy and self.bld_type[t] == _REP_TYPE[cat]:
+                live.append(f)
+        if not live:
+            return None
+        f = live[(k // 4) % len(live)]
+        ore = ((f >> 26) & 15) in (REP_ORE_TI, REP_ORE_VO)
+        return (k // 4) % 16, (self.ore_report(f) if ore else f)
 
     def _fact(self, p):
         self.pending.discard(p ^ REP_REMOVE)
@@ -156,6 +263,7 @@ class ObsMemory:
                 self.bot_hp[t] = ad.entity_hp_percent(u)
                 self.attr_seen_round[t] = r
             self.seen_round[t] = r
+            self.learn_terrain(t)
             # reportable facts seen now
             ter = self.terrain[t]
             if ter == T_ORE_TI or ter == T_ORE_VO:
@@ -166,6 +274,7 @@ class ObsMemory:
             cat_old = _REP_CAT.get(old_type, 0) if old_id >= 0 and old_team != team else 0
             if cat_old and cat_old != cat_now:
                 self._fact(rep_pack(cat_old, t, True))
+        self.resolve_symmetry()
 
     def plan_paths(self):
         """Conveyor planner, identical to ObsMemory::plan_paths (engine/src/obs.cpp):
@@ -533,9 +642,9 @@ class ActorEncoder:
         # team report bus: merge the store snapshot, see, post one report
         memory.merge_store([ct.read_store(i) for i in range(16)])
         memory.update(ad)
-        rep = memory.next_report()
+        rep = memory.next_report(uid, ct.get_current_round())
         if rep:
-            ct.write_store((uid + ct.get_current_round()) % 16, rep)
+            ct.write_store(rep[0], rep[1])
         return memory.encode(ad)
 
     def forget(self, entity_id):

@@ -14,8 +14,9 @@ void Match::observe(int entity) {
     const int team = game.ents[entity].team;
     mem.merge_store(game.teams[team].store.data());
     mem.update(game, entity);
-    if (const uint32_t rep = mem.next_report())
-        game.write_store(team, int((uint32_t(game.ents[entity].id) + uint32_t(game.round)) % 16u), int64_t(rep));
+    int slot; uint32_t rep;
+    if (mem.next_report(uint64_t(uint32_t(game.ents[entity].id)), game.round, slot, rep))
+        game.write_store(team, slot, int64_t(rep));
 }
 void Match::encode_only(int entity, std::vector<float>& out) {
     auto& mem=memories.at(entity);

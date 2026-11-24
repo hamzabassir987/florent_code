@@ -24,9 +24,20 @@ void ObsMemory::init(const Game& g, int team_) {
     bot_dir.assign(n, -1);
     bot_hp.assign(n, -1);
     attr_seen_round.assign(n, -1);
+    known.clear(); pending.clear();
+    sym_alive = 7; sym = -1;
 }
 
 // ---------------------------------------------------------------- report bus
+// Identical in bots/econ/encoder.py (checked by engine/tools/obs_parity.py).
+// A FACT is one tile: rep_pack(cat, tile, remove); `known` / `pending` hold facts.
+// A REPORT (store word) is a fact, or for ore an anchor fact plus bits 11..25:
+// the other cells of the 4x4 block right / below the anchor holding the same ore.
+// Slots are not partitioned: a write in round r is read by every unit in round
+// r + 1 (all read the same start-of-round snapshot), so overwriting it later
+// loses nothing; a fresh fact that loses a same-round slot race stays pending
+// and goes out again. Fresh reports: slot (id + round) % 16; rotation (idle
+// units with (id + round) % 4 == 0): slot ((id + round) / 4) % 16.
 static constexpr uint32_t REP_MARK = 1u << 31, REP_REMOVE = 1u << 30;
 enum : int { REP_ORE_TI = 1, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE };
 static int rep_cat_of_type(int type) {
@@ -41,10 +52,65 @@ static int rep_type_of_cat(int cat) {
     case REP_LAUNCHER: return LAUNCHER; case REP_SPIKE: return SPIKE; default: return -1;
     }
 }
+static bool rep_is_ore(int cat) { return cat == REP_ORE_TI || cat == REP_ORE_VO; }
 static uint32_t rep_pack(int cat, int t, bool remove) { return REP_MARK | (remove ? REP_REMOVE : 0u) | (uint32_t(cat) << 26) | uint32_t(t); }
 static int rep_rank(uint32_t p) { int c = (p >> 26) & 15; return c == REP_CORE ? 0 : (c >= REP_GUNNER ? 1 : 2); }
+static void rep_note(std::set<uint32_t>& known, uint32_t f) { known.insert(f); known.erase(f ^ REP_REMOVE); }
 
-static void rep_note(std::set<uint32_t>& known, uint32_t p) { known.insert(p); known.erase(p ^ REP_REMOVE); }
+int ObsMemory::mirror(int t, int s) const {
+    const int x = t % W, y = t / W;
+    return ((s == 1) ? y : H - 1 - y) * W + ((s == 2) ? x : W - 1 - x);
+}
+
+// A tile's terrain is known: rule out the symmetries it contradicts; once the
+// symmetry is known, its mirror tile gets the same terrain.
+void ObsMemory::learn_terrain(int t) {
+    if (terrain[t] == T_UNKNOWN) return;
+    for (int s = 0; s < 3; s++) {
+        if (!(sym_alive >> s & 1)) continue;
+        const int mt = mirror(t, s);
+        if (terrain[mt] != T_UNKNOWN && terrain[mt] != terrain[t]) sym_alive &= uint8_t(~(1u << s));
+    }
+    if (sym >= 0) {
+        const int mt = mirror(t, sym);
+        if (terrain[mt] == T_UNKNOWN) terrain[mt] = terrain[t];
+    }
+}
+
+// End of a turn's update: a symmetry that maps our core onto itself is out;
+// when one symmetry is left it becomes THE symmetry (every known tile is
+// mirrored once), and the enemy core is placed on the mirror of ours where that
+// tile was never seen.
+void ObsMemory::resolve_symmetry() {
+    const int N = W * H;
+    std::vector<int> own_core;
+    for (int t = 0; t < N; t++) if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == CORE) own_core.push_back(t);
+    for (int s = 0; s < 3; s++) {
+        if (!(sym_alive >> s & 1)) continue;
+        for (int t : own_core) {
+            const int mt = mirror(t, s);
+            if (bld_id[mt] >= 0 && bld_team[mt] == team && bld_type[mt] == CORE) { sym_alive &= uint8_t(~(1u << s)); break; }
+        }
+    }
+    if (sym < 0 && (sym_alive == 1 || sym_alive == 2 || sym_alive == 4)) {
+        sym = sym_alive == 1 ? 0 : (sym_alive == 2 ? 1 : 2);
+        for (int t = 0; t < N; t++) {
+            const int mt = mirror(t, sym);
+            if (terrain[t] != T_UNKNOWN && terrain[mt] == T_UNKNOWN) terrain[mt] = terrain[t];
+        }
+    }
+    if (sym >= 0) {
+        const int enemy = 1 - team;
+        for (int t : own_core) {
+            const int mt = mirror(t, sym);
+            if (bld_id[mt] < 0 && seen_round[mt] < 0) {
+                bld_id[mt] = enemy + 1; bld_type[mt] = int8_t(CORE); bld_team[mt] = int8_t(enemy);
+                bld_dir[mt] = -1; bld_hp[mt] = 100;
+                if (terrain[mt] == T_UNKNOWN) terrain[mt] = T_EMPTY;
+            }
+        }
+    }
+}
 
 void ObsMemory::merge_store(const int64_t* store) {
     for (int i = 0; i < 16; i++) {
@@ -52,14 +118,28 @@ void ObsMemory::merge_store(const int64_t* store) {
         if (v < 0 || v > 0xFFFFFFFFll || !(uint64_t(v) & REP_MARK)) continue;
         const uint32_t p = uint32_t(v);
         const int cat = (p >> 26) & 15, t = p & 0x7FF;
+        const uint32_t bits = (p >> 11) & 0x7FFF;
         const bool remove = p & REP_REMOVE;
         if (cat < REP_ORE_TI || cat > REP_SPIKE || t >= W * H) continue;
-        rep_note(known, p);
-        pending.erase(p);
-        if (cat == REP_ORE_TI || cat == REP_ORE_VO) {
-            if (!remove && terrain[t] == T_UNKNOWN) terrain[t] = cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO;
+        if (rep_is_ore(cat)) {
+            if (remove) continue;
+            const int x = t % W, y = t / W;
+            for (int k = 0; k < 16; k++) {
+                if (k > 0 && !(bits >> (k - 1) & 1)) continue;
+                const int xx = x + k % 4, yy = y + k / 4;
+                if (xx >= W || yy >= H) continue;
+                const int tt = yy * W + xx;
+                const uint32_t f = rep_pack(cat, tt, false);
+                rep_note(known, f);
+                pending.erase(f);
+                if (terrain[tt] == T_UNKNOWN) terrain[tt] = cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO;
+                learn_terrain(tt);
+            }
             continue;
         }
+        if (bits) continue;
+        rep_note(known, p);
+        pending.erase(p);
         const int type = rep_type_of_cat(cat), enemy = 1 - team;
         if (remove) {
             if (bld_id[t] >= 0 && bld_team[t] == enemy && bld_type[t] == type) {
@@ -72,19 +152,52 @@ void ObsMemory::merge_store(const int64_t* store) {
             bld_id[t] = type == CORE ? enemy + 1 : (1 << 30) + t;
             bld_type[t] = int8_t(type); bld_team[t] = int8_t(enemy);
             bld_dir[t] = -1; bld_hp[t] = 100;
-            if (terrain[t] == T_UNKNOWN) terrain[t] = T_EMPTY;
+            if (terrain[t] == T_UNKNOWN) { terrain[t] = T_EMPTY; learn_terrain(t); }
         }
     }
 }
 
-uint32_t ObsMemory::next_report() const {
-    uint32_t best = 0;
-    for (uint32_t p : pending) {
-        if (!best) { best = p; continue; }
-        const auto key = [](uint32_t q) { return std::make_tuple(rep_rank(q), int(q & 0x7FF), int((q >> 30) & 1), int((q >> 26) & 15)); };
-        if (key(p) < key(best)) best = p;
+// The ore report for anchor fact f: f plus the 4x4 block's cells holding the same ore.
+uint32_t ObsMemory::ore_report(uint32_t f) const {
+    const int cat = (f >> 26) & 15, t = f & 0x7FF, x = t % W, y = t / W;
+    const uint8_t ore = cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO;
+    uint32_t bits = 0;
+    for (int k = 1; k < 16; k++) {
+        const int xx = x + k % 4, yy = y + k / 4;
+        if (xx < W && yy < H && terrain[yy * W + xx] == ore) bits |= 1u << (k - 1);
     }
-    return best;
+    return f | (bits << 11);
+}
+
+// The report to post this turn: the most important pending fact (core, turrets,
+// ore; lowest tile) into slot (id + round) % 16; with nothing pending, on rounds
+// where (id + round) % 4 == 0, a known fact still true in memory, cycling
+// through them in order, into slot ((id + round) / 4) % 16.
+bool ObsMemory::next_report(uint64_t unit_id, int round, int& slot, uint32_t& report) const {
+    const uint64_t k = unit_id + uint64_t(round);
+    if (!pending.empty()) {
+        uint32_t best = 0;
+        const auto key = [](uint32_t q) { return std::make_tuple(rep_rank(q), int(q & 0x7FF), int((q >> 30) & 1), int((q >> 26) & 15)); };
+        for (uint32_t f : pending) if (!best || key(f) < key(best)) best = f;
+        const int cat = (best >> 26) & 15;
+        report = rep_is_ore(cat) ? ore_report(best) : best;
+        slot = int(k % 16);
+        return true;
+    }
+    if (k % 4 != 0) return false;
+    std::vector<uint32_t> live;
+    const int enemy = 1 - team;
+    for (uint32_t f : known) {                  // std::set: ascending
+        if (f & REP_REMOVE) continue;
+        const int cat = (f >> 26) & 15, t = f & 0x7FF;
+        if (rep_is_ore(cat)) { if (terrain[t] == (cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO)) live.push_back(f); }
+        else if (bld_id[t] >= 0 && bld_team[t] == enemy && bld_type[t] == rep_type_of_cat(cat)) live.push_back(f);
+    }
+    if (live.empty()) return false;
+    const uint32_t f = live[(k / 4) % live.size()];
+    report = rep_is_ore((f >> 26) & 15) ? ore_report(f) : f;
+    slot = int((k / 4) % 16);
+    return true;
 }
 
 void ObsMemory::update(const Game& g, int actor) {
@@ -133,6 +246,7 @@ void ObsMemory::update(const Game& g, int actor) {
             bot_hp[t] = -1;
         }
         seen_round[t] = g.round;
+        learn_terrain(t);
         // reportable facts seen now
         if (terrain[t] == T_ORE_TI || terrain[t] == T_ORE_VO) fact(rep_pack(terrain[t] == T_ORE_TI ? REP_ORE_TI : REP_ORE_VO, t, false));
         const int cat_now = (bld_id[t] >= 0 && bld_team[t] != team) ? rep_cat_of_type(bld_type[t]) : 0;
@@ -140,6 +254,7 @@ void ObsMemory::update(const Game& g, int actor) {
         const int cat_old = (old_id >= 0 && old_team != team) ? rep_cat_of_type(old_type) : 0;
         if (cat_old && cat_old != cat_now) fact(rep_pack(cat_old, t, true));
     }
+    resolve_symmetry();
 }
 
 // Walk `maxlen` tiles outward from (x0,y0) along (dx,dy), one rounded step at a
