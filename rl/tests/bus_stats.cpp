@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     std::printf("bus: refresh %d  spawn_cooldown %d  quiet_after %d  quiet_rounds %d  enemy_bot_ttl %d\n", fe::g_bus.refresh,
                 fe::g_bus.spawn_cooldown, fe::g_bus.quiet_after, fe::g_bus.quiet_rounds, fe::g_bus.enemy_bot_ttl);
     std::map<int, std::vector<double>> late_sym;          // k -> share of late units knowing the symmetry
-    long store_writes = 0, unit_turns = 0;
+    long store_writes = 0, unit_turns = 0, wrong_sym = 0;
     long own_pairs = 0, own_close = 0;                    // (unit, other own builder): believed within 2 tiles
     long alarm_rounds = 0, alarm_known = 0;
     std::vector<std::string> maps(argv + 3, argv + argc);
@@ -95,7 +95,8 @@ int main(int argc, char** argv) {
                     if (enemy_b && kb[t] < 0 && mem.bld_id[t] >= 0 && mem.bld_team[t] != team && mem.bld_type[t] == G.ents[b].type) kb[t] = r;
                 }
             }
-            for (auto& [ent, mem] : m.memories) if (ent < int(G.ents.size()) && G.ents[ent].alive) { unit_turns++; store_writes += mem.sym >= 0; }
+            for (auto& [ent, mem] : m.memories) if (ent < int(G.ents.size()) && G.ents[ent].alive) { unit_turns++; store_writes += mem.sym >= 0;
+                if (mem.sym >= 0) { bool ok = true; for (int t = 0; t < N && ok; t++) { int a = G.env[t], b = G.env[mem.mirror(t, mem.sym)]; ok = (a == b); } wrong_sym += !ok; } }
             // builder position accuracy: for every unit, the team's other builders
             for (auto& [ent, mem] : m.memories) {
                 if (ent >= int(G.ents.size()) || !G.ents[ent].alive) continue;
@@ -132,6 +133,13 @@ int main(int argc, char** argv) {
                 }
                 if (team_known) late[k].push_back(double(mine) / team_known);
                 late_sym[k].push_back(mem.sym >= 0 ? 1.0 : 0.0);
+                if (std::getenv("DEBUG_SYM")) {
+                    int tk = 0; for (auto& [e2, m2] : m.memories) if (e2 != ent && e2 < int(G.ents.size()) && G.ents[e2].alive && G.ents[e2].team == team && m2.sym >= 0) tk++;
+                    int snapsym = 0; for (int i = 0; i < 16; i++) { int64_t w = G.teams[team].store[i]; if ((w >> 31 & 1) && (w >> 28 & 3)) snapsym++; }
+                    int band = 7; for (auto& [e2, m2] : m.memories) if (e2 < int(G.ents.size()) && G.ents[e2].alive && G.ents[e2].team == team) band &= m2.sym_alive;
+                    std::printf("DBG k %d type %d me %d mates_knowing %d store_words_with_sym %d alive %d team_and %d\n", k, G.ents[ent].type, mem.sym, tk, snapsym, mem.sym_alive, band);
+                    if (mem.sym_alive == 0) for (int t = 0; t < N; t++) { int mt = mem.mirror(t, 1); if (t < mt && mem.terrain[t] && mem.terrain[mt] && mem.terrain[t] != mem.terrain[mt]) std::printf("   x-contra %d,%d=%d (env %d, seen %d)  %d,%d=%d (env %d, seen %d)\n", t % G.W, t / G.W, mem.terrain[t], G.env[t], mem.seen_round[t], mt % G.W, mt / G.W, mem.terrain[mt], G.env[mt], mem.seen_round[mt]); }
+                }
             }
         }
         // latencies: for every unit alive when its team first saw the fact, and that did not see it itself first
@@ -169,7 +177,7 @@ int main(int argc, char** argv) {
     std::printf("  never learned (unit alive 10+ rounds after it was seen): %ld\n", ore_never);
     std::printf("enemy buildings (core / turrets), units alive when first seen: %ld pairs  rounds: median %.0f  p75 %.0f  p90 %.0f\n",
                 bld_pairs, pct(bld_lat, .5), pct(bld_lat, .75), pct(bld_lat, .9));
-    std::printf("unit-rounds with the symmetry known: %.1f%%\n", 100.0 * store_writes / std::max(1L, unit_turns));
+    std::printf("unit-rounds with the symmetry known: %.1f%%  (wrong: %.1f%% of those)\n", 100.0 * store_writes / std::max(1L, unit_turns), 100.0 * wrong_sym / std::max(1L, store_writes));
     std::printf("own builders a unit believes within 2 tiles of their real position: %.1f%% (%ld unit-builder pairs)\n",
                 100.0 * own_close / std::max(1L, own_pairs), own_pairs);
     std::printf("late units (born after round 5): share of the team's known ore they know\n");

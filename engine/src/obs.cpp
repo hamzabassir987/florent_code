@@ -18,6 +18,7 @@ void ObsMemory::init(const Game& g, int team_) {
     bot_id.assign(n, -1);
     bot_team.assign(n, -1);
     seen_round.assign(n, -1);
+    stood.assign(n, 0);
     visit_round.assign(n, -1);
     bld_dir.assign(n, -1);
     bld_hp.assign(n, -1);
@@ -78,14 +79,25 @@ int ObsMemory::mirror(int t, int s) const {
 // symmetry is known, its mirror tile gets the same terrain.
 void ObsMemory::learn_terrain(int t) {
     if (terrain[t] == T_UNKNOWN) return;
+    const bool blocked = terrain[t] == T_WALL || terrain[t] == T_VOID;
     for (int s = 0; s < 3; s++) {
         if (!(sym_alive >> s & 1)) continue;
         const int mt = mirror(t, s);
-        if (terrain[mt] != T_UNKNOWN && terrain[mt] != terrain[t]) sym_alive &= uint8_t(~(1u << s));
+        if ((terrain[mt] != T_UNKNOWN && terrain[mt] != terrain[t]) || (blocked && stood[mt])) sym_alive &= uint8_t(~(1u << s));
     }
     if (sym >= 0) {
         const int mt = mirror(t, sym);
         if (terrain[mt] == T_UNKNOWN) terrain[mt] = terrain[t];
+    }
+}
+// A reported unit / building stands on t (terrain not known: ore or empty):
+// a symmetry mapping t onto a known wall or void is out.
+void ObsMemory::learn_passable(int t) {
+    stood[t] = 1;
+    for (int s = 0; s < 3; s++) {
+        if (!(sym_alive >> s & 1)) continue;
+        const uint8_t mt = terrain[mirror(t, s)];
+        if (mt == T_WALL || mt == T_VOID) sym_alive &= uint8_t(~(1u << s));
     }
 }
 // End of a turn's update: a symmetry that maps our core onto itself is out;
@@ -103,14 +115,35 @@ void ObsMemory::resolve_symmetry() {
             if (bld_id[mt] >= 0 && bld_team[mt] == team && bld_type[mt] == CORE) { sym_alive &= uint8_t(~(1u << s)); break; }
         }
     }
-    // a known enemy core tile (seen or reported) must be the mirror of one of ours
+    // the cores mirror each other: a candidate is out when it maps a known
+    // enemy core tile onto a tile this unit saw without our core, or one of our
+    // core tiles onto a tile it saw without the enemy core
+    if (g_bus.use_enemy_core && sym < 0) {
+        for (int t = 0; t < N; t++) {
+            if (bld_id[t] < 0 || bld_type[t] != CORE) continue;
+            const int want = bld_team[t] != team ? team : 1 - team;
+            for (int s = 0; s < 3; s++) {
+                if (!(sym_alive >> s & 1)) continue;
+                const int mt = mirror(t, s);
+                if (seen_round[mt] >= 0 && !(bld_id[mt] >= 0 && bld_type[mt] == CORE && bld_team[mt] == want))
+                    sym_alive &= uint8_t(~(1u << s));
+            }
+        }
+    }
+    // a known enemy core tile must mirror a tile of our 2x2 core: a known one,
+    // or an unseen tile next to every known one (part of our core not seen yet)
     if (g_bus.use_enemy_core && !own_core.empty() && sym < 0) {
         for (int t = 0; t < N; t++) {
             if (!(bld_id[t] >= 0 && bld_team[t] != team && bld_type[t] == CORE)) continue;
             for (int s = 0; s < 3; s++) {
                 if (!(sym_alive >> s & 1)) continue;
                 bool match = false;
-                for (int o : own_core) if (mirror(o, s) == t) { match = true; break; }
+                const int mt = mirror(t, s);
+                for (int o : own_core) if (o == mt) { match = true; break; }
+                if (!match && seen_round[mt] < 0) {
+                    match = true;
+                    for (int o : own_core) if (std::max(std::abs(o % W - mt % W), std::abs(o / W - mt / W)) > 1) { match = false; break; }
+                }
                 if (!match) sym_alive &= uint8_t(~(1u << s));
             }
         }
@@ -142,8 +175,8 @@ static void place_reported_bot(ObsMemory& m, int tm, int tag, int t, int rr) {
     if (old >= 0 && old != t && m.bot_id[old] == sid) { m.bot_id[old] = -1; m.bot_team[old] = -1; m.bot_dir[old] = -1; m.bot_hp[old] = -1; }
     if (m.bot_id[t] < 0 || m.bot_id[t] == sid) {
         m.bot_id[t] = sid; m.bot_team[t] = int8_t(tm); m.bot_dir[t] = -1; m.bot_hp[t] = -1;
-        m.visit_round[t] = rr;
-        if (m.terrain[t] == T_UNKNOWN) { m.terrain[t] = T_EMPTY; m.learn_terrain(t); }
+        m.visit_round[t] = rr;   // terrain left as is: a builder can stand on ore
+        m.learn_passable(t);
     }
     m.rep_bot_tile[idx] = t; m.rep_bot_round[idx] = rr;
 }
@@ -192,8 +225,8 @@ void ObsMemory::merge_store(const int64_t* store, int round) {
                 // others get a per-tile id; direction and HP unknown, attribute age untouched
                 bld_id[t] = type == CORE ? owner + 1 : (eatk ? (1 << 30) : (1 << 29)) + t;
                 bld_type[t] = int8_t(type); bld_team[t] = int8_t(owner);
-                bld_dir[t] = -1; bld_hp[t] = 100;
-                if (terrain[t] == T_UNKNOWN) { terrain[t] = T_EMPTY; learn_terrain(t); }
+                bld_dir[t] = -1; bld_hp[t] = 100;   // terrain left as is (a harvester stands on ore)
+                learn_passable(t);
             }
         }
     }

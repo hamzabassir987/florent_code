@@ -142,6 +142,8 @@ struct ObsMemory {
     int sym = -1;
     int mirror(int t, int s) const;
     void learn_terrain(int t);
+    void learn_passable(int t);   // a reported unit stands on t
+    std::vector<uint8_t> stood;   // a reported unit / building stood here (so not wall / void)
     void resolve_symmetry();
 
     void init(const Game& g, int team_);

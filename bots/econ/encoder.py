@@ -97,6 +97,7 @@ class ObsMemory:
         self.bot_team = [-1] * n
         self.bot_hp = [-1] * n
         self.seen_round = [-1] * n
+        self.stood = [0] * n
         self.visit_round = [-1] * n
         self.attr_seen_round = [-1] * n
         self.bus_q = [[] for _ in range(5)]
@@ -121,16 +122,24 @@ class ObsMemory:
         ter = terrain[t]
         if ter == T_UNKNOWN:
             return
+        blocked = ter == T_WALL or ter == T_VOID
         for s in range(3):
             if not (self.sym_alive >> s) & 1:
                 continue
             mt = self.mirror(t, s)
-            if terrain[mt] != T_UNKNOWN and terrain[mt] != ter:
+            if (terrain[mt] != T_UNKNOWN and terrain[mt] != ter) or (blocked and self.stood[mt]):
                 self.sym_alive &= ~(1 << s) & 7
         if self.sym >= 0:
             mt = self.mirror(t, self.sym)
             if terrain[mt] == T_UNKNOWN:
                 terrain[mt] = ter
+
+    def learn_passable(self, t):
+        """A reported unit / building stands on t: a symmetry mapping t onto a known wall or void is out."""
+        self.stood[t] = 1
+        for s in range(3):
+            if (self.sym_alive >> s) & 1 and self.terrain[self.mirror(t, s)] in (T_WALL, T_VOID):
+                self.sym_alive &= ~(1 << s) & 7
 
     def resolve_symmetry(self):
         n, team = self.W * self.H, self.team
@@ -144,13 +153,35 @@ class ObsMemory:
                 if bid[mt] >= 0 and btm[mt] == team and bty[mt] == CORE:
                     self.sym_alive &= ~(1 << s) & 7
                     break
-        # a known enemy core tile (seen or reported) must be the mirror of one of ours
+        # the cores mirror each other: a candidate is out when it maps a known
+        # enemy core tile onto a tile this unit saw without our core, or one of
+        # our core tiles onto a tile it saw without the enemy core
+        if self.sym < 0:
+            seen = self.seen_round
+            for t in range(n):
+                if bid[t] < 0 or bty[t] != CORE:
+                    continue
+                want = team if btm[t] != team else 1 - team
+                for s in range(3):
+                    if not (self.sym_alive >> s) & 1:
+                        continue
+                    mt = self.mirror(t, s)
+                    if seen[mt] >= 0 and not (bid[mt] >= 0 and bty[mt] == CORE and btm[mt] == want):
+                        self.sym_alive &= ~(1 << s) & 7
+        # a known enemy core tile must mirror a tile of our 2x2 core: a known one,
+        # or an unseen tile next to every known one (part of our core not seen yet)
         if own_core and self.sym < 0:
+            W = self.W
             for t in range(n):
                 if not (bid[t] >= 0 and btm[t] != team and bty[t] == CORE):
                     continue
                 for s in range(3):
-                    if (self.sym_alive >> s) & 1 and not any(self.mirror(o, s) == t for o in own_core):
+                    if not (self.sym_alive >> s) & 1:
+                        continue
+                    mt = self.mirror(t, s)
+                    match = mt in own_core or (self.seen_round[mt] < 0 and all(
+                        max(abs(o % W - mt % W), abs(o // W - mt // W)) <= 1 for o in own_core))
+                    if not match:
                         self.sym_alive &= ~(1 << s) & 7
         if self.sym < 0 and self.sym_alive in (1, 2, 4):
             self.sym = {1: 0, 2: 1, 4: 2}[self.sym_alive]
@@ -189,10 +220,8 @@ class ObsMemory:
             self._clear_bot(old)
         if self.bot_id[t] < 0 or self.bot_id[t] == sid:
             self.bot_id[t], self.bot_team[t], self.bot_hp[t] = sid, tm, -1
-            self.visit_round[t] = rr
-            if self.terrain[t] == T_UNKNOWN:
-                self.terrain[t] = T_EMPTY
-                self.learn_terrain(t)
+            self.visit_round[t] = rr   # terrain left as is: a builder can stand on ore
+            self.learn_passable(t)
         self.rep_bot_tile[idx], self.rep_bot_round[idx] = t, rr
 
     def merge_store(self, store, rnd):
@@ -251,10 +280,8 @@ class ObsMemory:
                 elif self.bld_id[t] < 0:
                     self.bld_id[t] = owner + 1 if typ == CORE else ((1 << 30) if eatk else (1 << 29)) + t
                     self.bld_type[t], self.bld_team[t] = typ, owner
-                    self.bld_dir[t], self.bld_hp[t] = -1, 100
-                    if self.terrain[t] == T_UNKNOWN:
-                        self.terrain[t] = T_EMPTY
-                        self.learn_terrain(t)
+                    self.bld_dir[t], self.bld_hp[t] = -1, 100   # terrain left as is (a harvester stands on ore)
+                    self.learn_passable(t)
         for idx in range(128):
             t = self.rep_bot_tile[idx]
             if t < 0 or rnd - self.rep_bot_round[idx] <= ENEMY_BOT_TTL:
