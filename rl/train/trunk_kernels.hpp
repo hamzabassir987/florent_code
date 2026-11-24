@@ -3,7 +3,9 @@
 #include <cstdint>
 
 #define TRUNK_IN_CH 60          // fe::ACTOR_CH
-#define TRUNK_FLAT 21120        // flat parameter vector length (layout in trunk_kernels.cu)
+// flat parameter vector length (layout in trunk_kernels.cu): the stem
+// (TRUNK_IN_CH x 32 weights + 32 biases), then 4 blocks of 4800
+#define TRUNK_FLAT (TRUNK_IN_CH * 32 + 32 + 4 * 4800)
 #define TRUNK_SCRATCH 61984     // backward scratch floats per CTA
 #define TRUNK_THREADS 320
 
