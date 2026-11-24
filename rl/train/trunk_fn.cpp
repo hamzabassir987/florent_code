@@ -7,6 +7,8 @@
 #include <stdexcept>
 
 #include "trunk_kernels.hpp"
+#include "../../engine/src/obs.hpp"
+static_assert(TRUNK_IN_CH == fe::ACTOR_CH, "trunk_kernels.hpp TRUNK_IN_CH must equal the encoder's ACTOR_CH");
 
 namespace florent_rl {
 
@@ -81,7 +83,7 @@ bool fused_trunk_built() { return true; }
 
 torch::Tensor fused_trunk(const torch::Tensor& x, const torch::Tensor& flat) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kUInt8 && x.is_contiguous() && x.dim() == 2 && x.size(1) == TRUNK_IN_CH * 289,
-                "fused_trunk: x must be a contiguous CUDA uint8 [n, 59*17*17]");
+                "fused_trunk: x must be a contiguous CUDA uint8 [n, TRUNK_IN_CH*17*17]");
     TORCH_CHECK(flat.is_cuda() && flat.scalar_type() == torch::kFloat32 && flat.numel() == TRUNK_FLAT, "fused_trunk: flat");
     return TrunkFn::apply(x, flat.contiguous());
 }

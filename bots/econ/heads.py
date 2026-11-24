@@ -61,6 +61,10 @@ class Api:
         self.Tinv = {v: k for k, v in self.T.items()}
 
         self.cache = {}
+        # Conveyor planner mask (docs/rl-layout.md): planned conveyor direction
+        # (Dir code, 0 none) of the 4 adjacent tiles N E S W, from the actor
+        # observation's path channel (encoder C_PATH). None: no restriction.
+        self.plan4 = None
 
     def once(self, key, fn):
         """Legal-option tables are computed once per turn and shared."""
@@ -127,7 +131,10 @@ def _builder_opts(api):
             continue
         for t, typ in enumerate(BUILD_ORDER):
             if typ in DIRECTIONAL:
+                planned = api.plan4 is not None and typ in (CONVEYOR, SPLITTER)
                 for d in range(8):
+                    if planned and api.plan4[i] != d + 1:
+                        continue
                     build[t][i][d] = int(api.call("can_build", api.T[typ], q, api.D[d + 1]))
             else:
                 build[t][i][0] = int(api.call("can_build", api.T[typ], q, None))
@@ -325,3 +332,12 @@ def apply(api, action):
     if k == "launch":
         return ct.launch(P(action[1], action[2]), P(action[3], action[4]))
     raise ValueError(k)
+
+
+def plan4_from_obs(spatial):
+    """The 4 adjacent tiles' planned conveyor directions (N E S W) from the
+    actor observation's path channel; same cells as plan4_from_obs in C++."""
+    from encoder import C_PATH, PATCH, HALF
+    base, c = C_PATH * PATCH * PATCH, HALF
+    return [spatial[base + (c - 1) * PATCH + c], spatial[base + c * PATCH + c + 1],
+            spatial[base + (c + 1) * PATCH + c], spatial[base + c * PATCH + c - 1]]

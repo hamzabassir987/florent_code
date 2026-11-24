@@ -247,6 +247,7 @@ class Player:
         if p is None:
             return True
         spatial, scalars = self.actor_encoder.encode(ct)   # memory updates every turn
+        api.plan4 = HEADS.plan4_from_obs(spatial)   # conveyor planner mask (path channel)
         if not HEADS.has_choice(api):
             return True                              # only "wait" is legal: no forward
         if ct.get_cpu_time_elapsed() > LEARNED_START_LIMIT_US:

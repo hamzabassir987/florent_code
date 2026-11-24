@@ -98,6 +98,68 @@ static bool has(const std::vector<int>& v, int x) {
     return false;
 }
 
+// Conveyor planner (identical in bots/econ/encoder.py, checked by obs_parity):
+// only what this unit remembers. A BFS from the remembered own-core tiles
+// (distance 0) over known EMPTY tiles that hold no building, or the team's own
+// conveyor / splitter; neighbours in N, E, S, W order. Then for every known ore
+// tile (row-major) that is free or holds an own harvester: from its neighbour
+// closest to the core (first in N E S W order on ties) walk down the distance
+// to the core; each cell on the way gets the direction to its next cell (the
+// first path to reach a cell keeps it). An ore tile next to the core needs no
+// conveyor. Unknown tiles, walls, void, ore and other buildings are not paths.
+void ObsMemory::plan_paths(std::vector<int8_t>& plan) const {
+    const int N = W * H;
+    plan.assign(N, 0);
+    static const int NX[4] = {0, 1, 0, -1}, NY[4] = {-1, 0, 1, 0};
+    static const int8_t NDIR[4] = {1, 3, 5, 7};          // Dir codes of N, E, S, W (a local N below is the tile count)
+    std::vector<int> dist(N, -1), q;
+    q.reserve(N);
+    for (int t = 0; t < N; t++)
+        if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == CORE) { dist[t] = 0; q.push_back(t); }
+    auto passable = [&](int t) {
+        if (terrain[t] != T_EMPTY) return false;
+        if (bld_id[t] < 0) return true;
+        return bld_team[t] == team && (bld_type[t] == CONVEYOR || bld_type[t] == SPLITTER);
+    };
+    for (size_t h = 0; h < q.size(); h++) {
+        const int t = q[h], x = t % W, y = t / W;
+        for (int k = 0; k < 4; k++) {
+            const int nx = x + NX[k], ny = y + NY[k];
+            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+            const int nt = ny * W + nx;
+            if (dist[nt] >= 0 || !passable(nt)) continue;
+            dist[nt] = dist[t] + 1;
+            q.push_back(nt);
+        }
+    }
+    for (int s = 0; s < N; s++) {
+        if (terrain[s] != T_ORE_TI && terrain[s] != T_ORE_VO) continue;
+        if (bld_id[s] >= 0 && !(bld_team[s] == team && bld_type[s] == HARVESTER)) continue;
+        const int sx = s % W, sy = s / W;
+        int best = -1, bd = 1 << 30;
+        for (int k = 0; k < 4; k++) {
+            const int nx = sx + NX[k], ny = sy + NY[k];
+            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+            const int nt = ny * W + nx;
+            if (dist[nt] >= 0 && dist[nt] < bd) { best = nt; bd = dist[nt]; }
+        }
+        if (best < 0 || bd == 0) continue;
+        int c = best;
+        while (dist[c] > 0) {
+            const int x = c % W, y = c / W;
+            int nxt = -1, kk = -1;
+            for (int k = 0; k < 4; k++) {
+                const int nx = x + NX[k], ny = y + NY[k];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                const int nt = ny * W + nx;
+                if (dist[nt] == dist[c] - 1) { nxt = nt; kk = k; break; }
+            }
+            if (plan[c] == 0) plan[c] = NDIR[kk];
+            c = nxt;
+        }
+    }
+}
+
 void encode_actor(const Game& g, const ObsMemory& m, int actor,
                   std::vector<int32_t>& ch, std::vector<int32_t>& scalars) {
     ch.assign(ACTOR_SPATIAL, 0);
@@ -253,6 +315,18 @@ void encode_actor(const Game& g, const ObsMemory& m, int actor,
             int cell = (dy + HALF) * PATCH + (dx + HALF);
             for (int k = 0; k < CH_RAY; k++) ch[(size_t)(C_RAY + k) * cs + cell] = v[k];
         }
+    }
+
+    // planned conveyor paths (builders only)
+    if (e.type == BUILDER) {
+        std::vector<int8_t> plan;
+        m.plan_paths(plan);
+        for (int dy = -HALF; dy <= HALF; dy++)
+            for (int dx = -HALF; dx <= HALF; dx++) {
+                const int x = cx + dx, y = cy + dy;
+                if (!g.inb(x, y)) continue;
+                ch[(size_t)C_PATH * cs + (dy + HALF) * PATCH + (dx + HALF)] = plan[y * g.W + x];
+            }
     }
 
     // scalars

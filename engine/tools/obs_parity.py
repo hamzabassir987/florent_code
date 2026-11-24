@@ -253,6 +253,8 @@ def run_game(L, map_path, seed, rounds, rng, stats):
                 bad = compare("actor", list(cbuf), list(sbuf), pch, psc, r, aid, typ, stats)
                 stats["cells"] += len(cbuf) + len(sbuf)
                 stats["units"] += 1
+                if any(pch[E.C_PATH * E.PATCH * E.PATCH:(E.C_PATH + 1) * E.PATCH * E.PATCH]):
+                    stats["path_encodings"] = stats.get("path_encodings", 0) + 1
                 if bad:
                     stats["bad"] += bad
                 play_unit(L, g, a, typ, rng, W, H)
@@ -519,6 +521,7 @@ def main():
     print(f"leak checks: {stats['leak_checks']}, leaks: {stats['leaks']}")
     print(f"critic checks: {stats['critic_checks']}, failures: {stats['critic_bad']}")
     print(f"visit-history checks: {stats['visit_checks']}")
+    print(f"encodings with a planned conveyor path: {stats.get('path_encodings', 0)}")
     print(f"turret/core reach checks: {stats['turret_core_checks']}")
     print(f"python encode: median {med:.3f} ms, p95 {p95:.3f} ms per unit")
     print(f"elapsed {time.time() - t0:.1f}s")

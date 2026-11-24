@@ -2,7 +2,7 @@
 #pragma once
 #include <cstdint>
 
-#define TRUNK_IN_CH 59          // fe::ACTOR_CH
+#define TRUNK_IN_CH 60          // fe::ACTOR_CH
 #define TRUNK_FLAT 21120        // flat parameter vector length (layout in trunk_kernels.cu)
 #define TRUNK_SCRATCH 61984     // backward scratch floats per CTA
 #define TRUNK_THREADS 320
@@ -10,7 +10,7 @@
 // grid size (CTAs) for n samples: backward needs grid * TRUNK_SCRATCH scratch
 // floats and grid * TRUNK_FLAT gradient-accumulator floats
 int trunk_grid(long n);
-// x: [n, 59*17*17] uint8 (device); flat: [TRUNK_FLAT]; out: [n, 32]
+// x: [n, TRUNK_IN_CH*17*17] uint8 (device); flat: [TRUNK_FLAT]; out: [n, 32]
 void trunk_forward(const uint8_t* x, long n, const float* flat, float* out, void* stream);
 // gout: [n, 32]; gflat: [TRUNK_FLAT] (overwritten)
 void trunk_backward(const uint8_t* x, long n, const float* flat, const float* gout, float* scratch, float* gacc,

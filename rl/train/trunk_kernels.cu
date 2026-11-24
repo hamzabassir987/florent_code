@@ -1,6 +1,6 @@
 // Fused CUDA kernels for the actor trunk (see model.hpp, ActorImpl):
 //
-//   stem 1x1 (59 -> 32) + ReLU on the 17x17 patch, then 4 residual blocks
+//   stem 1x1 (TRUNK_IN_CH -> 32) + ReLU on the 17x17 patch, then 4 residual blocks
 //   [1x1 -> ReLU -> depthwise 3x3 -> ReLU -> 1x1 -> ReLU -> depthwise 3x3
 //   -> + input -> ReLU], read at the centre.
 //

@@ -70,15 +70,24 @@ struct Decision {
 // masked softmax.
 using Chooser = std::function<int(int head, const float* logits, const std::vector<uint8_t>& mask, float& logp)>;
 
+// Conveyor planner mask (docs/rl-layout.md): plan4[i] is the planned conveyor
+// direction (Dir code, 0 none) of the builder's i-th adjacent tile (CARD4
+// order N E S W), read from the actor observation's path channel. With a plan,
+// a conveyor / splitter may be built only on a planned tile, facing its planned
+// direction. nullptr: no planner restriction.
+void plan4_from_obs(const int32_t* spatial, int8_t plan4[4]);
+void plan4_from_obs(const float* spatial, int8_t plan4[4]);
+void plan4_from_obs(const uint8_t* spatial, int8_t plan4[4]);
+
 // Does the unit have any legal action besides waiting? (if not: no forward)
-bool has_choice(const fe::Game& g, int actor);
+bool has_choice(const fe::Game& g, int actor, const int8_t* plan4 = nullptr);
 
 // Deterministic spike rule: fire at the first neighbour (row-major) holding a
 // visible enemy entity if the spike can fire; else wait.
 bool spike_action(const fe::Game& g, int actor, Candidate& out);
 
 // Decode one turn. `logits` is this unit's policy logit row (policy_logit_count).
-Decision decide(const fe::Game& g, int actor, const float* logits, const Chooser& choose);
+Decision decide(const fe::Game& g, int actor, const float* logits, const Chooser& choose, const int8_t* plan4 = nullptr);
 
 // Masked log-softmax helpers (shared by sampling and argmax).
 int argmax_choice(const float* logits, const std::vector<uint8_t>& mask, float& logp);

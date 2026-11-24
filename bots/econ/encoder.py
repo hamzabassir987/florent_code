@@ -15,7 +15,8 @@ UNIT_TYPES = frozenset(range(6))
 CH_TERRAIN, CH_OWN, CH_ENEMY, CH_OCC = 6, 11, 10, 2
 CH_STALE, CH_VISIT, CH_ATTR_STALE = 1, 1, 2
 CH_DIR, CH_HP, CH_THREAT, CH_RAY = 9, 2, 4, 11
-ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY
+CH_PATH = 1   # builders only: planned conveyor cell, value = conveyor direction (Dir 1..8), 0 none
+ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH
 ACTOR_SPATIAL = ACTOR_CH * PATCH * PATCH
 ACTOR_SCALARS = 50
 ACTOR_COSTS = 40   # 40..49: current prices (conveyor, splitter, harvester, barrier, gunner,
@@ -31,6 +32,9 @@ C_DIR = C_ATTR_STALE + CH_ATTR_STALE
 C_HP = C_DIR + CH_DIR
 C_THREAT = C_HP + CH_HP
 C_RAY = C_THREAT + CH_THREAT
+C_PATH = C_RAY + CH_RAY
+_NXY = ((0, -1), (1, 0), (0, 1), (-1, 0))   # N, E, S, W
+_NDIR = (1, 3, 5, 7)                        # engine Dir codes of N, E, S, W
 
 
 def ray_path(x0, y0, dx, dy, maxlen=RAY_LEN):
@@ -94,6 +98,63 @@ class ObsMemory:
                 self.bot_hp[t] = ad.entity_hp_percent(u)
                 self.attr_seen_round[t] = r
             self.seen_round[t] = r
+
+    def plan_paths(self):
+        """Conveyor planner, identical to ObsMemory::plan_paths (engine/src/obs.cpp):
+        per tile the planned conveyor direction (Dir code), 0 = not on a path."""
+        W, H, team = self.W, self.H, self.team
+        N = W * H
+        terrain, bid, bty, btm = self.terrain, self.bld_id, self.bld_type, self.bld_team
+        dist = [-1] * N
+        q = [t for t in range(N) if bid[t] >= 0 and btm[t] == team and bty[t] == CORE]
+        for t in q:
+            dist[t] = 0
+
+        def passable(t):
+            if terrain[t] != T_EMPTY:
+                return False
+            if bid[t] < 0:
+                return True
+            return btm[t] == team and (bty[t] == CONVEYOR or bty[t] == SPLITTER)
+
+        h = 0
+        while h < len(q):
+            t = q[h]; h += 1
+            x, y = t % W, t // W
+            for dx, dy in _NXY:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < W and 0 <= ny < H:
+                    nt = ny * W + nx
+                    if dist[nt] < 0 and passable(nt):
+                        dist[nt] = dist[t] + 1
+                        q.append(nt)
+        plan = [0] * N
+        for s in range(N):
+            if terrain[s] != T_ORE_TI and terrain[s] != T_ORE_VO:
+                continue
+            if bid[s] >= 0 and not (btm[s] == team and bty[s] == HARVESTER):
+                continue
+            sx, sy = s % W, s // W
+            best, bd = -1, 1 << 30
+            for dx, dy in _NXY:
+                nx, ny = sx + dx, sy + dy
+                if 0 <= nx < W and 0 <= ny < H:
+                    nt = ny * W + nx
+                    if 0 <= dist[nt] < bd:
+                        best, bd = nt, dist[nt]
+            if best < 0 or bd == 0:
+                continue
+            c = best
+            while dist[c] > 0:
+                x, y = c % W, c // W
+                for k, (dx, dy) in enumerate(_NXY):
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < W and 0 <= ny < H and dist[ny * W + nx] == dist[c] - 1:
+                        if plan[c] == 0:
+                            plan[c] = _NDIR[k]
+                        c = ny * W + nx
+                        break
+        return plan
 
     def encode(self, ad):
         W, H, team = self.W, self.H, self.team
@@ -259,6 +320,20 @@ class ObsMemory:
         scalars[ACTOR_COSTS:ACTOR_COSTS + 10] = ad.costs()
         scalars[36:40] = [int(own_reaches_enemy_core), int(own_core_confirmed),
                           int(enemy_reaches_own_core), int(enemy_core_confirmed)]
+        if typ == BUILDER:                       # planned conveyor paths (builders only)
+            plan = self.plan_paths()
+            base = C_PATH * cs
+            for dy in range(-HALF, HALF + 1):
+                y = ay + dy
+                if not 0 <= y < H:
+                    continue
+                row = base + (dy + HALF) * PATCH + HALF
+                for dx in range(-HALF, HALF + 1):
+                    x = ax + dx
+                    if 0 <= x < W:
+                        v = plan[y * W + x]
+                        if v:
+                            ch[row + dx] = v
         return out, scalars
 
 

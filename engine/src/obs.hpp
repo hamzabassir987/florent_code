@@ -40,7 +40,8 @@ constexpr int CH_DIR = 9;            // building direction one-hot: centre, then
 constexpr int CH_HP = 2;             // remembered building / builder HP percentage
 constexpr int CH_THREAT = 4;         // own/enemy remembered turret reach: possible / confirmed
 constexpr int CH_RAY = 11;           // ray aggregates, written on boundary cells only
-constexpr int ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY;  // 57
+constexpr int CH_PATH = 1;           // builders only: planned conveyor cell, value = conveyor direction (Dir 1..8), 0 none
+constexpr int ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH;  // 60
 constexpr int ACTOR_SPATIAL = ACTOR_CH * PATCH * PATCH;
 // 40 base scalars, then the team's current price of each buildable type
 // (controller get_*_cost(), in ACTOR_COST_TYPES order)
@@ -58,6 +59,7 @@ constexpr int C_DIR = C_ATTR_STALE + CH_ATTR_STALE;
 constexpr int C_HP = C_DIR + CH_DIR;
 constexpr int C_THREAT = C_HP + CH_HP;
 constexpr int C_RAY = C_THREAT + CH_THREAT;
+constexpr int C_PATH = C_RAY + CH_RAY;
 
 // per-unit fog memory (one instance per unit)
 struct ObsMemory {
@@ -77,6 +79,9 @@ struct ObsMemory {
     std::vector<int32_t> attr_seen_round; // last round entity attributes were observed
 
     void init(const Game& g, int team_);
+    // Conveyor plan from this memory (see plan_paths in obs.cpp): per tile the
+    // planned conveyor direction (Dir N/E/S/W), 0 = not on a planned path.
+    void plan_paths(std::vector<int8_t>& plan) const;
     void update(const Game& g, int actor);
 };
 

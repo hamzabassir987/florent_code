@@ -1,4 +1,5 @@
 #include "florent_heads.hpp"
+#include "obs.hpp"
 
 #include <cmath>
 #include <limits>
@@ -62,7 +63,7 @@ struct BuilderOpts {
     uint8_t build[9][4][8] = {};      // [type][tile][dir index] (non-directional: dir index 0)
     int tx[4], ty[4];
 };
-static void builder_opts(const Game& g, int a, BuilderOpts& o) {
+static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* plan4 = nullptr) {
     const Entity& e = g.ents[a];
     for (int i = 0; i < 4; i++) {
         o.tx[i] = e.x + DX[CARD4[i]]; o.ty[i] = e.y + DY[CARD4[i]];
@@ -75,7 +76,9 @@ static void builder_opts(const Game& g, int a, BuilderOpts& o) {
             int type = BUILD_ORDER[t];
             if (!in) continue;
             if (directional(type)) {
-                for (int d = 0; d < 8; d++) o.build[t][i][d] = g.can_build(a, type, o.tx[i], o.ty[i], d + 1) == OK;
+                const bool planned = plan4 && (type == CONVEYOR || type == SPLITTER);
+                for (int d = 0; d < 8; d++)
+                    o.build[t][i][d] = (!planned || plan4[i] == d + 1) && g.can_build(a, type, o.tx[i], o.ty[i], d + 1) == OK;
             } else {
                 o.build[t][i][0] = g.can_build(a, type, o.tx[i], o.ty[i], C) == OK;
             }
@@ -120,12 +123,22 @@ static void launcher_opts(const Game& g, int a, LauncherOpts& o) {
 
 static bool any(const uint8_t* m, int n) { for (int i = 0; i < n; i++) if (m[i]) return true; return false; }
 
-bool has_choice(const Game& g, int a) {
+template <class T>
+static void plan4_impl(const T* sp, int8_t plan4[4]) {
+    const int cs = fe::PATCH * fe::PATCH, c = fe::HALF;
+    const int cell[4] = {(c - 1) * fe::PATCH + c, c * fe::PATCH + c + 1, (c + 1) * fe::PATCH + c, c * fe::PATCH + c - 1};  // N E S W
+    for (int i = 0; i < 4; i++) plan4[i] = int8_t(sp[size_t(fe::C_PATH) * cs + cell[i]]);
+}
+void plan4_from_obs(const int32_t* sp, int8_t plan4[4]) { plan4_impl(sp, plan4); }
+void plan4_from_obs(const float* sp, int8_t plan4[4]) { plan4_impl(sp, plan4); }
+void plan4_from_obs(const uint8_t* sp, int8_t plan4[4]) { plan4_impl(sp, plan4); }
+
+bool has_choice(const Game& g, int a, const int8_t* plan4) {
     if (a < 0 || a >= int(g.ents.size()) || !g.ents[a].alive) return false;
     switch (g.ents[a].type) {
     case CORE: { CoreOpts o; core_opts(g, a, o); return any(o.spawn + 1, 12) || any(o.conv + 1, 4); }
     case BUILDER: {
-        BuilderOpts o; builder_opts(g, a, o);
+        BuilderOpts o; builder_opts(g, a, o, plan4);
         return any(o.move, 4) || any(o.attack, 4) || any(o.heal, 4) || any(o.destroy, 4) ||
                any(&o.build[0][0][0], 9 * 4 * 8);
     }
@@ -168,7 +181,7 @@ int argmax_choice(const float* l, const std::vector<uint8_t>& m, float& logp) {
 }
 
 // ---- decode ----------------------------------------------------------------
-Decision decide(const Game& g, int a, const float* logits, const Chooser& choose) {
+Decision decide(const Game& g, int a, const float* logits, const Chooser& choose, const int8_t* plan4) {
     Decision d;
     const Entity& e = g.ents[a];
     int p = policy_of_type(e.type);
@@ -187,7 +200,7 @@ Decision decide(const Game& g, int a, const float* logits, const Chooser& choose
         int c = run(HC_CONVERT, vec(o.conv, 5));
         if (c > 0) d.actions.push_back({ActionKind::Convert, o.amount[c]});
     } else if (p == P_BUILDER) {
-        BuilderOpts o; builder_opts(g, a, o);
+        BuilderOpts o; builder_opts(g, a, o, plan4);
         uint8_t bt[9] = {0};
         for (int t = 0; t < 9; t++) bt[t] = any(&o.build[t][0][0], 4 * 8);
         uint8_t mode[6] = {1, any(o.move, 4), any(bt, 9), any(o.attack, 4), any(o.heal, 4), any(o.destroy, 4)};

@@ -12,7 +12,7 @@ import sys
 from array import array
 
 PATCH, HALF = 17, 8
-ACTOR_CH, SCALARS = 59, 50
+ACTOR_CH, SCALARS = 60, 50   # 60th channel: planned conveyor direction (copied as is, 1..8)
 COSTS = 40
 BITS = 16
 # 4 residual blocks x 2 (1x1 -> depthwise 3x3) layers = 8 depthwise convs:
@@ -153,7 +153,7 @@ class StudentPolicy:
         for pd in data["policies"]:
             p = pd["policy"]
             P = {"shifts": pd["shifts"], "n": pd["nlogits"]}
-            sw = pd["stem_w"]                      # [C][59][1][1]
+            sw = pd["stem_w"]                      # [C][ACTOR_CH][1][1]
             P["stem"] = [[sw[co * ACTOR_CH + ci] for ci in range(ACTOR_CH)] for co in range(C)]
             P["stem_b"] = pd["stem_b"]
             for b in range(LAYERS):

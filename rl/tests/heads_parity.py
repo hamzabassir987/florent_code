@@ -103,10 +103,14 @@ class EngineCt:
         return None if o[2] == -1 else o[2]
 
 
-def cpp_decide(L, g, a, logits):
+def cplan(plan4):
+    return None if plan4 is None else (ctypes.c_int * 4)(*plan4)
+
+
+def cpp_decide(L, g, a, logits, plan4=None):
     out = (ctypes.c_int * 8192)()
     arr = (ctypes.c_float * len(logits))(*logits)
-    L.rl_decide(g, a, arr, out)
+    L.rl_decide(g, a, arr, out, cplan(plan4))
     k = 0
     n = out[k]; k += 1
     acts = []
@@ -169,7 +173,14 @@ def main():
                 p = L.rl_policy_of_type(typ)
                 if p < 0:
                     continue
-                c_has = L.rl_has_choice(g, a) == 1
+                # conveyor planner mask: half the builder turns get a random plan
+                # (each adjacent tile: no plan, or a random direction)
+                plan4 = None
+                if typ == 0 and rng.random() < 0.5:
+                    plan4 = [rng.choice((0, 0, 1, 3, 5, 7, rng.randint(1, 8))) for _ in range(4)]
+                    stats["planned"] = stats.get("planned", 0) + 1
+                api.plan4 = plan4
+                c_has = L.rl_has_choice(g, a, cplan(plan4)) == 1
                 p_has = H.has_choice(api)
                 if c_has != p_has:
                     stats["mismatch"] += 1
@@ -179,12 +190,16 @@ def main():
                     continue
                 stats["turns"] += 1
                 logits = [rng.uniform(-3, 3) for _ in range(L.rl_policy_logits(p))]
-                if p == H.P_BUILDER and gi % 2 == 1:   # tilt toward turrets/launchers for coverage
+                if p == H.P_BUILDER and plan4 is not None:   # tilt toward conveyors / splitters: the planner mask
+                    logits[H.head_offset(p, H.HB_MODE) + 2] += 2.5
+                    for t in (0, 1):
+                        logits[H.head_offset(p, H.HB_BTYPE) + t] += 3.0
+                elif p == H.P_BUILDER and gi % 2 == 1:   # tilt toward turrets/launchers for coverage
                     logits[H.head_offset(p, H.HB_MODE) + 2] += 2.5
                     for t in (3, 4, 5, 6):
                         logits[H.head_offset(p, H.HB_BTYPE) + t] += 3.0
                 logits = [float(ctypes.c_float(v).value) for v in logits]
-                c_acts, c_recs = cpp_decide(L, g, a, logits)
+                c_acts, c_recs = cpp_decide(L, g, a, logits, plan4)
                 p_acts, p_recs = H.decide(api, logits)
                 p_recs2 = [(h, m, c) for h, m, c, _ in p_recs]
                 p_acts2 = [py_action_tuple(x) for x in p_acts]
