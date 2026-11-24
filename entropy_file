@@ -18,6 +18,16 @@ game_rounds 200
 # same Ti/Vo counts); -1 keeps the map's ore. Applies to games started afterwards.
 ore_radius 4
 
+# map generator (rl/sim/map_gen.hpp): random maps shaped like the real ones,
+# symmetric, with the core distance under control. Eval keeps the real maps.
+# map_gen: share of training games on generated maps (0: real maps only)
+# core_distance: tiles between the two cores on generated maps (-1: random 7..21);
+#   start small (~8) so fighting is learned early, then raise it
+# pit_share: share of generated maps with a pit (the cores face each other across it)
+map_gen 0
+core_distance -1
+pit_share 0.15
+
 # eval: every eval_every iterations, eval_games greedy games against the frozen
 # net (half on each side); >= 85% wins promotes the live net to frozen.
 # Game 0 is logged to replays/ for rl/tools/make_replay.py.

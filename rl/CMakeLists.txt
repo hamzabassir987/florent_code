@@ -6,6 +6,7 @@ add_library(florent_rl_core STATIC
   sim/florent_actions.cpp
   sim/florent_heads.cpp
   sim/florent_game.cpp
+  sim/map_gen.cpp
 )
 set_target_properties(florent_rl_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # engine + heads C API in one library, for the Python parity tests
@@ -13,6 +14,8 @@ add_library(rlcapi SHARED sim/heads_capi.cpp ../engine/src/capi.cpp)
 target_link_libraries(rlcapi PRIVATE florent_rl_core)
 target_include_directories(florent_rl_core PUBLIC ../engine/src sim train)
 target_sources(florent_rl_core PRIVATE ../engine/src/fengine.cpp ../engine/src/obs.cpp)
+add_executable(map_gen_dump tests/map_gen_dump.cpp)
+target_link_libraries(map_gen_dump PRIVATE florent_rl_core)
 add_executable(action_smoke tests/action_smoke.cpp)
 target_link_libraries(action_smoke PRIVATE florent_rl_core)
 add_executable(rollout_smoke tests/rollout_smoke.cpp)

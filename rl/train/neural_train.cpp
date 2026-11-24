@@ -67,6 +67,7 @@
 #include "../sim/florent_heads.hpp"
 #include "entropy_file.hpp"
 #include "game_log.hpp"
+#include "../sim/map_gen.hpp"
 #include "model.hpp"
 #include "trajectory.hpp"
 
@@ -128,6 +129,7 @@ constexpr int NUM_KINDS = 11;
 // GAMES
 // ===========================================================================
 struct EndStat {
+    std::string kind;              // map: file stem, or gen_g<gap>[_pit]; + _ore<r> with ore_radius
     int rounds = 0, winner = -1;
     std::string cond;
     int ti_col[2] = {0, 0}, vo_col[2] = {0, 0}, harv[2] = {0, 0}, units[2] = {0, 0};
@@ -182,6 +184,8 @@ struct Slot {
     int net_of[2] = {0, 0}; bool greedy = false, record = true;
     std::vector<ActionLine>* log = nullptr;
     std::string map_path; uint64_t seed = 0;
+    std::string kind;                                // for games.csv (see EndStat::kind)
+    bool real_maps_only = false;                     // eval: the real maps only
     // outputs
     std::vector<Segment> segs;
     std::vector<Sample> samples;
@@ -201,9 +205,23 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
 
 static void start_game(Slot& s, const Setup& S) {
     s.m = Match();
-    s.map_path = S.maps[s.rng() % S.maps.size()];
-    s.seed = s.rng() & 0xFFFFFFFFull;
-    if (!s.m.load(s.map_path, s.seed)) { std::cerr << "bad map " << s.map_path << "\n"; std::exit(3); }
+    const bool gen = !s.real_maps_only && S.K->map_gen > 0.f && std::uniform_real_distribution<float>(0.f, 1.f)(s.rng) < S.K->map_gen;
+    if (gen) {
+        // a generated map (rl/sim/map_gen.hpp): core distance and pits under the entropy file's control
+        MapGenParams P; P.core_gap = S.K->core_distance; P.pit_share = S.K->pit_share;
+        MapGenInfo info;
+        const std::string bytes = generate_map(P, s.rng, &info);
+        s.map_path = "(generated)";
+        s.seed = s.rng() & 0xFFFFFFFFull;
+        if (!s.m.load_bytes(bytes, s.seed)) { std::cerr << "generated map failed to load: " << info.line << "\n"; std::exit(3); }
+        s.kind = "gen_g" + std::to_string(info.gap) + (info.pit ? "_pit" : "");
+    } else {
+        s.map_path = S.maps[s.rng() % S.maps.size()];
+        s.seed = s.rng() & 0xFFFFFFFFull;
+        if (!s.m.load(s.map_path, s.seed)) { std::cerr << "bad map " << s.map_path << "\n"; std::exit(3); }
+        s.kind = fs::path(s.map_path).stem().string();
+    }
+    if (S.K->ore_radius >= 0) s.kind += "_ore" + std::to_string(S.K->ore_radius);
     s.m.reset();
     s.m.game.round = s.start_round;
     s.start_round = 0;              // staggered once (the games of iteration 0); every restart starts at round 0
@@ -222,6 +240,7 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
             if (s.m.game.over) {
                 s.segs.back().terminal = true;
                 s.ended.push_back(end_stat(s.m.game));
+                s.ended.back().kind = s.kind;
                 if (!restart) { s.done = true; return; }
                 start_game(s, S);
             }
@@ -1209,9 +1228,8 @@ int main(int argc, char** argv) {
                 << "," << K.lr << "," << EPOCHS << "," << K.game_rounds << "," << K.ore_radius << "," << s_roll << "," << s_upd;
         for (int h = 0; h < NUM_HEAD_IDS; h++) { ppo_log << ","; if (head_n[h]) ppo_log << head_ent[h] / head_n[h]; }
         ppo_log << std::endl;
-        const std::string map_kind = K.ore_radius >= 0 ? "ore_r" + std::to_string(K.ore_radius) : std::string("map");
         for (auto& e : ended)
-            games_log << it << "," << map_kind << "," << e.rounds << "," << e.winner << "," << e.cond
+            games_log << it << "," << e.kind << "," << e.rounds << "," << e.winner << "," << e.cond
                       << "," << e.ti_col[0] << "," << e.ti_col[1] << "," << e.vo_col[0] << "," << e.vo_col[1]
                       << "," << e.harv[0] << "," << e.harv[1] << "," << e.units[0] << "," << e.units[1] << "\n";
         games_log.flush();
@@ -1237,7 +1255,7 @@ int main(int argc, char** argv) {
                     Slot& s = ev_slots[i];
                     s.rng.seed(0xE7A1ull * uint64_t(it) + uint64_t(i) * 31337ull + uint64_t(mode));
                     s.net_of[0] = i & 1; s.net_of[1] = 1 - (i & 1);   // live (net 0) is A on even games
-                    s.greedy = greedy; s.record = false;
+                    s.greedy = greedy; s.record = false; s.real_maps_only = true;   // eval: the real maps
                     if (i == 0 && greedy) s.log = &log0;
                     start_game(s, S);
                 }

@@ -1,6 +1,7 @@
 #include "florent_game.hpp"
 namespace florent_rl {
 bool Match::load(const std::string& p,uint64_t s){ map_path=p; seed=s; return game.load_map(p); }
+bool Match::load_bytes(const std::string& b,uint64_t s){ map_path="(generated)"; seed=s; return game.load_map_bytes(reinterpret_cast<const uint8_t*>(b.data()), b.size()); }
 void Match::reset(){ game.reset(seed); memories.clear(); critic_round=-1; }
 std::vector<int> Match::acting_units() const { return game.turn_order(); }
 bool Match::round_critic(){ if(critic_round==game.round) return false; fe::encode_critic(game,critic_channels,critic_scalars); critic_round=game.round; return true; }

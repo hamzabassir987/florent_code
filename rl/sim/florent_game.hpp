@@ -14,6 +14,7 @@ struct Match {
     std::vector<int32_t> critic_channels, critic_scalars;
     std::unordered_map<int, fe::ObsMemory> memories;
     bool load(const std::string& path, uint64_t s);
+    bool load_bytes(const std::string& map26, uint64_t s);   // a generated map (rl/sim/map_gen.hpp)
     void reset();
     bool round_critic();
     int terminal_reward(int team) const;

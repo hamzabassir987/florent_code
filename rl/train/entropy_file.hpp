@@ -10,6 +10,9 @@
 //     ore_radius 2           # all ore moved to random tiles within this distance
 //                            # of each core, mirrored (same Ti/Vo counts as the
 //                            # map); -1: map as is. Applies to games started afterwards
+//     map_gen 0.5            # share of training games on generated maps (rl/sim/map_gen.hpp)
+//     core_distance 8        # generated maps: tiles between the two cores (-1: random 7..21)
+//     pit_share 0.15         # generated maps: share with a pit (cores face each other across it)
 //     eval_every 50          # every N iterations: eval vs the frozen net (0: off)
 //     eval_games 200         # games per eval (half on each side)
 //
@@ -40,6 +43,9 @@ struct Knobs {
     int epochs;
     int game_rounds = 1000;
     int ore_radius = -1;
+    float map_gen = 0.f;       // share of training games on generated maps
+    int core_distance = -1;    // generated maps: tiles between the cores; -1 random 7..21
+    float pit_share = 0.15f;   // generated maps: share with a pit
     int eval_every = 50, eval_games = 200;
 };
 
@@ -53,6 +59,9 @@ inline bool read_entropy_file(const std::string& path, Knobs& k) {
         if (key == "epochs") { k.epochs = std::clamp(int(v), 1, 8); return; }
         if (key == "game_rounds") { k.game_rounds = std::clamp(int(v), 1, 1000); return; }
         if (key == "ore_radius") { k.ore_radius = int(v); return; }
+        if (key == "map_gen") { k.map_gen = std::clamp(float(v), 0.f, 1.f); return; }
+        if (key == "core_distance") { k.core_distance = int(v); return; }
+        if (key == "pit_share") { k.pit_share = std::clamp(float(v), 0.f, 1.f); return; }
         if (key == "eval_every") { k.eval_every = std::max(0, int(v)); return; }
         if (key == "eval_games") { k.eval_games = std::max(2, int(v)); return; }
         for (int h = 0; h < NUM_HEAD_IDS; h++)
