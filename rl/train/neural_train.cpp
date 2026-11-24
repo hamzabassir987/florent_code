@@ -37,6 +37,11 @@
 // Live knobs in the entropy file, see entropy_file.hpp.
 #include <omp.h>
 #include <torch/torch.h>
+#ifdef FLORENT_CUDA_GRAPHS
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -324,6 +329,74 @@ static void play_decision(Slot& s, const Setup& S, bool train) {
     s.need = false; s.pos++;
 }
 
+// ===========================================================================
+// ROLLOUT FORWARD, with CUDA graphs
+// ===========================================================================
+// A rollout runs thousands of small forwards (one per policy per step), so on
+// a GPU the time goes to launching kernels, not to computing. A CUDA graph
+// records one forward's kernels once and replays them with a single launch.
+// One graph per (net, policy, batch bucket): the batch is padded up to a
+// power of two (>= 8); the padded rows' outputs are ignored. The weights are
+// updated in place (optimizer, copy_model), so a graph stays valid all run.
+// Each new graph is checked once against the plain forward; a mismatch turns
+// graphs off (CUDA_GRAPHS=0 turns them off from the start).
+struct FwdGraphs {
+    bool enabled = false;
+#ifdef FLORENT_CUDA_GRAPHS
+    struct Entry { std::unique_ptr<at::cuda::CUDAGraph> g; torch::Tensor sp, sc, out; };
+    std::map<std::tuple<const void*, int, long>, Entry> m;
+#endif
+};
+static FwdGraphs g_graphs;
+
+static torch::Tensor policy_forward(Teacher& net, int p, const torch::Tensor& sp_host, const torch::Tensor& sc_host, torch::Device dev) {
+#ifdef FLORENT_CUDA_GRAPHS
+    if (g_graphs.enabled && dev.is_cuda()) {
+        const long n = sp_host.size(0);
+        long B = 8; while (B < n) B *= 2;
+        const auto key = std::make_tuple((const void*)net.get(), p, B);
+        auto it = g_graphs.m.find(key);
+        if (it == g_graphs.m.end()) {
+            FwdGraphs::Entry e;
+            auto opt = torch::TensorOptions().device(dev);
+            e.sp = torch::zeros({B, fe::ACTOR_SPATIAL}, opt.dtype(torch::kUInt8));
+            e.sc = torch::zeros({B, fe::ACTOR_SCALARS}, opt.dtype(torch::kInt16));
+            {
+                auto st = c10::cuda::getStreamFromPool();
+                st.synchronize();
+                c10::cuda::CUDAStreamGuard guard(st);
+                for (int w = 0; w < 3; w++) net->logits_split(p, e.sp, e.sc);     // warm-up before capture
+                st.synchronize();
+                e.g = std::make_unique<at::cuda::CUDAGraph>();
+                e.g->capture_begin();
+                e.out = net->logits_split(p, e.sp, e.sc);
+                e.g->capture_end();
+                st.synchronize();
+            }
+            // check the graph against the plain forward on this batch
+            e.sp.narrow(0, 0, n).copy_(sp_host); e.sc.narrow(0, 0, n).copy_(sc_host);
+            e.g->replay();
+            auto ref = net->logits_split(p, sp_host.to(dev), sc_host.to(dev));
+            const double diff = (e.out.narrow(0, 0, n) - ref).abs().max().item<double>();
+            std::cout << "  cuda graph  captured: policy " << p << " batch " << B << ", check max diff " << diff << std::endl;
+            if (!(diff < 1e-3)) {
+                std::cout << "  cuda graph  mismatch: graphs off for the rest of the run" << std::endl;
+                g_graphs.enabled = false;
+                return ref.to(torch::kCPU);
+            }
+            it = g_graphs.m.emplace(key, std::move(e)).first;
+            return it->second.out.narrow(0, 0, n).to(torch::kCPU);
+        }
+        FwdGraphs::Entry& e = it->second;
+        e.sp.narrow(0, 0, n).copy_(sp_host);
+        e.sc.narrow(0, 0, n).copy_(sc_host);
+        e.g->replay();
+        return e.out.narrow(0, 0, n).to(torch::kCPU);
+    }
+#endif
+    return net->logits_split(p, sp_host.to(dev), sc_host.to(dev)).to(torch::kCPU);
+}
+
 struct PlayStats { long steps = 0; double t_encode = 0, t_forward = 0, t_act = 0, t_critic = 0; long critic_rows = 0; };
 
 // Kept value rows (for the value loss): the critic input and the return.
@@ -392,7 +465,7 @@ static PlayStats play(std::vector<Slot>& slots, const Setup& S, const std::vecto
                 for (long j = 0; j < n; j++)
                     actor_compact(slots[idx[j]].obs, tsp.data_ptr<uint8_t>() + j * fe::ACTOR_SPATIAL,
                                   tsc.data_ptr<int16_t>() + j * fe::ACTOR_SCALARS, slots[idx[j]].oob);
-                auto l = (*nets[k])->logits_split(p, tsp.to(dev), tsc.to(dev)).to(torch::kCPU).contiguous();
+                auto l = policy_forward(*nets[k], p, tsp, tsc, dev).contiguous();
                 const long L = l.size(1);
                 const float* lp = l.data_ptr<float>();
                 for (long j = 0; j < n; j++) slots[idx[j]].logits.assign(lp + j * L, lp + (j + 1) * L);
@@ -458,6 +531,9 @@ int main(int argc, char** argv) {
         if ((!d || std::string(d) == "cuda") && torch::cuda::is_available()) dev = torch::Device(torch::kCUDA);
     }
     torch::manual_seed(7);
+#ifdef FLORENT_CUDA_GRAPHS
+    g_graphs.enabled = dev.is_cuda() && env_int("CUDA_GRAPHS", 1) != 0;
+#endif
 
     const std::string KNOB_PATH = std::getenv("ENTROPY_FILE") ? std::getenv("ENTROPY_FILE") : "entropy_file";
     Knobs K;
@@ -501,7 +577,7 @@ int main(int argc, char** argv) {
         for (auto& t : pol_params) np += t.numel();
         for (auto& t : val_params) nv += t.numel();
         std::cout << "train: " << S.maps.size() << " maps, " << G << " games x " << R << " rounds an iteration, " << N_MINI << " minibatches a pass, micro-batch " << MICRO << ", critic batch " << CRITIC_BATCH
-                  << ", device " << (dev.is_cuda() ? "cuda" : "cpu") << ", " << T << " threads\n"
+                  << ", device " << (dev.is_cuda() ? "cuda" : "cpu") << (g_graphs.enabled ? " (rollout cuda graphs)" : "") << ", " << T << " threads\n"
                   << "train: params policy " << np << ", value " << nv << ", value rows kept " << S.value_keep
                   << ", decisions recorded " << S.record_p << "\n"
                   << "train: lr " << INITIAL_LR << " -> " << FINAL_LR << " over " << iterations << " iterations (an lr line in "
@@ -619,6 +695,53 @@ int main(int argc, char** argv) {
         const size_t VB = std::max<size_t>(1, (kept.size() + N_MINI - 1) / N_MINI);
         std::vector<int> vo(kept.size()); std::iota(vo.begin(), vo.end(), 0);
 
+        // ---- pack the iteration's samples once (instead of per minibatch and head)
+        //  SP / SC: every sample's input, one contiguous host tensor each (pinned
+        //  on CUDA); a chunk gathers its rows with index_select and uploads them.
+        //  Per head h: its records as device tensors (choice, mask, old logp,
+        //  advantage), and rec_of[h][sample] = the sample's record in head h, -1 none.
+        const long NS = long(samples.size());
+        const bool cuda = dev.is_cuda();
+        using uclk = std::chrono::steady_clock;
+        auto sync_now = [&] { if (cuda) torch::cuda::synchronize(); return uclk::now(); };
+        double t_pack = 0, t_pol = 0, t_val = 0;
+        const auto tp0 = uclk::now();
+        auto host_opts = [&](torch::ScalarType t) { return torch::TensorOptions().dtype(t).pinned_memory(cuda); };
+        torch::Tensor SP = torch::empty({NS, fe::ACTOR_SPATIAL}, host_opts(torch::kUInt8));
+        torch::Tensor SC = torch::empty({NS, fe::ACTOR_SCALARS}, host_opts(torch::kInt16));
+        {
+            uint8_t* spp = SP.data_ptr<uint8_t>(); int16_t* scp = SC.data_ptr<int16_t>();
+            #pragma omp parallel for schedule(static)
+            for (long i = 0; i < NS; i++) {
+                std::memcpy(spp + i * fe::ACTOR_SPATIAL, samples[i].sp.data(), fe::ACTOR_SPATIAL);
+                std::memcpy(scp + i * fe::ACTOR_SCALARS, samples[i].sc.data(), sizeof(int16_t) * fe::ACTOR_SCALARS);
+                std::vector<uint8_t>().swap(samples[i].sp);        // the packed copy is the one used now
+            }
+        }
+        std::vector<std::vector<int>> rec_of(NUM_HEAD_IDS, std::vector<int>(NS, -1));
+        torch::Tensor HCH[NUM_HEAD_IDS], HMK[NUM_HEAD_IDS], HOLP[NUM_HEAD_IDS], HADV[NUM_HEAD_IDS];
+        {
+            std::vector<long> ch[NUM_HEAD_IDS]; std::vector<uint8_t> mk[NUM_HEAD_IDS];
+            std::vector<float> olp[NUM_HEAD_IDS], adv[NUM_HEAD_IDS];
+            for (long i = 0; i < NS; i++)
+                for (auto& rec : samples[i].recs) {
+                    const int h = rec.head;
+                    rec_of[h][i] = int(ch[h].size());
+                    ch[h].push_back(rec.choice);
+                    mk[h].insert(mk[h].end(), rec.mask.begin(), rec.mask.end());
+                    olp[h].push_back(rec.old_logp); adv[h].push_back(samples[i].adv);
+                }
+            for (int h = 0; h < NUM_HEAD_IDS; h++) {
+                const long k = long(ch[h].size());
+                if (!k) continue;
+                HCH[h] = torch::tensor(ch[h], torch::kLong).to(dev);
+                HMK[h] = torch::from_blob(mk[h].data(), {k, HEAD_SIZE[h]}, torch::kUInt8).to(dev).to(torch::kBool);
+                HOLP[h] = torch::tensor(olp[h]).to(dev);
+                HADV[h] = torch::tensor(adv[h]).to(dev);
+            }
+        }
+
+        t_pack = std::chrono::duration<double>(sync_now() - tp0).count();
         // Per-minibatch sums, kept on the device and read back once per
         // minibatch (no .item() per head).
         struct Acc {
@@ -638,33 +761,25 @@ int main(int argc, char** argv) {
         // chunk's share is H_chunk / (cnt_h * h_mean_h).
         auto chunk = [&](int p, const int* rows, long nr, bool grad, Acc& acc, long n_total,
                          const long* cnt_total, const double* h_mean, int present) -> torch::Tensor {
-            auto tsp = torch::empty({nr, fe::ACTOR_SPATIAL}, torch::kUInt8);
-            auto tsc = torch::empty({nr, fe::ACTOR_SCALARS}, torch::kInt16);
-            for (long b = 0; b < nr; b++) {
-                const Sample& sm = samples[rows[b]];
-                std::memcpy(tsp.data_ptr<uint8_t>() + b * fe::ACTOR_SPATIAL, sm.sp.data(), fe::ACTOR_SPATIAL);
-                std::memcpy(tsc.data_ptr<int16_t>() + b * fe::ACTOR_SCALARS, sm.sc.data(), sizeof(int16_t) * fe::ACTOR_SCALARS);
-            }
-            auto logits = net->logits_split(p, tsp.to(dev), tsc.to(dev));
+            auto rows_t = torch::from_blob(const_cast<int*>(rows), {nr}, torch::kInt32).to(torch::kLong);
+            auto sp = SP.index_select(0, rows_t), sc = SC.index_select(0, rows_t);
+            if (cuda) { sp = sp.pin_memory(); sc = sc.pin_memory(); }
+            auto logits = net->logits_split(p, sp.to(dev, /*non_blocking=*/cuda), sc.to(dev, cuda));
             torch::Tensor loss = torch::zeros({}, dev);
             for (int head : policy_heads(p)) {
-                const int n = HEAD_SIZE[head];
-                std::vector<long> rr, ch; std::vector<uint8_t> mk; std::vector<float> olp, adv;
-                for (long b = 0; b < nr; b++)
-                    for (auto& rec : samples[rows[b]].recs)
-                        if (rec.head == head) {
-                            rr.push_back(b); ch.push_back(rec.choice);
-                            mk.insert(mk.end(), rec.mask.begin(), rec.mask.end());
-                            olp.push_back(rec.old_logp); adv.push_back(samples[rows[b]].adv);
-                        }
+                // this chunk's records of the head: (row in the chunk, record index)
+                std::vector<long> rr, ri;
+                const std::vector<int>& ro = rec_of[head];
+                for (long b = 0; b < nr; b++) { const int x = ro[rows[b]]; if (x >= 0) { rr.push_back(b); ri.push_back(x); } }
                 if (rr.empty()) continue;
                 const long k = long(rr.size());
-                auto hl = logits.index_select(0, torch::tensor(rr, torch::kLong).to(dev)).narrow(1, head_offset(p, head), n);
-                auto mask = torch::from_blob(mk.data(), {k, n}, torch::kUInt8).to(dev).to(torch::kBool);
+                auto ri_t = torch::tensor(ri, torch::kLong).to(dev);
+                auto hl = logits.index_select(0, torch::tensor(rr, torch::kLong).to(dev)).narrow(1, head_offset(p, head), HEAD_SIZE[head]);
+                auto mask = HMK[head].index_select(0, ri_t);
                 auto lsm = torch::log_softmax(hl.masked_fill(~mask, -1e9f), 1);
-                auto new_lp = lsm.gather(1, torch::tensor(ch, torch::kLong).view({k, 1}).to(dev)).squeeze(1);
-                auto log_ratio = new_lp - torch::tensor(olp).to(dev);
-                auto A = torch::tensor(adv).to(dev);
+                auto new_lp = lsm.gather(1, HCH[head].index_select(0, ri_t).view({k, 1})).squeeze(1);
+                auto log_ratio = new_lp - HOLP[head].index_select(0, ri_t);
+                auto A = HADV[head].index_select(0, ri_t);
                 auto ratio = torch::exp(log_ratio);
                 auto surr = torch::min(ratio * A, torch::clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * A).sum();
                 auto H = -(lsm.exp().masked_fill(~mask, 0.f) * lsm.masked_fill(~mask, 0.f)).sum();   // summed over k records
@@ -713,11 +828,12 @@ int main(int argc, char** argv) {
                 // head record counts and the heads present, from the records (CPU, no forward)
                 long cnt_total[NUM_HEAD_IDS] = {}; long n_total = 0; int present = 0;
                 for (size_t k = s0; k < s1; k++)
-                    for (auto& rec : samples[order[k]].recs) { cnt_total[rec.head]++; n_total++; }
+                    for (auto& rec : samples[order[k]].recs) { cnt_total[rec.head]++; n_total++; }   // recs kept (small): counts only
                 for (int h = 0; h < NUM_HEAD_IDS; h++) present += cnt_total[h] > 0;
                 if (!n_total) continue;
                 bool split = false;
                 for (int p = 0; p < NUM_POLICIES; p++) split |= by_pol[p].size() > size_t(MICRO);
+                const auto tq0 = sync_now();
                 // no-grad pass only when needed: the KL check (pass 2+) or a policy split into chunks
                 double h_mean[NUM_HEAD_IDS] = {};
                 if (ep > 0 || split) {
@@ -754,7 +870,11 @@ int main(int argc, char** argv) {
                 }
                 pl_sum += -rp[0] / double(acc.n); ent_sum += ent_mean / std::max(1, present);
                 kl_sum += rp[1] / double(acc.n); nrec += acc.n; clipped += long(rp[2]); n_steps++;
+                const auto tq1 = sync_now();
                 value_step(j);
+                const auto tq2 = sync_now();
+                t_pol += std::chrono::duration<double>(tq1 - tq0).count();
+                t_val += std::chrono::duration<double>(tq2 - tq1).count();
             }
         }
         const auto t_upd = std::chrono::steady_clock::now();
@@ -840,7 +960,8 @@ int main(int argc, char** argv) {
             }
         }
         o << "  " << lfmt::label("time") << std::fixed << std::setprecision(1) << s_roll + s_upd << " s (rollout " << s_roll
-          << " s, update " << s_upd << " s)\n" << std::defaultfloat;
+          << " s, update " << s_upd << " s: pack " << std::setprecision(2) << t_pack << ", policy " << t_pol
+          << ", value " << t_val << ")\n" << std::defaultfloat;
         std::cout << o.str() << std::flush;
 
         ppo_log << it << "," << samples.size() << "," << recs << "," << ended.size() << "," << ended_a << "," << mean_rounds
