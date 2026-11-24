@@ -97,6 +97,13 @@ class EngineCt:
         i = self.L.fe_bot_at(self.g, p.x, p.y)
         return None if i < 0 else self.ent(i)[0]
 
+    def get_tile_env(self, p):
+        from fcode import Environment
+        o = (ctypes.c_int * 5)()
+        self.L.fe_vis_tile(self.g, self.a, p.x, p.y, o)
+        return {0: Environment.EMPTY, 1: Environment.WALL, 2: Environment.ORE_TITANIUM,
+                4: Environment.ORE_VOLTIUM, 5: Environment.VOID}[o[4]]
+
     def get_tile_building_id(self, p):
         o = (ctypes.c_int * 5)()
         self.L.fe_vis_tile(self.g, self.a, p.x, p.y, o)
@@ -107,10 +114,10 @@ def cplan(plan4):
     return None if plan4 is None else (ctypes.c_int * 4)(*plan4)
 
 
-def cpp_decide(L, g, a, logits, plan4=None):
+def cpp_decide(L, g, a, logits, plan4=None, own_l=None):
     out = (ctypes.c_int * 8192)()
     arr = (ctypes.c_float * len(logits))(*logits)
-    L.rl_decide(g, a, arr, out, cplan(plan4))
+    L.rl_decide(g, a, arr, out, cplan(plan4), -1 if own_l is None else own_l)
     k = 0
     n = out[k]; k += 1
     acts = []
@@ -180,7 +187,9 @@ def main():
                     plan4 = [rng.choice((0, 0, 1, 3, 5, 7, rng.randint(1, 8))) for _ in range(4)]
                     stats["planned"] = stats.get("planned", 0) + 1
                 api.plan4 = plan4
-                c_has = L.rl_has_choice(g, a, cplan(plan4)) == 1
+                own_l = rng.choice((None, 0, 1, 2, 3, 4)) if typ == 0 else None   # launcher cap
+                api.own_launchers = own_l
+                c_has = L.rl_has_choice(g, a, cplan(plan4), -1 if own_l is None else own_l) == 1
                 p_has = H.has_choice(api)
                 if c_has != p_has:
                     stats["mismatch"] += 1
@@ -199,7 +208,7 @@ def main():
                     for t in (3, 4, 5, 6):
                         logits[H.head_offset(p, H.HB_BTYPE) + t] += 3.0
                 logits = [float(ctypes.c_float(v).value) for v in logits]
-                c_acts, c_recs = cpp_decide(L, g, a, logits, plan4)
+                c_acts, c_recs = cpp_decide(L, g, a, logits, plan4, own_l)
                 p_acts, p_recs = H.decide(api, logits)
                 p_recs2 = [(h, m, c) for h, m, c, _ in p_recs]
                 p_acts2 = [py_action_tuple(x) for x in p_acts]

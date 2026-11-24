@@ -136,7 +136,8 @@ int main(int argc, char** argv) {
                     m.observe(a);                            // memory updates every turn, as deployed
                     std::vector<float> obs; m.encode_only(a, obs);   // first: the conveyor planner mask reads it
                     int8_t plan4[4]; plan4_from_obs(obs.data(), plan4);
-                    if (!has_choice(m.game, a, plan4)) continue;
+                    const int own_l = m.memories.at(a).own_count(fe::LAUNCHER);
+                    if (!has_choice(m.game, a, plan4, own_l)) continue;
                     Sample s; s.policy = p; s.raw.assign(obs.begin(), obs.end());
                     s.q.resize(s.raw.size()); quantize_actor(s.raw.data(), s.q.data());
                     torch::Tensor tl, sl;
@@ -146,8 +147,8 @@ int main(int argc, char** argv) {
                         sl = (st->a(p)->forward(q_tensor(s.q)) / double(1 << ST_LOGIT_SHIFT)).squeeze(0).contiguous();
                     }
                     // agreement: greedy decode with each model on this exact state
-                    Decision dt = decide(m.game, a, tl.data_ptr<float>(), greedy(), plan4);
-                    Decision ds = decide(m.game, a, sl.data_ptr<float>(), greedy(), plan4);
+                    Decision dt = decide(m.game, a, tl.data_ptr<float>(), greedy(), plan4, own_l);
+                    Decision ds = decide(m.game, a, sl.data_ptr<float>(), greedy(), plan4, own_l);
                     compared++;
                     bool same = dt.actions.size() == ds.actions.size();
                     for (size_t k = 0; same && k < dt.actions.size(); k++) {
@@ -165,7 +166,7 @@ int main(int argc, char** argv) {
                         double u = std::uniform_real_distribution<double>(0, z)(rng), c = 0; int pick = -1;
                         for (size_t i = 0; i < mk.size(); i++) if (mk[i]) { pick = int(i); c += w[i]; if (u <= c) break; }
                         lp = 0; return pick;
-                    }, plan4);
+                    }, plan4, own_l);
                     for (auto& hr : d.records) s.heads.push_back({hr.head, hr.mask});
                     // the teacher's own decode visits heads too: label those as well
                     for (auto& hr : dt.records) s.heads.push_back({hr.head, hr.mask});

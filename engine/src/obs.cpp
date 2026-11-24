@@ -39,7 +39,8 @@ void ObsMemory::init(const Game& g, int team_) {
 // and goes out again. Fresh reports: slot (id + round) % 16; rotation (idle
 // units with (id + round) % 4 == 0): slot ((id + round) / 4) % 16.
 static constexpr uint32_t REP_MARK = 1u << 31, REP_REMOVE = 1u << 30;
-enum : int { REP_ORE_TI = 1, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE };
+enum : int { REP_ORE_TI = 1, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE,
+             REP_OWN_LAUNCHER };          // 8: one of OUR launchers (for the launcher cap)
 static int rep_cat_of_type(int type) {
     switch (type) {
     case CORE: return REP_CORE; case GUNNER: return REP_GUNNER; case SENTINEL: return REP_SENTINEL;
@@ -55,6 +56,11 @@ static int rep_type_of_cat(int cat) {
 static bool rep_is_ore(int cat) { return cat == REP_ORE_TI || cat == REP_ORE_VO; }
 static uint32_t rep_pack(int cat, int t, bool remove) { return REP_MARK | (remove ? REP_REMOVE : 0u) | (uint32_t(cat) << 26) | uint32_t(t); }
 static int rep_rank(uint32_t p) { int c = (p >> 26) & 15; return c == REP_CORE ? 0 : (c >= REP_GUNNER ? 1 : 2); }
+int ObsMemory::own_count(int type) const {
+    int n = 0;
+    for (size_t t = 0; t < bld_id.size(); t++) n += bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == type;
+    return n;
+}
 static void rep_note(std::set<uint32_t>& known, uint32_t f) { known.insert(f); known.erase(f ^ REP_REMOVE); }
 
 int ObsMemory::mirror(int t, int s) const {
@@ -120,7 +126,7 @@ void ObsMemory::merge_store(const int64_t* store) {
         const int cat = (p >> 26) & 15, t = p & 0x7FF;
         const uint32_t bits = (p >> 11) & 0x7FFF;
         const bool remove = p & REP_REMOVE;
-        if (cat < REP_ORE_TI || cat > REP_SPIKE || t >= W * H) continue;
+        if (cat < REP_ORE_TI || cat > REP_OWN_LAUNCHER || t >= W * H) continue;
         if (rep_is_ore(cat)) {
             if (remove) continue;
             const int x = t % W, y = t / W;
@@ -140,6 +146,18 @@ void ObsMemory::merge_store(const int64_t* store) {
         if (bits) continue;
         rep_note(known, p);
         pending.erase(p);
+        if (cat == REP_OWN_LAUNCHER) {
+            if (remove) {
+                if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == LAUNCHER) {
+                    bld_id[t] = -1; bld_type[t] = -1; bld_team[t] = -1; bld_dir[t] = -1; bld_hp[t] = -1;
+                }
+            } else if (bld_id[t] < 0) {
+                bld_id[t] = (1 << 29) + t; bld_type[t] = int8_t(LAUNCHER); bld_team[t] = int8_t(team);
+                bld_dir[t] = -1; bld_hp[t] = 100;
+                if (terrain[t] == T_UNKNOWN) { terrain[t] = T_EMPTY; learn_terrain(t); }
+            }
+            continue;
+        }
         const int type = rep_type_of_cat(cat), enemy = 1 - team;
         if (remove) {
             if (bld_id[t] >= 0 && bld_team[t] == enemy && bld_type[t] == type) {
@@ -191,6 +209,7 @@ bool ObsMemory::next_report(uint64_t unit_id, int round, int& slot, uint32_t& re
         if (f & REP_REMOVE) continue;
         const int cat = (f >> 26) & 15, t = f & 0x7FF;
         if (rep_is_ore(cat)) { if (terrain[t] == (cat == REP_ORE_TI ? T_ORE_TI : T_ORE_VO)) live.push_back(f); }
+        else if (cat == REP_OWN_LAUNCHER) { if (bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == LAUNCHER) live.push_back(f); }
         else if (bld_id[t] >= 0 && bld_team[t] == enemy && bld_type[t] == rep_type_of_cat(cat)) live.push_back(f);
     }
     if (live.empty()) return false;
@@ -253,6 +272,11 @@ void ObsMemory::update(const Game& g, int actor) {
         if (cat_now) fact(rep_pack(cat_now, t, false));
         const int cat_old = (old_id >= 0 && old_team != team) ? rep_cat_of_type(old_type) : 0;
         if (cat_old && cat_old != cat_now) fact(rep_pack(cat_old, t, true));
+        // our own launchers (the launcher cap)
+        const bool own_l_now = bld_id[t] >= 0 && bld_team[t] == team && bld_type[t] == LAUNCHER;
+        const bool own_l_old = old_id >= 0 && old_team == team && old_type == LAUNCHER;
+        if (own_l_now) fact(rep_pack(REP_OWN_LAUNCHER, t, false));
+        else if (own_l_old) fact(rep_pack(REP_OWN_LAUNCHER, t, true));
     }
     resolve_symmetry();
 }

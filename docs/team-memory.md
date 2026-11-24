@@ -44,7 +44,8 @@ takes part every turn: core, builders, gunners, sentinels, launchers and spikes.
 
 - Fact: one tile, a u32: bit 31 marker (the heuristic packets above never set
   it), bit 30 removal, bits 26..29 category (1 Ti ore, 2 Vo ore, 3 enemy core,
-  4 gunner, 5 sentinel, 6 launcher, 7 spike: enemy buildings), bits 0..10 tile.
+  4 gunner, 5 sentinel, 6 launcher, 7 spike: enemy buildings; 8 one of our
+  launchers, for the launcher cap of 3), bits 0..10 tile.
 - Report (store word): a fact; for ore, plus bits 11..25 = the other cells of
   the 4x4 block right / below the anchor holding the same ore (one cluster per report).
 - Each turn a unit: merges every marked report in the snapshot into its memory

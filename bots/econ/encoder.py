@@ -58,7 +58,7 @@ def ray_path(x0, y0, dx, dy, maxlen=RAY_LEN):
 # the fact collection in ObsMemory::update, engine/src/obs.cpp). A report is one
 # u32: bit 31 marker, bit 30 removal, bits 26..29 category, bits 0..10 tile.
 REP_MARK, REP_REMOVE = 1 << 31, 1 << 30
-REP_ORE_TI, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE = range(1, 8)
+REP_ORE_TI, REP_ORE_VO, REP_CORE, REP_GUNNER, REP_SENTINEL, REP_LAUNCHER, REP_SPIKE, REP_OWN_LAUNCHER = range(1, 9)
 _REP_CAT = {CORE: REP_CORE, GUNNER: REP_GUNNER, SENTINEL: REP_SENTINEL, LAUNCHER: REP_LAUNCHER, SPIKE: REP_SPIKE}
 _REP_TYPE = {v: k for k, v in _REP_CAT.items()}
 
@@ -151,7 +151,7 @@ class ObsMemory:
                 continue
             cat, t, remove = (v >> 26) & 15, v & 0x7FF, bool(v & REP_REMOVE)
             bits = (v >> 11) & 0x7FFF
-            if cat < REP_ORE_TI or cat > REP_SPIKE or t >= n:
+            if cat < REP_ORE_TI or cat > REP_OWN_LAUNCHER or t >= n:
                 continue
             if cat in (REP_ORE_TI, REP_ORE_VO):
                 if remove:
@@ -178,6 +178,20 @@ class ObsMemory:
             self.known.add(v)
             self.known.discard(v ^ REP_REMOVE)
             self.pending.discard(v)
+            if cat == REP_OWN_LAUNCHER:
+                team = self.team
+                if remove:
+                    if self.bld_id[t] >= 0 and self.bld_team[t] == team and self.bld_type[t] == LAUNCHER:
+                        self.bld_id[t] = self.bld_type[t] = self.bld_team[t] = -1
+                        self.bld_dir[t] = self.bld_hp[t] = -1
+                elif self.bld_id[t] < 0:
+                    self.bld_id[t] = (1 << 29) + t
+                    self.bld_type[t], self.bld_team[t] = LAUNCHER, team
+                    self.bld_dir[t], self.bld_hp[t] = -1, 100
+                    if self.terrain[t] == T_UNKNOWN:
+                        self.terrain[t] = T_EMPTY
+                        self.learn_terrain(t)
+                continue
             typ = _REP_TYPE[cat]
             if remove:
                 if self.bld_id[t] >= 0 and self.bld_team[t] == enemy and self.bld_type[t] == typ:
@@ -221,6 +235,9 @@ class ObsMemory:
             if cat in (REP_ORE_TI, REP_ORE_VO):
                 if self.terrain[t] == (T_ORE_TI if cat == REP_ORE_TI else T_ORE_VO):
                     live.append(f)
+            elif cat == REP_OWN_LAUNCHER:
+                if self.bld_id[t] >= 0 and self.bld_team[t] == self.team and self.bld_type[t] == LAUNCHER:
+                    live.append(f)
             elif self.bld_id[t] >= 0 and self.bld_team[t] == enemy and self.bld_type[t] == _REP_TYPE[cat]:
                 live.append(f)
         if not live:
@@ -228,6 +245,11 @@ class ObsMemory:
         f = live[(k // 4) % len(live)]
         ore = ((f >> 26) & 15) in (REP_ORE_TI, REP_ORE_VO)
         return (k // 4) % 16, (self.ore_report(f) if ore else f)
+
+    def own_count(self, typ):
+        """Own buildings of a type in memory (seen or reported)."""
+        team, bid, bty, btm = self.team, self.bld_id, self.bld_type, self.bld_team
+        return sum(1 for t in range(len(bid)) if bid[t] >= 0 and btm[t] == team and bty[t] == typ)
 
     def _fact(self, p):
         self.pending.discard(p ^ REP_REMOVE)
@@ -274,6 +296,11 @@ class ObsMemory:
             cat_old = _REP_CAT.get(old_type, 0) if old_id >= 0 and old_team != team else 0
             if cat_old and cat_old != cat_now:
                 self._fact(rep_pack(cat_old, t, True))
+            # our own launchers (the launcher cap)
+            if self.bld_id[t] >= 0 and self.bld_team[t] == team and self.bld_type[t] == LAUNCHER:
+                self._fact(rep_pack(REP_OWN_LAUNCHER, t, False))
+            elif old_id >= 0 and old_team == team and old_type == LAUNCHER:
+                self._fact(rep_pack(REP_OWN_LAUNCHER, t, True))
         self.resolve_symmetry()
 
     def plan_paths(self):

@@ -26,6 +26,7 @@ DXY = [(0, 0), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, 
 CARD4 = (N, E, S, W)
 BUILDER, CORE, GUNNER, SENTINEL, LAUNCHER, SPIKE = range(6)
 CONVEYOR, SPLITTER, HARVESTER, BARRIER, MINE = range(6, 11)
+MAX_LAUNCHERS = 3   # launcher cap (as florent_heads.hpp)
 BUILD_ORDER = (CONVEYOR, SPLITTER, HARVESTER, GUNNER, SENTINEL, LAUNCHER, SPIKE, BARRIER, MINE)
 DIRECTIONAL = frozenset((CONVEYOR, SPLITTER, GUNNER, SENTINEL))
 CONVERT_PCT = (0, 10, 25, 50, 100)
@@ -65,6 +66,9 @@ class Api:
         # (Dir code, 0 none) of the 4 adjacent tiles N E S W, from the actor
         # observation's path channel (encoder C_PATH). None: no restriction.
         self.plan4 = None
+        # launcher cap: own launchers known to the unit (encoder memory + team bus);
+        # a launcher may be built only while fewer than MAX_LAUNCHERS. None: no cap.
+        self.own_launchers = None
 
     def once(self, key, fn):
         """Legal-option tables are computed once per turn and shared."""
@@ -130,6 +134,8 @@ def _builder_opts(api):
         if not inb:
             continue
         for t, typ in enumerate(BUILD_ORDER):
+            if typ == LAUNCHER and api.own_launchers is not None and api.own_launchers >= MAX_LAUNCHERS:
+                continue
             if typ in DIRECTIONAL:
                 planned = api.plan4 is not None and typ in (CONVEYOR, SPLITTER)
                 for d in range(8):
@@ -145,7 +151,21 @@ def line_opts(api, typ):
     return api.once('line_opts', lambda: _line_opts(api, typ))
 
 
+def _enemy_on(api, x, y):
+    """A visible enemy builder bot or building on (x, y) (as enemy_on in C++)."""
+    if not api.inb(x, y):
+        return False
+    ct = api.ct
+    me = ct.get_team()
+    q = api.P(x, y)
+    u = _safe(lambda: ct.get_tile_builder_bot_id(q))
+    b = _safe(lambda: ct.get_tile_building_id(q))
+    return (u is not None and ct.get_team(u) != me) or (b is not None and ct.get_team(b) != me)
+
+
 def _line_opts(api, typ):
+    """Fire only at a visible enemy; a gunner rotates only to a direction whose
+    line (3 straight, 2 diagonal) first meets an enemy. As line_opts in C++."""
     ct = api.ct
     p = ct.get_position()
     dd = ct.get_direction().delta()
@@ -153,8 +173,26 @@ def _line_opts(api, typ):
     for k in range(1, 6):
         x, y = p.x + dd[0] * k, p.y + dd[1] * k
         fxy.append((x, y))
-        fire.append(int(api.inb(x, y) and api.call("can_fire", api.P(x, y))))
-    rot = [int(api.call("can_rotate", api.D[d + 1])) for d in range(8)] if typ == GUNNER else [0] * 8
+        fire.append(int(api.inb(x, y) and _enemy_on(api, x, y) and api.call("can_fire", api.P(x, y))))
+    rot = [0] * 8
+    if typ == GUNNER:
+        from fcode import Environment
+        for d in range(8):
+            if not api.call("can_rotate", api.D[d + 1]):
+                continue
+            dx, dy = DXY[d + 1]
+            for k in range(1, (3 if d % 2 == 0 else 2) + 1):
+                x, y = p.x + dx * k, p.y + dy * k
+                if not api.inb(x, y):
+                    break
+                q = api.P(x, y)
+                if _safe(lambda: ct.get_tile_env(q)) == Environment.WALL:
+                    break
+                if _enemy_on(api, x, y):
+                    rot[d] = 1
+                    break
+                if _safe(lambda: ct.get_tile_builder_bot_id(q)) is not None or _safe(lambda: ct.get_tile_building_id(q)) is not None:
+                    break
     return fire, fxy, rot
 
 

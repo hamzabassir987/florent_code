@@ -79,15 +79,21 @@ void plan4_from_obs(const int32_t* spatial, int8_t plan4[4]);
 void plan4_from_obs(const float* spatial, int8_t plan4[4]);
 void plan4_from_obs(const uint8_t* spatial, int8_t plan4[4]);
 
+// Launcher cap: a builder may build a launcher only while the team has fewer
+// than MAX_LAUNCHERS (own launchers in the unit's memory, shared by the team
+// report bus). own_launchers < 0: no cap.
+constexpr int MAX_LAUNCHERS = 3;
+
 // Does the unit have any legal action besides waiting? (if not: no forward)
-bool has_choice(const fe::Game& g, int actor, const int8_t* plan4 = nullptr);
+bool has_choice(const fe::Game& g, int actor, const int8_t* plan4 = nullptr, int own_launchers = -1);
 
 // Deterministic spike rule: fire at the first neighbour (row-major) holding a
 // visible enemy entity if the spike can fire; else wait.
 bool spike_action(const fe::Game& g, int actor, Candidate& out);
 
 // Decode one turn. `logits` is this unit's policy logit row (policy_logit_count).
-Decision decide(const fe::Game& g, int actor, const float* logits, const Chooser& choose, const int8_t* plan4 = nullptr);
+Decision decide(const fe::Game& g, int actor, const float* logits, const Chooser& choose, const int8_t* plan4 = nullptr,
+               int own_launchers = -1);
 
 // Masked log-softmax helpers (shared by sampling and argmax).
 int argmax_choice(const float* logits, const std::vector<uint8_t>& mask, float& logp);

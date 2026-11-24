@@ -89,6 +89,7 @@ struct ObsMemory {
     // the report to post this turn and its slot; false: nothing to post
     bool next_report(uint64_t unit_id, int round, int& slot, uint32_t& report) const;
     uint32_t ore_report(uint32_t fact) const;
+    int own_count(int type) const;          // own buildings of a type in memory (seen or reported)
     // map symmetry (0: 180 rotation, 1: mirror x, 2: mirror y): candidates
     // still consistent with the known terrain; once one is left, known tiles are
     // mirrored and the enemy core is placed on the mirror of ours.
