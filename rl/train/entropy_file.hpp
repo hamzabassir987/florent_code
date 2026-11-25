@@ -15,6 +15,9 @@
 //     pit_share 0.15         # generated maps: share with a pit (cores face each other across it)
 //     eval_every 50          # every N iterations: eval vs the frozen net (0: off)
 //     eval_games 200         # games per eval (half on each side)
+//     full_games 1           # 1: every iteration plays fresh games from round 0 to
+//                            # their end (no cut, no critic bootstrap; ROUNDS is
+//                            # ignored); 0: ROUNDS-round slices of running games
 //
 // No file: the current values are kept. A deleted line keeps its last value
 // (except lr, which goes back to the schedule).
@@ -47,6 +50,7 @@ struct Knobs {
     int core_distance = -1;    // generated maps: tiles between the cores; -1 random 7..21
     float pit_share = 0.15f;   // generated maps: share with a pit
     int eval_every = 50, eval_games = 200;
+    bool full_games = false;   // each iteration: fresh games played to the end
 };
 
 // Returns false if the file does not exist.
@@ -64,6 +68,7 @@ inline bool read_entropy_file(const std::string& path, Knobs& k) {
         if (key == "pit_share") { k.pit_share = std::clamp(float(v), 0.f, 1.f); return; }
         if (key == "eval_every") { k.eval_every = std::max(0, int(v)); return; }
         if (key == "eval_games") { k.eval_games = std::max(2, int(v)); return; }
+        if (key == "full_games") { k.full_games = v != 0; return; }
         for (int h = 0; h < NUM_HEAD_IDS; h++)
             if (key == HEAD_NAMES[h]) { k.head_entropy[h] = float(v); return; }
         std::cerr << "entropy_file: unknown field '" << key << "', ignored\n";

@@ -889,7 +889,10 @@ int main(int argc, char** argv) {
             s.decisions = 0; s.oob = 0;
             std::fill(std::begin(s.tried), std::end(s.tried), 0L); std::fill(std::begin(s.refused), std::end(s.refused), 0L);
             s.greedy = false; s.record = true; s.log = nullptr; s.net_of[0] = s.net_of[1] = 0;
-            if (!s.started) {
+            if (K.full_games) {                     // a fresh game from round 0, played to its end
+                s.start_round = 0;
+                start_game(s, S);
+            } else if (!s.started) {
                 const int game_len = std::max(1, S.K->game_rounds);
                 const int step = env_int("START_TURN_STEP", 10);
                 s.start_round = ((i % game_len) * (step % game_len)) % game_len;
@@ -900,7 +903,12 @@ int main(int argc, char** argv) {
         net->eval();
         std::vector<ValueRow> kept;
         CriticStore cstore;
-        const PlayStats ps = play(slots, S, {&net}, dev, R, /*restart=*/true, /*train=*/true, &kept, &cstore);
+        // full games: no stretch limit, no restart (every segment ends terminal);
+        // otherwise R more rounds of every running game, cut and bootstrapped
+        const PlayStats ps = K.full_games
+            ? play(slots, S, {&net}, dev, /*stretch=*/0, /*restart=*/false, /*train=*/true, &kept, &cstore)
+            : play(slots, S, {&net}, dev, R, /*restart=*/true, /*train=*/true, &kept, &cstore);
+        if (K.full_games) for (auto& s : slots) s.started = false;   // switching back: start staggered games
         if (g_store.skipped > 0) {
             // the store filled up: record a smaller share from the next rollout on, so
             // what is recorded is spread over the whole rollout (not only its start)
@@ -1237,7 +1245,7 @@ int main(int argc, char** argv) {
         std::ostringstream o;
         o << "---- iter " << it << "   lr " << K.lr << "   epochs " << EPOCHS << "   game_rounds " << K.game_rounds
           << "   ore_radius " << K.ore_radius << "\n";
-        o << "  " << lfmt::label("rollout") << G << " games x " << R << " rounds   " << decisions << " decisions, "
+        o << "  " << lfmt::label("rollout") << G << " games x " << (K.full_games ? std::string("full games (") + std::to_string(K.game_rounds) + " rounds max)" : std::to_string(R) + " rounds") << "   " << decisions << " decisions, "
           << samples.size() << " recorded (" << recs << " head records)"
           << (g_store.skipped ? "   STORE FULL: " + std::to_string(g_store.skipped) + " not recorded (lower RECORD_P or set STORE_GB)" : std::string())
           << "   " << kept.size() << " value rows   ~"
