@@ -419,6 +419,8 @@ class ObsMemory:
                 prio = 0
                 if grp == G_EATK and own_core:
                     prio = min(_cheb(c, it.key & 0x7FF, W) for c in own_core)
+                if grp == G_MINE:   # our buildings by type code, launchers first
+                    prio = (it.key >> 11) & 7
                 key = (0 if it.fresh else 1, prio, it.key ^ spread)
                 if best is None or key < bk:
                     best, bk = it, key

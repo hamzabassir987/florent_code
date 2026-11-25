@@ -418,6 +418,8 @@ void ObsMemory::next_reports(uint64_t unit_id, int round, std::vector<std::pair<
                 prio = 1 << 20;
                 for (int c : own_core) prio = std::min(prio, cheb(c, int(it.key & 0x7FF), W));
             }
+            // our buildings: by type code, launchers first (launcher, spike, gunner, sentinel, mine, harvester)
+            if (grp == G_MINE) prio = int(it.key >> 11 & 7);
             // spread: different units prefer different items (a per-unit key hash)
             const auto key = std::make_tuple(it.fresh ? 0 : 1, prio, it.key ^ spread);
             if (!best || key < bk) { best = &it; bk = key; }

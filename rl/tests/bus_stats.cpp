@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
     std::printf("bus: refresh_facts %d  refresh_gate %d\n", fe::g_bus.refresh_facts, fe::g_bus.refresh_gate);
     std::printf("bus: refresh %d  spawn_cooldown %d  quiet_after %d  quiet_rounds %d  enemy_bot_ttl %d\n", fe::g_bus.refresh,
                 fe::g_bus.spawn_cooldown, fe::g_bus.quiet_after, fe::g_bus.quiet_rounds, fe::g_bus.enemy_bot_ttl);
-    std::map<int, std::vector<double>> late_sym;          // k -> share of late units knowing the symmetry
+    std::map<int, std::vector<double>> late_sym, late_own, late_lau;   // + share of own buildings / launchers they know          // k -> share of late units knowing the symmetry
     long store_writes = 0, unit_turns = 0, wrong_sym = 0;
     long own_pairs = 0, own_close = 0;                    // (unit, other own builder): believed within 2 tiles
     long alarm_rounds = 0, alarm_known = 0;
@@ -133,6 +133,19 @@ int main(int argc, char** argv) {
                 }
                 if (team_known) late[k].push_back(double(mine) / team_known);
                 late_sym[k].push_back(mem.sym >= 0 ? 1.0 : 0.0);
+                {   // own buildings that exist now (launchers separately), known in its memory
+                    int ob = 0, okn = 0, lb = 0, lkn = 0;
+                    for (int t = 0; t < N; t++) {
+                        const int b = G.bld[t];
+                        if (b < 0 || G.ents[b].team != team || G.ents[b].type == fe::CORE || G.ents[b].type == fe::CONVEYOR ||
+                            G.ents[b].type == fe::SPLITTER || G.ents[b].type == fe::BARRIER) continue;
+                        const bool kn = mem.bld_id[t] >= 0 && mem.bld_team[t] == team && mem.bld_type[t] == G.ents[b].type;
+                        ob++; okn += kn;
+                        if (G.ents[b].type == fe::LAUNCHER) { lb++; lkn += kn; }
+                    }
+                    if (ob) late_own[k].push_back(double(okn) / ob);
+                    if (lb) late_lau[k].push_back(double(lkn) / lb);
+                }
                 if (std::getenv("DEBUG_SYM")) {
                     int tk = 0; for (auto& [e2, m2] : m.memories) if (e2 != ent && e2 < int(G.ents.size()) && G.ents[e2].alive && G.ents[e2].team == team && m2.sym >= 0) tk++;
                     int snapsym = 0; for (int i = 0; i < 16; i++) { int64_t w = G.teams[team].store[i]; if ((w >> 31 & 1) && (w >> 28 & 3)) snapsym++; }
@@ -186,5 +199,12 @@ int main(int argc, char** argv) {
         double sy = 0; for (double x : late_sym[k]) sy += x;
         std::printf("  %2d rounds after birth: %5.1f%% of the team's ore   symmetry known %5.1f%%  (%zu samples)\n", k,
                     100 * s / std::max<size_t>(1, v.size()), 100 * sy / std::max<size_t>(1, late_sym[k].size()), v.size());
+    }
+    std::printf("late units: share of our existing buildings (launcher, spike, turret, mine, harvester) they know\n");
+    for (auto& [k, v] : late_own) {
+        double s = 0; for (double x : v) s += x;
+        double l = 0; for (double x : late_lau[k]) l += x;
+        std::printf("  %2d rounds after birth: %5.1f%% of our buildings (%zu samples)   launchers %5.1f%% (%zu samples)\n", k,
+                    100 * s / std::max<size_t>(1, v.size()), v.size(), 100 * l / std::max<size_t>(1, late_lau[k].size()), late_lau[k].size());
     }
 }
