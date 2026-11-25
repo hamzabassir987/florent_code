@@ -116,8 +116,9 @@ def _core_opts(api):
     for pct in CONVERT_PCT[1:]:
         a = (vo * pct + 99) // 100
         amount.append(a)
-        conv.append(int(vo > 0 and a > 0 and (api.targets is None or api.targets["own_turrets"] > 0)
-                        and api.call("can_convert_ammo", a)))
+        conv.append(int(vo > 0 and a > 0 and api.call("can_convert_ammo", a)))
+    # Voltium has no other use than ammo: always convert all of it (as in C++)
+    conv = [0, 0, 0, 0, 1] if conv[4] else [1, 0, 0, 0, 0]
     return spawn, sx, conv, amount
 
 

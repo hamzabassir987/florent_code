@@ -54,8 +54,13 @@ static void core_opts(const Game& g, int a, CoreOpts& o, const Targets* tg = nul
     int vo = g.teams[e.team].vo;
     for (int i = 1; i < 5; i++) {
         o.amount[i] = (vo * CONVERT_TENTHS[i] + 99) / 100;
-        o.conv[i] = vo > 0 && o.amount[i] > 0 && (!tg || tg->own_turrets > 0) && g.can_convert(a, o.amount[i]) == OK;
+        o.conv[i] = vo > 0 && o.amount[i] > 0 && g.can_convert(a, o.amount[i]) == OK;
     }
+    // Voltium has no other use than ammo (no price, no tie-break): always convert
+    // all of it (a single option, not recorded); "none" only when that is illegal
+    (void)tg;
+    if (o.conv[4]) { o.conv[0] = 0; o.conv[1] = o.conv[2] = o.conv[3] = 0; }
+    else o.conv[1] = o.conv[2] = o.conv[3] = 0;
 }
 
 struct BuilderOpts {
