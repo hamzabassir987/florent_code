@@ -254,11 +254,21 @@ def has_choice(api):
     return False
 
 
-def spike_action(api):
-    """('fire', x, y) at the first neighbour with a visible enemy, else None."""
+def spike_action(api, first_turn=False):
+    """('fire', x, y) at the first neighbour with a visible enemy, else None.
+    On its first turn a spike fires once anyway (a shot hits every enemy
+    building around it, hidden mines included). As spike_action in C++."""
     ct = api.ct
     p = ct.get_position()
     me = ct.get_team()
+    if first_turn:
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not dx and not dy:
+                    continue
+                x, y = p.x + dx, p.y + dy
+                if api.inb(x, y) and api.call("can_fire", api.P(x, y)):
+                    return ("fire", x, y)
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
             if not dx and not dy:

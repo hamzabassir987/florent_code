@@ -71,9 +71,10 @@ inline void play_greedy(Match& m, LogitsFn logits, std::vector<ActionLine>& log)
             if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) continue;
             const int type = m.game.ents[a].type, id = m.game.ents[a].id;
             if (type == fe::SPIKE) {
+                const bool first = !m.memories.count(a);   // its first turn (no memory yet)
                 m.observe(a);                          // its memory + the team report bus
                 Candidate c;
-                if (spike_action(m.game, a, c) && m.act(a, c) == fe::OK) log.push_back({m.game.round, id, c});
+                if (spike_action(m.game, a, c, first) && m.act(a, c) == fe::OK) log.push_back({m.game.round, id, c});
                 continue;
             }
             int p = policy_of_type(type);

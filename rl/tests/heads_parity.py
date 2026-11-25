@@ -150,6 +150,7 @@ def main():
         g = ctypes.c_void_p(L.fe_new())
         assert L.fe_load_map(g, mp.encode())
         L.fe_reset(g, ctypes.c_ulonglong(seed * 100 + gi))
+        spikes_seen = set()
         for r in range(rounds):
             if L.fe_winner(g) >= 0:
                 break
@@ -166,8 +167,11 @@ def main():
                 api = H.Api(ct)
                 if typ == H.SPIKE:
                     xy = (ctypes.c_int * 2)()
-                    c_fire = L.rl_spike(g, a, xy)
-                    p_act = H.spike_action(api)
+                    eid = ct.e[0]
+                    first = eid not in spikes_seen
+                    spikes_seen.add(eid)
+                    c_fire = L.rl_spike(g, a, xy, int(first))
+                    p_act = H.spike_action(api, first)
                     want = (xy[0], xy[1]) if c_fire else None
                     got = (p_act[1], p_act[2]) if p_act else None
                     stats["spikes"] += 1

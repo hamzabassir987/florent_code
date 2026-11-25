@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
                 for (int a : m.acting_units()) {
                     if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) continue;
                     int type = m.game.ents[a].type;
-                    if (type == fe::SPIKE) { m.observe(a); Candidate c; if (spike_action(m.game, a, c)) m.act(a, c); continue; }
+                    if (type == fe::SPIKE) { const bool first = !m.memories.count(a); m.observe(a); Candidate c; if (spike_action(m.game, a, c, first)) m.act(a, c); continue; }
                     int p = policy_of_type(type);
                     if (p < 0) continue;
                     m.observe(a);                            // memory updates every turn, as deployed

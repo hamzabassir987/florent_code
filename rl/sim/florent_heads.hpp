@@ -89,7 +89,9 @@ bool has_choice(const fe::Game& g, int actor, const int8_t* plan4 = nullptr, int
 
 // Deterministic spike rule: fire at the first neighbour (row-major) holding a
 // visible enemy entity if the spike can fire; else wait.
-bool spike_action(const fe::Game& g, int actor, Candidate& out);
+// Spikes are scripted: on their first turn they fire once (clears hidden enemy
+// mines around them), then only at a visible enemy. Same in bots/econ/heads.py.
+bool spike_action(const fe::Game& g, int actor, Candidate& out, bool first_turn = false);
 
 // Decode one turn. `logits` is this unit's policy logit row (policy_logit_count).
 Decision decide(const fe::Game& g, int actor, const float* logits, const Chooser& choose, const int8_t* plan4 = nullptr,

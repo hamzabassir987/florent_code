@@ -28,6 +28,6 @@ int rl_decide(fe::Game* g, int a, const float* logits, int* out, const int* plan
     }
     return k;
 }
-int rl_spike(fe::Game* g, int a, int* xy) { Candidate c; if (!spike_action(*g, a, c)) return 0; xy[0] = c.a; xy[1] = c.b; return 1; }
+int rl_spike(fe::Game* g, int a, int* xy, int first) { Candidate c; if (!spike_action(*g, a, c, first != 0)) return 0; xy[0] = c.a; xy[1] = c.b; return 1; }
 int rl_apply(fe::Game* g, int a, int kind, int p, int q, int r, int s) { Candidate c{ActionKind(kind), p, q, r, s}; return apply_candidate(*g, a, c); }
 }
