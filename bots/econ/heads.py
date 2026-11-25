@@ -128,7 +128,7 @@ def _builder_opts(api):
     for i, (x, y) in enumerate(tiles):
         inb = api.inb(x, y)
         q = api.P(x, y)
-        attack.append(int(inb and api.call("can_fire", q)))
+        attack.append(int(inb and _enemy_building_on(api, x, y) and api.call("can_fire", q)))
         heal.append(int(inb and api.call("can_heal", q)))
         destroy.append(int(inb and api.call("can_destroy", q)))
         if not inb:
@@ -151,16 +151,25 @@ def line_opts(api, typ):
     return api.once('line_opts', lambda: _line_opts(api, typ))
 
 
-def _enemy_on(api, x, y):
-    """A visible enemy builder bot or building on (x, y) (as enemy_on in C++)."""
+def _enemy_building_on(api, x, y):
+    """A visible enemy building on (x, y): what a builder attack damages (as enemy_building_on in C++)."""
     if not api.inb(x, y):
         return False
     ct = api.ct
-    me = ct.get_team()
+    b = _safe(lambda: ct.get_tile_building_id(api.P(x, y)))
+    return b is not None and ct.get_team(b) != ct.get_team()
+
+
+def _enemy_hit(api, x, y):
+    """What a turret shot on (x, y) hits (the builder bot, else the building) is a
+    visible enemy (as enemy_hit in C++)."""
+    if not api.inb(x, y):
+        return False
+    ct = api.ct
     q = api.P(x, y)
     u = _safe(lambda: ct.get_tile_builder_bot_id(q))
-    b = _safe(lambda: ct.get_tile_building_id(q))
-    return (u is not None and ct.get_team(u) != me) or (b is not None and ct.get_team(b) != me)
+    hit = u if u is not None else _safe(lambda: ct.get_tile_building_id(q))
+    return hit is not None and ct.get_team(hit) != ct.get_team()
 
 
 def _line_opts(api, typ):
@@ -173,7 +182,7 @@ def _line_opts(api, typ):
     for k in range(1, 6):
         x, y = p.x + dd[0] * k, p.y + dd[1] * k
         fxy.append((x, y))
-        fire.append(int(api.inb(x, y) and _enemy_on(api, x, y) and api.call("can_fire", api.P(x, y))))
+        fire.append(int(api.inb(x, y) and _enemy_hit(api, x, y) and api.call("can_fire", api.P(x, y))))
     rot = [0] * 8
     if typ == GUNNER:
         from fcode import Environment
@@ -188,7 +197,7 @@ def _line_opts(api, typ):
                 q = api.P(x, y)
                 if _safe(lambda: ct.get_tile_env(q)) == Environment.WALL:
                     break
-                if _enemy_on(api, x, y):
+                if _enemy_hit(api, x, y):
                     rot[d] = 1
                     break
                 if _safe(lambda: ct.get_tile_builder_bot_id(q)) is not None or _safe(lambda: ct.get_tile_building_id(q)) is not None:

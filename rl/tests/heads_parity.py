@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, "bots", "econ"))
 import heads as H  # noqa: E402
 from fcode import Direction, EntityType, Position  # noqa: E402
 
-LIB = os.environ.get("RLCAPI", "/tmp/claude-0/rlb/librlcapi.so")
+LIB = os.environ.get("RLCAPI", "build/librlcapi.so")
 TYPES = [getattr(EntityType, n) for n in H.TYPE_NAMES]
 KIND = {"move": 1, "spawn": 2, "convert": 3, "build": 4, "attack": 5, "heal": 6,
         "destroy": 7, "fire": 8, "rotate": 9, "launch": 10}

@@ -63,13 +63,30 @@ struct BuilderOpts {
     uint8_t build[9][4][8] = {};      // [type][tile][dir index] (non-directional: dir index 0)
     int tx[4], ty[4];
 };
+// What a shot / attack on (x, y) would damage, as seen by unit a (enemy mines
+// are hidden from it). The engine lets every damaging action hit our own side,
+// so the masks below allow only enemy targets:
+//  * builder attack damages the building on the tile (never a builder);
+//  * a gunner / sentinel shot hits the builder bot on the tile, else the building;
+//  * spikes and mines only ever hit enemies (engine rule), launchers do no damage.
+static bool enemy_building_on(const Game& g, int a, int x, int y) {
+    if (!g.inb(x, y)) return false;
+    const int b = g.tile_building(a, x, y);
+    return b >= 0 && g.ents[b].team != g.ents[a].team;
+}
+static bool enemy_hit(const Game& g, int a, int x, int y) {
+    if (!g.inb(x, y)) return false;
+    const int u = g.bot[g.idx(x, y)], b = g.tile_building(a, x, y);
+    const int hit = u >= 0 ? u : b;
+    return hit >= 0 && g.ents[hit].team != g.ents[a].team;
+}
 static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* plan4 = nullptr, int own_launchers = -1) {
     const Entity& e = g.ents[a];
     for (int i = 0; i < 4; i++) {
         o.tx[i] = e.x + DX[CARD4[i]]; o.ty[i] = e.y + DY[CARD4[i]];
         o.move[i] = g.can_move(a, CARD4[i]) == OK;
         bool in = g.inb(o.tx[i], o.ty[i]);
-        o.attack[i] = in && g.can_attack(a, o.tx[i], o.ty[i]) == OK;
+        o.attack[i] = in && enemy_building_on(g, a, o.tx[i], o.ty[i]) && g.can_attack(a, o.tx[i], o.ty[i]) == OK;
         o.heal[i] = in && g.can_heal(a, o.tx[i], o.ty[i]) == OK;
         o.destroy[i] = in && g.can_destroy(a, o.tx[i], o.ty[i]) == OK;
         for (int t = 0; t < 9; t++) {
@@ -88,14 +105,7 @@ static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* pla
 }
 
 struct LineOpts { uint8_t fire[5] = {0}, rot[8] = {0}; int fx[5], fy[5]; };
-// A visible enemy builder bot or building on (x, y), as seen by unit a.
-static bool enemy_on(const Game& g, int a, int x, int y) {
-    if (!g.inb(x, y)) return false;
-    const int team = g.ents[a].team;
-    const int u = g.bot[g.idx(x, y)], b = g.tile_building(a, x, y);
-    return (u >= 0 && g.ents[u].team != team) || (b >= 0 && g.ents[b].team != team);
-}
-// Turrets: fire only at a tile holding a visible enemy (no wasted ammo, no
+// Turrets: fire only where the shot hits a visible enemy (no wasted ammo, no
 // friendly fire); a gunner may rotate only to a direction whose line, within
 // reach (3 straight, 2 diagonal), first meets an enemy (walls and anything
 // else block it). Identical in bots/econ/heads.py.
@@ -103,7 +113,7 @@ static void line_opts(const Game& g, int a, LineOpts& o) {
     const Entity& e = g.ents[a];
     for (int k = 0; k < 5; k++) {
         o.fx[k] = e.x + DX[e.dir] * (k + 1); o.fy[k] = e.y + DY[e.dir] * (k + 1);
-        o.fire[k] = g.inb(o.fx[k], o.fy[k]) && enemy_on(g, a, o.fx[k], o.fy[k]) && g.can_fire(a, o.fx[k], o.fy[k]) == OK;
+        o.fire[k] = g.inb(o.fx[k], o.fy[k]) && enemy_hit(g, a, o.fx[k], o.fy[k]) && g.can_fire(a, o.fx[k], o.fy[k]) == OK;
     }
     if (e.type == GUNNER)
         for (int d = 0; d < 8; d++) {
@@ -112,7 +122,7 @@ static void line_opts(const Game& g, int a, LineOpts& o) {
             for (int k = 1; k <= len; k++) {
                 const int x = e.x + DX[d + 1] * k, y = e.y + DY[d + 1] * k;
                 if (!g.inb(x, y) || g.env[g.idx(x, y)] == WALL) break;
-                if (enemy_on(g, a, x, y)) { o.rot[d] = 1; break; }
+                if (enemy_hit(g, a, x, y)) { o.rot[d] = 1; break; }
                 if (g.bot[g.idx(x, y)] >= 0 || g.tile_building(a, x, y) >= 0) break;   // own unit / building blocks
             }
         }
