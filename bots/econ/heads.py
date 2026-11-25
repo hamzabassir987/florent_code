@@ -258,6 +258,33 @@ def _launcher_opts(api):
                         row[k] = 1
             ok.append(row)
             botm.append(int(any(row)))
+    # pit launcher: on the edge of a pit 1-2 wide it only throws our own builder
+    # across the pit, to the nearest legal tile there (as launcher_opts in C++)
+    pit = _safe(lambda: ct.get_pit())
+    if pit and 1 <= pit[2] <= 2:
+        axis, at, w = pit
+        c = p.x if axis == "x" else p.y
+        west, east = c == at - 1, c == at + w
+        if west or east:
+            me = ct.get_team()
+            taken = False
+            for b, (bx, by) in enumerate(bots):
+                best, bd = -1, 1 << 30
+                u = _safe(lambda: ct.get_tile_builder_bot_id(api.P(bx, by))) if api.inb(bx, by) else None
+                if not taken and u is not None and ct.get_team(u) == me:
+                    for k, (tx, ty) in enumerate(dests):
+                        if not ok[b][k]:
+                            continue
+                        tc = tx if axis == "x" else ty
+                        if (tc < at + w) if west else (tc >= at):
+                            continue
+                        d2 = (tx - p.x) ** 2 + (ty - p.y) ** 2
+                        if d2 < bd:
+                            best, bd = k, d2
+                ok[b] = [int(k == best) for k in range(120)]
+                botm[b] = int(best >= 0)
+                if best >= 0:
+                    taken = True
     return botm, ok, bots, dests
 
 

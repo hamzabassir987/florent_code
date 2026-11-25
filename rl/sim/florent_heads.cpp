@@ -167,6 +167,31 @@ static void launcher_opts(const Game& g, int a, LauncherOpts& o) {
                     }
             i++;
         }
+    // pit launcher: on the edge of a pit 1-2 wide it only throws our own builder
+    // across the pit, to the nearest legal tile there (one builder, one tile:
+    // the network only decides launch or wait). As launcher_opts in heads.py.
+    if (g.pit_axis >= 0 && g.pit_w >= 1 && g.pit_w <= 2) {
+        const int c = g.pit_axis == 0 ? e.x : e.y;
+        const bool west = c == g.pit_at - 1, east = c == g.pit_at + g.pit_w;
+        if (west || east) {
+            bool taken = false;
+            for (int b = 0; b < 8; b++) {
+                int best = -1, bd = 1 << 30;
+                const int u = g.inb(o.bx[b], o.by[b]) ? g.bot[g.idx(o.bx[b], o.by[b])] : -1;
+                if (!taken && u >= 0 && g.ents[u].team == e.team)
+                    for (int k = 0; k < 120; k++) {
+                        if (!o.ok[b][k]) continue;
+                        const int tc = g.pit_axis == 0 ? o.dx[k] : o.dy[k];
+                        if (west ? tc < g.pit_at + g.pit_w : tc >= g.pit_at) continue;   // not across
+                        const int ddx = o.dx[k] - e.x, ddy = o.dy[k] - e.y, d2 = ddx * ddx + ddy * ddy;
+                        if (d2 < bd) { bd = d2; best = k; }
+                    }
+                for (int k = 0; k < 120; k++) o.ok[b][k] = k == best;
+                o.bot[b] = best >= 0;
+                if (best >= 0) taken = true;
+            }
+        }
+    }
 }
 
 static bool any(const uint8_t* m, int n) { for (int i = 0; i < n; i++) if (m[i]) return true; return false; }

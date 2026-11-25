@@ -258,6 +258,8 @@ def main():
                 if c_acts and not c_recs:
                     stats["forced_launchers"] = stats.get("forced_launchers", 0) + 1
                 for act in c_acts:
+                    if act[0] == 10:
+                        stats["launches"] = stats.get("launches", 0) + 1
                     if act[0] == 4 and act[1] in (2, 3):
                         k = "built_gunner" if act[1] == 2 else "built_sentinel"
                         stats[k] = stats.get(k, 0) + 1
