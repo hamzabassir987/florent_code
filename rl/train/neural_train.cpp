@@ -180,6 +180,7 @@ struct Slot {
     bool need = false; int ent = -1, policy = -1, net = 0;
     int8_t plan4[4] = {0, 0, 0, 0};                  // the waiting unit's conveyor plan (adjacent tiles N E S W)
     int own_launchers = 0;                           // own launchers it knows of (launcher cap)
+    Targets tg;                                      // its target knowledge (turret / convert masks)
     uint8_t* in_sp = nullptr; int16_t* in_sc = nullptr;   // this slot's row of the (pinned) input stage
     const float* lg = nullptr;                            // its logits row after the forward
     bool recorded = false;                                // the last decision was recorded
@@ -280,7 +281,8 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
             const long oob = m.encode_compact(a, s.in_sp, s.in_sc);
             plan4_from_obs(s.in_sp, s.plan4);
             s.own_launchers = m.memories.at(a).own_count(fe::LAUNCHER);
-            if (!has_choice(m.game, a, s.plan4, s.own_launchers)) { s.pos++; continue; }   // only wait: no forward
+            targets_from_memory(m.memories.at(a), s.tg);
+            if (!has_choice(m.game, a, s.plan4, s.own_launchers, &s.tg)) { s.pos++; continue; }   // only wait: no forward
             s.oob += oob;
             s.need = true; s.ent = a; s.policy = p; s.net = s.net_of[m.game.ents[a].team];
             return;
@@ -336,7 +338,7 @@ static void play_decision(Slot& s, const Setup& S, bool train) {
     const int a = s.ent;
     Decision d = decide(m.game, a, s.lg, [&](int, const float* l, const std::vector<uint8_t>& mk, float& lp) {
         return s.greedy ? argmax_choice(l, mk, lp) : sample_masked(l, mk, s.rng, lp);
-    }, s.plan4, s.own_launchers);
+    }, s.plan4, s.own_launchers, &s.tg);
     for (auto& c : d.actions) {
         const int k = int(c.kind);
         s.tried[k]++;

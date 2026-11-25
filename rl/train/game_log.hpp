@@ -83,11 +83,12 @@ inline void play_greedy(Match& m, LogitsFn logits, std::vector<ActionLine>& log)
             std::vector<float> obs; m.encode_only(a, obs);       // first: the conveyor planner mask reads it
             int8_t plan4[4]; plan4_from_obs(obs.data(), plan4);
             const int own_l = m.memories.at(a).own_count(fe::LAUNCHER);
-            if (!has_choice(m.game, a, plan4, own_l)) continue;
+            Targets tg; targets_from_memory(m.memories.at(a), tg);
+            if (!has_choice(m.game, a, plan4, own_l, &tg)) continue;
             std::vector<float> L = logits(p, obs);
             Decision d = decide(m.game, a, L.data(), [](int, const float* l, const std::vector<uint8_t>& mk, float& lp) {
                 return argmax_choice(l, mk, lp);
-            }, plan4, own_l);
+            }, plan4, own_l, &tg);
             for (auto& c : d.actions)
                 if (m.act(a, c) == fe::OK) log.push_back({m.game.round, id, c});
         }

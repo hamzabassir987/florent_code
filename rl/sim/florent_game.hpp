@@ -1,11 +1,25 @@
 #pragma once
 #include "../../engine/src/fengine.hpp"
 #include "florent_actions.hpp"
+#include "florent_heads.hpp"
 #include "../../engine/src/obs.hpp"
 #include <string>
 #include <unordered_map>
 
 namespace florent_rl {
+// The masks' target knowledge from a unit's memory (Targets, florent_heads.hpp):
+// known enemy core / building tiles, own gunners + sentinels. As
+// ObsMemory.targets() in bots/econ/encoder.py.
+inline void targets_from_memory(const fe::ObsMemory& m, Targets& t) {
+    t.core.clear(); t.bld.clear();
+    for (int i = 0; i < m.W * m.H; i++) {
+        if (m.bld_id[i] < 0 || m.bld_team[i] == m.team) continue;
+        t.bld.push_back(i);
+        if (m.bld_type[i] == fe::CORE) t.core.push_back(i);
+    }
+    t.own_turrets = m.own_count(fe::GUNNER) + m.own_count(fe::SENTINEL);
+}
+
 struct Match {
     fe::Game game;
     std::string map_path;

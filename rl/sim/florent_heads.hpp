@@ -84,8 +84,21 @@ void plan4_from_obs(const uint8_t* spatial, int8_t plan4[4]);
 // report bus). own_launchers < 0: no cap.
 constexpr int MAX_LAUNCHERS = 3;
 
+// What the unit knows about targets (from its memory, docs/masks.md):
+//  * sentinel: may be built only facing a line (5 straight / 4 diagonal) that
+//    reaches a known enemy core tile;
+//  * gunner: only facing a line (3 / 2) whose first known enemy building comes
+//    before any wall;
+//  * core convert: only while we own a gunner or sentinel (the ammo users).
+// nullptr: none of these restrictions.
+struct Targets {   // (fill with targets_from_memory, rl/sim/florent_game.hpp)
+    std::vector<int> core;      // known enemy core tiles (y * W + x)
+    std::vector<int> bld;       // known enemy building tiles (core included)
+    int own_turrets = 0;        // own gunners + sentinels known
+};
+
 // Does the unit have any legal action besides waiting? (if not: no forward)
-bool has_choice(const fe::Game& g, int actor, const int8_t* plan4 = nullptr, int own_launchers = -1);
+bool has_choice(const fe::Game& g, int actor, const int8_t* plan4 = nullptr, int own_launchers = -1, const Targets* tg = nullptr);
 
 // Deterministic spike rule: fire at the first neighbour (row-major) holding a
 // visible enemy entity if the spike can fire; else wait.
@@ -94,8 +107,11 @@ bool has_choice(const fe::Game& g, int actor, const int8_t* plan4 = nullptr, int
 bool spike_action(const fe::Game& g, int actor, Candidate& out, bool first_turn = false);
 
 // Decode one turn. `logits` is this unit's policy logit row (policy_logit_count).
+// Pit maps (pit at most 2 wide, a thrown builder survives): a builder next to
+// a free tile on the pit's edge builds a launcher there when the team has no
+// launcher (own_launchers == 0); a scripted turn, nothing recorded.
 Decision decide(const fe::Game& g, int actor, const float* logits, const Chooser& choose, const int8_t* plan4 = nullptr,
-               int own_launchers = -1);
+               int own_launchers = -1, const Targets* tg = nullptr);
 
 // Masked log-softmax helpers (shared by sampling and argmax).
 int argmax_choice(const float* logits, const std::vector<uint8_t>& mask, float& logp);

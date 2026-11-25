@@ -69,6 +69,11 @@ class Api:
         # launcher cap: own launchers known to the unit (encoder memory + team bus);
         # a launcher may be built only while fewer than MAX_LAUNCHERS. None: no cap.
         self.own_launchers = None
+        # target knowledge (docs/masks.md, Targets in florent_heads.hpp): None, or
+        # dict(core=set of (x, y), bld=set of (x, y), own_turrets=int). Sentinels
+        # only facing a line reaching a known enemy core tile, gunners only facing
+        # a known enemy building before any wall, convert only with own turrets.
+        self.targets = None
 
     def once(self, key, fn):
         """Legal-option tables are computed once per turn and shared."""
@@ -111,7 +116,8 @@ def _core_opts(api):
     for pct in CONVERT_PCT[1:]:
         a = (vo * pct + 99) // 100
         amount.append(a)
-        conv.append(int(vo > 0 and a > 0 and api.call("can_convert_ammo", a)))
+        conv.append(int(vo > 0 and a > 0 and (api.targets is None or api.targets["own_turrets"] > 0)
+                        and api.call("can_convert_ammo", a)))
     return spawn, sx, conv, amount
 
 
@@ -141,10 +147,34 @@ def _builder_opts(api):
                 for d in range(8):
                     if planned and api.plan4[i] != d + 1:
                         continue
+                    if api.targets is not None and typ in (GUNNER, SENTINEL) and not _aims(api, typ, x, y, d + 1):
+                        continue
                     build[t][i][d] = int(api.call("can_build", api.T[typ], q, api.D[d + 1]))
             else:
                 build[t][i][0] = int(api.call("can_build", api.T[typ], q, None))
     return move, attack, heal, destroy, build, tiles
+
+
+def _aims(api, typ, x, y, d):
+    """A sentinel / gunner built at (x, y) facing Dir d aims at a target (as aims in C++)."""
+    from fcode import Environment
+    tg = api.targets
+    diag = d % 2 == 0
+    n = (4 if diag else 5) if typ == SENTINEL else (2 if diag else 3)
+    dx, dy = DXY[d]
+    for k in range(1, n + 1):
+        xx, yy = x + dx * k, y + dy * k
+        if not api.inb(xx, yy):
+            return False
+        if typ == SENTINEL:
+            if (xx, yy) in tg["core"]:
+                return True
+            continue
+        if (xx, yy) in tg["bld"]:
+            return True
+        if _safe(lambda: api.ct.get_tile_env(api.P(xx, yy))) == Environment.WALL:
+            return False
+    return False
 
 
 def line_opts(api, typ):
@@ -329,6 +359,14 @@ def decide(api, logits, choose=None):
             actions.append(("convert", amount[c]))
     elif p == P_BUILDER:
         move, attack, heal, destroy, build, tiles = builder_opts(api)
+        # crossable pit (1-2 wide) and no own launcher: build one on the pit's edge (as in C++)
+        pit = _safe(lambda: api.ct.get_pit())
+        if api.own_launchers == 0 and pit and 1 <= pit[2] <= 2:
+            lt = BUILD_ORDER.index(LAUNCHER)
+            for i, (x, y) in enumerate(tiles):
+                c = x if pit[0] == "x" else y
+                if (c == pit[1] - 1 or c == pit[1] + pit[2]) and build[lt][i][0]:
+                    return [("build", LAUNCHER, x, y, C)], []
         bt = [int(any(any(r) for r in build[t2])) for t2 in range(9)]
         mode = [1, int(any(move)), int(any(bt)), int(any(attack)), int(any(heal)), int(any(destroy))]
         m = run(HB_MODE, mode)

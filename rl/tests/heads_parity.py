@@ -64,6 +64,11 @@ class EngineCt:
         d = self.e[8]
         return next(x for x in Direction if x.delta() == H.DXY[d])
 
+    def get_pit(self):
+        o = (ctypes.c_int * 3)()
+        self.L.rl_pit(self.g, o)
+        return None if o[0] < 0 else ("x" if o[0] == 0 else "y", o[1], o[2])
+
     def get_map_width(self):
         return self.L.fe_width(self.g)
 
@@ -114,10 +119,40 @@ def cplan(plan4):
     return None if plan4 is None else (ctypes.c_int * 4)(*plan4)
 
 
-def cpp_decide(L, g, a, logits, plan4=None, own_l=None):
+def ctargets(tg, W):
+    """(tiles array, ncore, nbld, own_turrets) for the C API from a Python targets dict."""
+    if tg is None:
+        return None, -1, 0, 0
+    core = sorted(y * W + x for x, y in tg["core"])
+    bld = sorted(y * W + x for x, y in tg["bld"])
+    arr = (ctypes.c_int * max(1, len(core) + len(bld)))(*(core + bld))
+    return arr, len(core), len(bld), tg["own_turrets"]
+
+
+def random_targets(L, g, team, rng):
+    """Target knowledge for the masks: none, or random subsets of the true enemy buildings."""
+    if rng.random() < 0.3:
+        return None
+    core, bld = set(), set()
+    for i in range(L.fe_n_entities(g)):
+        o = (ctypes.c_int * 13)()
+        L.fe_entity(g, i, o)
+        if not o[7] or o[2] == team or o[1] < 1 or o[1] == 0:
+            continue
+        tiles = [(o[3] + dx, o[4] + dy) for dx in (0, 1) for dy in (0, 1)] if o[1] == 1 else [(o[3], o[4])]
+        if o[1] == 1:
+            if rng.random() < 0.9:
+                core.update(tiles)
+        if rng.random() < 0.8:
+            bld.update(tiles)
+    return {"core": core, "bld": bld, "own_turrets": rng.choice((0, 0, 1, 2))}
+
+
+def cpp_decide(L, g, a, logits, plan4=None, own_l=None, tg=None):
     out = (ctypes.c_int * 8192)()
     arr = (ctypes.c_float * len(logits))(*logits)
-    L.rl_decide(g, a, arr, out, cplan(plan4), -1 if own_l is None else own_l)
+    tarr, nc, nb, ot = ctargets(tg, L.fe_width(g))
+    L.rl_decide(g, a, arr, out, cplan(plan4), -1 if own_l is None else own_l, tarr, nc, nb, ot)
     k = 0
     n = out[k]; k += 1
     acts = []
@@ -193,7 +228,10 @@ def main():
                 api.plan4 = plan4
                 own_l = rng.choice((None, 0, 1, 2, 3, 4)) if typ == 0 else None   # launcher cap
                 api.own_launchers = own_l
-                c_has = L.rl_has_choice(g, a, cplan(plan4), -1 if own_l is None else own_l) == 1
+                tg = random_targets(L, g, ct.e[2], rng)
+                api.targets = tg
+                tarr, nc, nb, ot = ctargets(tg, L.fe_width(g))
+                c_has = L.rl_has_choice(g, a, cplan(plan4), -1 if own_l is None else own_l, tarr, nc, nb, ot) == 1
                 p_has = H.has_choice(api)
                 if c_has != p_has:
                     stats["mismatch"] += 1
@@ -212,11 +250,17 @@ def main():
                     for t in (3, 4, 5, 6):
                         logits[H.head_offset(p, H.HB_BTYPE) + t] += 3.0
                 logits = [float(ctypes.c_float(v).value) for v in logits]
-                c_acts, c_recs = cpp_decide(L, g, a, logits, plan4, own_l)
+                c_acts, c_recs = cpp_decide(L, g, a, logits, plan4, own_l, tg)
                 p_acts, p_recs = H.decide(api, logits)
                 p_recs2 = [(h, m, c) for h, m, c, _ in p_recs]
                 p_acts2 = [py_action_tuple(x) for x in p_acts]
                 stats["records"] += len(c_recs)
+                if c_acts and not c_recs:
+                    stats["forced_launchers"] = stats.get("forced_launchers", 0) + 1
+                for act in c_acts:
+                    if act[0] == 4 and act[1] in (2, 3):
+                        k = "built_gunner" if act[1] == 2 else "built_sentinel"
+                        stats[k] = stats.get(k, 0) + 1
                 for h, _, _ in c_recs:
                     by_head[h] += 1
                 if c_recs != p_recs2 or c_acts != p_acts2:

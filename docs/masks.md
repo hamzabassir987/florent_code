@@ -15,19 +15,22 @@ both make the same decisions.
 | builder build: conveyor / splitter | only on a tile of the conveyor planner's path, facing its planned direction | routes are planned (BFS from the core over remembered tiles) |
 | conveyor planner | at most **4 harvesters per line** into the core; a full line is closed and later ore is routed to another core side | a line moves 1 stack/round, a harvester makes 1 per 4 rounds |
 | builder build: launcher | at most **3 own launchers** (from the unit's memory) | |
+| builder build: sentinel | only facing a line (5 straight / 4 diagonal) that reaches a **known enemy core tile** (memory: seen, reported or mirrored) | top players aim sentinels at the core: 18 damage / 2 rounds, not blocked; 500 HP = 28 shots = 140 Vo |
+| builder build: gunner | only facing a line (3 / 2) whose first known enemy building comes before any wall | a gunner is blocked and only rotates for 10 Ti |
+| core convert | only while we own a gunner or sentinel (memory) | the only ammo users |
+| builder: launcher at a pit (scripted) | on a map whose pit is 1-2 wide, a builder next to a free tile on the pit's edge builds a launcher there when the team knows no own launcher; nothing recorded | a thrown builder crosses a pit of width <= 2 alive (checked in the official engine) |
 | heal | engine rule only (own units / buildings that lost HP) | with no friendly fire, heals only repair enemy damage |
 | barriers, mines | **no restriction** (keep normal) | walls around the base and mines are good play |
 | spike (scripted, no network) | fires at the first adjacent visible enemy; **on its first turn it fires once anyway** | a spike shot hits every enemy building around it, hidden enemy mines included (5 HP vs 12 damage), so a spike can be placed to clear mines; otherwise the 4-round cooldown is kept for real targets |
+| gunner / sentinel surgery | tool: `surgery IN.pt OUT.pt` (rl/tools/surgery.cpp) copies the spike row of `builder_build_type` to gunner / sentinel and zeroes the gunner / sentinel policies' output layers (uniform heads) | run once on a checkpoint, then resume from OUT.pt |
 | single-choice heads (trainer) | a head with only one legal option is not recorded | no gradient; it diluted the loss and the logs |
 
 ## Discussed, not implemented yet
 
 | Idea | Rule | Notes |
 |---|---|---|
-| launcher over a wide pit | own builder: no landing across a pit wider than 2 tiles (it dies, `pit_w > 2`); enemy builder: allowed (a kill) | checked on a 2-wide pit (eval_8150): the throw is accepted by the official engine and the builder survives |
-| core convert | only when we own a gunner or sentinel (the only ammo users) | the policy mostly stopped converting by itself (0 in some later games) |
+| launcher over a wide pit (still open) | own builder: no landing across a pit wider than 2 tiles (it dies, `pit_w > 2`); enemy builder: allowed (a kill) | checked on a 2-wide pit (eval_8150): the throw is accepted by the official engine and the builder survives |
 | spawn cap | e.g. at most ~1.5 builders per harvester, or a fixed maximum | each builder adds +20% to every price; overspawning is invisible to the Ti-collected win condition |
-| gunner / sentinel | copy the spike row of `builder_build_type` to gunner / sentinel (weight surgery), heuristic build direction (face the nearest enemy), convert heuristic for ammo | they cost +20% scale and need ammo |
 | greedy anti-stuck | when a builder oscillates N turns, take its second-best action once | greedy (69% vs sampled) sometimes collapses on a map |
 | pit maps | drop pit maps from training (`pit_share 0`, map list without `*pit*`); scripted pit play: farm own half, launcher raids across 2-wide pits | |
 | low-HP curriculum | `hp_scale` / `core_hp_scale` knobs, ramped back to 1.0 | makes attacks pay off early |

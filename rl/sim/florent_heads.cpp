@@ -41,7 +41,7 @@ int policy_of_type(int t) {
 
 // ---- legal option tables -------------------------------------------------
 struct CoreOpts { uint8_t spawn[13] = {1}; uint8_t conv[5] = {1}; int amount[5] = {0}; int sx[13], sy[13]; };
-static void core_opts(const Game& g, int a, CoreOpts& o) {
+static void core_opts(const Game& g, int a, CoreOpts& o, const Targets* tg = nullptr) {
     const Entity& e = g.ents[a];
     int k = 1;
     for (int dy = -1; dy <= 2; dy++)
@@ -54,7 +54,7 @@ static void core_opts(const Game& g, int a, CoreOpts& o) {
     int vo = g.teams[e.team].vo;
     for (int i = 1; i < 5; i++) {
         o.amount[i] = (vo * CONVERT_TENTHS[i] + 99) / 100;
-        o.conv[i] = vo > 0 && o.amount[i] > 0 && g.can_convert(a, o.amount[i]) == OK;
+        o.conv[i] = vo > 0 && o.amount[i] > 0 && (!tg || tg->own_turrets > 0) && g.can_convert(a, o.amount[i]) == OK;
     }
 }
 
@@ -80,7 +80,22 @@ static bool enemy_hit(const Game& g, int a, int x, int y) {
     const int hit = u >= 0 ? u : b;
     return hit >= 0 && g.ents[hit].team != g.ents[a].team;
 }
-static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* plan4 = nullptr, int own_launchers = -1) {
+static bool in_list(const std::vector<int>& v, int t) { for (int x : v) if (x == t) return true; return false; }
+// sentinel / gunner built at (x, y) facing Dir d: does it aim at a target? (Targets)
+static bool aims(const Game& g, int type, int x, int y, int d, const Targets& tg) {
+    const bool diag = d % 2 == 0;                     // Dir: N=1 NE=2 E=3 ...
+    const int len = type == SENTINEL ? (diag ? 4 : 5) : (diag ? 2 : 3);
+    for (int k = 1; k <= len; k++) {
+        const int xx = x + DX[d] * k, yy = y + DY[d] * k;
+        if (!g.inb(xx, yy)) return false;
+        const int t = g.idx(xx, yy);
+        if (type == SENTINEL) { if (in_list(tg.core, t)) return true; continue; }   // a sentinel shot is not blocked
+        if (in_list(tg.bld, t)) return true;
+        if (g.env[t] == WALL) return false;
+    }
+    return false;
+}
+static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* plan4 = nullptr, int own_launchers = -1, const Targets* tg = nullptr) {
     const Entity& e = g.ents[a];
     for (int i = 0; i < 4; i++) {
         o.tx[i] = e.x + DX[CARD4[i]]; o.ty[i] = e.y + DY[CARD4[i]];
@@ -96,7 +111,9 @@ static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* pla
             if (directional(type)) {
                 const bool planned = plan4 && (type == CONVEYOR || type == SPLITTER);
                 for (int d = 0; d < 8; d++)
-                    o.build[t][i][d] = (!planned || plan4[i] == d + 1) && g.can_build(a, type, o.tx[i], o.ty[i], d + 1) == OK;
+                    o.build[t][i][d] = (!planned || plan4[i] == d + 1) &&
+                                       (!tg || (type != GUNNER && type != SENTINEL) || aims(g, type, o.tx[i], o.ty[i], d + 1, *tg)) &&
+                                       g.can_build(a, type, o.tx[i], o.ty[i], d + 1) == OK;
             } else {
                 o.build[t][i][0] = g.can_build(a, type, o.tx[i], o.ty[i], C) == OK;
             }
@@ -164,12 +181,12 @@ void plan4_from_obs(const int32_t* sp, int8_t plan4[4]) { plan4_impl(sp, plan4);
 void plan4_from_obs(const float* sp, int8_t plan4[4]) { plan4_impl(sp, plan4); }
 void plan4_from_obs(const uint8_t* sp, int8_t plan4[4]) { plan4_impl(sp, plan4); }
 
-bool has_choice(const Game& g, int a, const int8_t* plan4, int own_launchers) {
+bool has_choice(const Game& g, int a, const int8_t* plan4, int own_launchers, const Targets* tg) {
     if (a < 0 || a >= int(g.ents.size()) || !g.ents[a].alive) return false;
     switch (g.ents[a].type) {
-    case CORE: { CoreOpts o; core_opts(g, a, o); return any(o.spawn + 1, 12) || any(o.conv + 1, 4); }
+    case CORE: { CoreOpts o; core_opts(g, a, o, tg); return any(o.spawn + 1, 12) || any(o.conv + 1, 4); }
     case BUILDER: {
-        BuilderOpts o; builder_opts(g, a, o, plan4, own_launchers);
+        BuilderOpts o; builder_opts(g, a, o, plan4, own_launchers, tg);
         return any(o.move, 4) || any(o.attack, 4) || any(o.heal, 4) || any(o.destroy, 4) ||
                any(&o.build[0][0][0], 9 * 4 * 8);
     }
@@ -223,7 +240,7 @@ int argmax_choice(const float* l, const std::vector<uint8_t>& m, float& logp) {
 }
 
 // ---- decode ----------------------------------------------------------------
-Decision decide(const Game& g, int a, const float* logits, const Chooser& choose, const int8_t* plan4, int own_launchers) {
+Decision decide(const Game& g, int a, const float* logits, const Chooser& choose, const int8_t* plan4, int own_launchers, const Targets* tg) {
     Decision d;
     const Entity& e = g.ents[a];
     int p = policy_of_type(e.type);
@@ -236,13 +253,24 @@ Decision decide(const Game& g, int a, const float* logits, const Chooser& choose
     auto vec = [](const uint8_t* m, int n) { return std::vector<uint8_t>(m, m + n); };
 
     if (p == P_CORE) {
-        CoreOpts o; core_opts(g, a, o);
+        CoreOpts o; core_opts(g, a, o, tg);
         int s = run(HC_SPAWN, vec(o.spawn, 13));
         if (s > 0) d.actions.push_back({ActionKind::Spawn, o.sx[s], o.sy[s]});
         int c = run(HC_CONVERT, vec(o.conv, 5));
         if (c > 0) d.actions.push_back({ActionKind::Convert, o.amount[c]});
     } else if (p == P_BUILDER) {
-        BuilderOpts o; builder_opts(g, a, o, plan4, own_launchers);
+        BuilderOpts o; builder_opts(g, a, o, plan4, own_launchers, tg);
+        // crossable pit (1-2 wide) and no own launcher: build one on the pit's edge
+        if (own_launchers == 0 && g.pit_axis >= 0 && g.pit_w >= 1 && g.pit_w <= 2) {
+            const int lt = 5;                          // BUILD_ORDER index of LAUNCHER
+            for (int i = 0; i < 4; i++) {
+                const int c = g.pit_axis == 0 ? o.tx[i] : o.ty[i];
+                if ((c == g.pit_at - 1 || c == g.pit_at + g.pit_w) && o.build[lt][i][0]) {
+                    d.actions.push_back({ActionKind::Build, LAUNCHER, o.tx[i], o.ty[i], C});
+                    return d;
+                }
+            }
+        }
         uint8_t bt[9] = {0};
         for (int t = 0; t < 9; t++) bt[t] = any(&o.build[t][0][0], 4 * 8);
         uint8_t mode[6] = {1, any(o.move, 4), any(bt, 9), any(o.attack, 4), any(o.heal, 4), any(o.destroy, 4)};

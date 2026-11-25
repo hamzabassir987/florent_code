@@ -137,7 +137,8 @@ int main(int argc, char** argv) {
                     std::vector<float> obs; m.encode_only(a, obs);   // first: the conveyor planner mask reads it
                     int8_t plan4[4]; plan4_from_obs(obs.data(), plan4);
                     const int own_l = m.memories.at(a).own_count(fe::LAUNCHER);
-                    if (!has_choice(m.game, a, plan4, own_l)) continue;
+                    Targets tg; targets_from_memory(m.memories.at(a), tg);
+                    if (!has_choice(m.game, a, plan4, own_l, &tg)) continue;
                     Sample s; s.policy = p; s.raw.assign(obs.begin(), obs.end());
                     s.q.resize(s.raw.size()); quantize_actor(s.raw.data(), s.q.data());
                     torch::Tensor tl, sl;
@@ -147,8 +148,8 @@ int main(int argc, char** argv) {
                         sl = (st->a(p)->forward(q_tensor(s.q)) / double(1 << ST_LOGIT_SHIFT)).squeeze(0).contiguous();
                     }
                     // agreement: greedy decode with each model on this exact state
-                    Decision dt = decide(m.game, a, tl.data_ptr<float>(), greedy(), plan4, own_l);
-                    Decision ds = decide(m.game, a, sl.data_ptr<float>(), greedy(), plan4, own_l);
+                    Decision dt = decide(m.game, a, tl.data_ptr<float>(), greedy(), plan4, own_l, &tg);
+                    Decision ds = decide(m.game, a, sl.data_ptr<float>(), greedy(), plan4, own_l, &tg);
                     compared++;
                     bool same = dt.actions.size() == ds.actions.size();
                     for (size_t k = 0; same && k < dt.actions.size(); k++) {

@@ -254,7 +254,9 @@ class Player:
             return True
         spatial, scalars = self.actor_encoder.encode(ct)   # memory updates every turn
         api.plan4 = HEADS.plan4_from_obs(spatial)   # conveyor planner mask (path channel)
-        api.own_launchers = self.actor_encoder.memories[ct.get_id()].own_count(HEADS.LAUNCHER)   # launcher cap
+        mem = self.actor_encoder.memories[ct.get_id()]
+        api.own_launchers = mem.own_count(HEADS.LAUNCHER)   # launcher cap
+        api.targets = mem.targets()                         # turret direction / convert masks
         if not HEADS.has_choice(api):
             return True                              # only "wait" is legal: no forward
         if ct.get_cpu_time_elapsed() > LEARNED_START_LIMIT_US:

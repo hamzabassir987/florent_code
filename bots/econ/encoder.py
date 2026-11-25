@@ -209,6 +209,19 @@ class ObsMemory:
         team, bid, bty, btm = self.team, self.bld_id, self.bld_type, self.bld_team
         return sum(1 for t in range(len(bid)) if bid[t] >= 0 and btm[t] == team and bty[t] == typ)
 
+    def targets(self):
+        """The masks' target knowledge (as targets_from_memory in C++): known enemy
+        core / building tiles as (x, y), own gunners + sentinels."""
+        W, team = self.W, self.team
+        core, bld = set(), set()
+        for t in range(W * self.H):
+            if self.bld_id[t] < 0 or self.bld_team[t] == team:
+                continue
+            bld.add((t % W, t // W))
+            if self.bld_type[t] == CORE:
+                core.add((t % W, t // W))
+        return {"core": core, "bld": bld, "own_turrets": self.own_count(GUNNER) + self.own_count(SENTINEL)}
+
     def extra_bits(self):
         return (self.sym + 1) << 28 if self.sym >= 0 else 0
 
