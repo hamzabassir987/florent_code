@@ -344,11 +344,20 @@ static void play_decision(Slot& s, const Setup& S, bool train) {
     }
     s.decisions++;
     s.recorded = false;
-    if (train && s.record && std::uniform_real_distribution<float>(0.f, 1.f)(s.rng) < S.record_p) {
+    // only heads with a real choice (2+ legal options) are recorded: a single
+    // legal option has log-prob 0 and entropy 0 whatever the weights, so it
+    // gives no gradient and would only dilute the loss and the logs. A
+    // decision with no such head is not recorded.
+    int real = 0;
+    for (auto& hr : d.records) { int n = 0; for (uint8_t v : hr.mask) n += v != 0; real += n >= 2; }
+    if (train && s.record && real > 0 && std::uniform_real_distribution<float>(0.f, 1.f)(s.rng) < S.record_p) {
         Sample smp;
         smp.policy = s.policy; smp.team = m.game.ents[a].team;
         smp.seg = int(s.segs.size()) - 1; smp.rnd = int(s.segs.back().rounds.size()) - 1;
-        for (auto& hr : d.records) smp.recs.push_back({hr.head, hr.choice, std::move(hr.mask), hr.logp});
+        for (auto& hr : d.records) {
+            int n = 0; for (uint8_t v : hr.mask) n += v != 0;
+            if (n >= 2) smp.recs.push_back({hr.head, hr.choice, std::move(hr.mask), hr.logp});
+        }
         s.samples.push_back(std::move(smp));
         s.recorded = true;
     }
