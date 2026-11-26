@@ -21,7 +21,8 @@ ore_radius 4
 # map generator (rl/sim/map_gen.hpp): random maps shaped like the real ones,
 # symmetric, with the core distance under control. Eval keeps the real maps.
 # map_gen: share of training games on generated maps (0: real maps only)
-# core_distance: tiles between the two cores on generated maps (-1: random 7..21);
+# core_distance: MAX tiles between the two cores on generated maps: each map draws
+#   a random gap in 4..core_distance (capped at 24, the largest a map fits); -1: random 7..21;
 #   start small (~8) so fighting is learned early, then raise it
 # pit_share: share of generated maps with a pit (the cores face each other across it)
 map_gen 0

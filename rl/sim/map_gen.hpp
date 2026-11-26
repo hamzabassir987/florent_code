@@ -9,7 +9,7 @@
 //  * a pit (with probability pit_share, mirror maps only): a void band 1..4
 //    tiles wide through the middle, on the mirror axis, as the real pit maps;
 //  * cores: core B is core A's mirror; their footprints core_gap tiles apart
-//    (Chebyshev, -1: random 7..21 like the real maps). On a pit map the cores
+//    (Chebyshev, random 4..core_gap, capped at 24; -1: random 7..21 like the real maps). On a pit map the cores
 //    face each other across the pit (the gap is at least the pit's width);
 //  * checked by flood fill: each core walks to most of its own half, and the
 //    cores reach each other when there is no pit. A failed map is redrawn.
@@ -22,7 +22,7 @@
 namespace florent_rl {
 
 struct MapGenParams {
-    int core_gap = -1;           // Chebyshev tiles between the two cores' footprints; -1 random 7..21
+    int core_gap = -1;           // max Chebyshev tiles between the cores' footprints: random 4..core_gap (cap 24); -1 random 7..21
     float pit_share = 0.15f;     // share of maps with a pit
     float wall_lo = 0.01f, wall_hi = 0.13f;
 };
