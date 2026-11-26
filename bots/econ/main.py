@@ -68,47 +68,25 @@ _STATUS_SHOWN = False
 
 
 def _embedded_weights():
-    """The student.json data, embedded by rl/tools/make_submission.py over small
-    modules sw0..sw7 (the server drops a large file, and refuses importlib / zlib /
-    base64): every int8 list is a base85 string {"b85": ..., "n": len}, decoded here."""
-    import json
-    parts = []
-    for k in range(8):
-        try:
-            if k == 0: from sw0 import W
-            elif k == 1: from sw1 import W
-            elif k == 2: from sw2 import W
-            elif k == 3: from sw3 import W
-            elif k == 4: from sw4 import W
-            elif k == 5: from sw5 import W
-            elif k == 6: from sw6 import W
-            else: from sw7 import W
-        except ImportError:
-            if k == 0:
-                raise
-            break
-        parts.append(W)
-    alpha = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~"
-    val = {c: i for i, c in enumerate(alpha)}
-
-    def unb85(txt, n):
-        out = []
-        for i in range(0, len(txt), 5):
-            acc = 0
-            for c in txt[i:i + 5].ljust(5, "~"):
-                acc = acc * 85 + val[c]
-            out.extend(((acc >> 24) & 255, (acc >> 16) & 255, (acc >> 8) & 255, acc & 255))
-        return [v - 256 if v > 127 else v for v in out[:n]]
-
-    def expand(x):
-        if isinstance(x, dict):
-            if "b85" in x:
-                return unb85(x["b85"], x["n"])
-            return {k: expand(v) for k, v in x.items()}
-        if isinstance(x, list):
-            return [expand(v) for v in x]
-        return x
-    return expand(json.loads("".join(parts)))
+    """The student.json data as plain Python literals, written by
+    rl/tools/make_submission.py: sw_meta.py (META) and one module per policy
+    (sw0.py ... sw7.py, POLICY)."""
+    from sw_meta import META
+    pols = []
+    for k in range(META["n_policies"]):
+        if k == 0: from sw0 import POLICY
+        elif k == 1: from sw1 import POLICY
+        elif k == 2: from sw2 import POLICY
+        elif k == 3: from sw3 import POLICY
+        elif k == 4: from sw4 import POLICY
+        elif k == 5: from sw5 import POLICY
+        elif k == 6: from sw6 import POLICY
+        else: from sw7 import POLICY
+        pols.append(POLICY)
+    data = dict(META)
+    del data["n_policies"]
+    data["policies"] = pols
+    return data
 
 
 def _diag(ct, text):
@@ -130,21 +108,6 @@ def _diag(ct, text):
         pass
 
 
-class _TeacherPolicy:
-    """Local testing only: the float teacher through a ctypes library (same logits() as StudentPolicy)."""
-    def __init__(self, lib_path, model_path):
-        import ctypes
-        self.ct = ctypes
-        self.L = ctypes.CDLL(lib_path)
-        self.L.teacher_logits.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
-        assert self.L.teacher_load(model_path.encode()) == 0
-
-    def logits(self, policy, raw):
-        c = self.ct
-        x = (c.c_float * len(raw))(*raw)
-        out = (c.c_float * 2048)()
-        n = self.L.teacher_logits(policy, x, out)
-        return list(out[:n])   # int8 student forward: ~3.5 ms median, p95 ~5.1 ms
 if os.environ.get("FLORENT_POLICY"):
     # A cyclic-GC pause can push a turn past the 10 ms limit; reference
     # counting still frees everything, cycles just wait.
@@ -281,7 +244,8 @@ class Player:
         # FLORENT_TEACHER_LIB (rl/tools/teacher_capi.cpp, libtorch) instead of the student
         if HEADS is not None and os.environ.get("FLORENT_TEACHER"):
             try:
-                self.student = _TeacherPolicy(os.environ["FLORENT_TEACHER_LIB"], os.environ["FLORENT_TEACHER"])
+                from teacher_local import TeacherPolicy   # local tests only, not shipped
+                self.student = TeacherPolicy(os.environ["FLORENT_TEACHER_LIB"], os.environ["FLORENT_TEACHER"])
                 policy_path = None
             except Exception as e:
                 print("FLORENT_TEACHER load failed:", repr(e), file=sys.stderr)
