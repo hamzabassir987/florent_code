@@ -33,7 +33,7 @@ import sys
 
 from fcode import Controller, Direction, EntityType, Environment, Position, Team
 
-# The sibling modules (encoder, heads, student, student_weights) must import however
+# The sibling modules (encoder, heads, student, sw*) must import however
 # the runner loads this file: put this file's own folder on the import path first.
 try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +65,17 @@ ROUND_DIV = float(os.environ.get("FLORENT_ROUND_DIV", str(OFFICIAL_ROUNDS / TRAI
 ROUND_SCALAR = 9                     # actor scalar index of the current round (encoder)
 LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "4500"))
 _STATUS_SHOWN = False
+
+
+def _embedded_weights():
+    """The student.json text, embedded by rl/tools/make_submission.py as zlib + base85
+    split over small modules sw0, sw1, ... (the server drops a large file)."""
+    import base64
+    import importlib
+    import zlib
+    n = importlib.import_module("sw0").N
+    parts = [importlib.import_module("sw%d" % i).W for i in range(n)]
+    return zlib.decompress(base64.b85decode("".join(parts))).decode()
 
 
 def _diag(ct, text):
@@ -252,10 +263,9 @@ class Player:
         if self.student is None and StudentPolicy is not None and HEADS is not None and not policy_path \
                 and not os.environ.get("FLORENT_TEACHER"):
             try:
-                from student_weights import STUDENT_JSON
-                self.student = StudentPolicy(text=STUDENT_JSON)
+                self.student = StudentPolicy(text=_embedded_weights())
             except ImportError as e:
-                IMPORT_ERRORS.append("student_weights: " + repr(e))
+                IMPORT_ERRORS.append("weights: " + repr(e))
             except Exception as e:
                 IMPORT_ERRORS.append("embedded student: " + repr(e))
         # say once per process which brain plays (visible in the bot output / logs)
