@@ -101,27 +101,28 @@ static void dump_json_int(std::ostream& os, const torch::Tensor& t) {
 
 static void export_student(Student& st, const std::string& path) {
     std::ofstream os(path);
-    os << "{\"format\":\"florent-student-v1\",\"logit_shift\":" << ST_LOGIT_SHIFT
+    os << "{\"format\":\"florent-student-v2\",\"bits\":8,\"amax\":" << ST_AMAX << ",\"logit_shift\":" << ST_LOGIT_SHIFT
        << ",\"channels\":" << ST_CH << ",\"hidden\":" << ST_HIDDEN
        << ",\"actor_ch\":" << fe::ACTOR_CH << ",\"scalars\":" << fe::ACTOR_SCALARS << ",\"policies\":[";
     for (int p = 0; p < NUM_POLICIES; p++) {
         auto* a = st->a(p);
-        auto q7 = [](const torch::Tensor& w) { return torch::round(torch::clamp(w, -7, 7)); };
-        auto q127 = [](const torch::Tensor& w, double lim = 127) { return torch::round(torch::clamp(w, -lim, lim)); };
+        // exactly the integers the forward pass uses (student.hpp qw / qb)
+        auto qwt = [](const torch::Tensor& w) { return torch::round(torch::clamp(w * ST_WSCALE, -ST_WMAX, ST_WMAX)); };
+        auto qbs = [](const torch::Tensor& b) { return torch::round(torch::clamp(b * ST_BSCALE, -ST_BIAS_MAX, ST_BIAS_MAX)); };
         os << (p ? "," : "") << "{\"policy\":" << p << ",\"nlogits\":" << a->nlogits << ",\"shifts\":[";
         for (int i = 0; i < ST_NSHIFT; i++) os << (i ? "," : "") << a->shifts[i];
-        os << "],\"stem_w\":"; dump_json_int(os, q7(a->stem_w));
-        os << ",\"stem_b\":"; dump_json_int(os, q127(a->stem_b));
+        os << "],\"stem_w\":"; dump_json_int(os, qwt(a->stem_w));
+        os << ",\"stem_b\":"; dump_json_int(os, qbs(a->stem_b));
         for (int b = 0; b < ST_LAYERS; b++) {
-            os << ",\"pw_w" << b << "\":"; dump_json_int(os, q7(a->pw_w[b]));
-            os << ",\"pw_b" << b << "\":"; dump_json_int(os, q127(a->pw_b[b]));
-            os << ",\"dw_w" << b << "\":"; dump_json_int(os, q7(a->dw_w[b]));
-            os << ",\"dw_b" << b << "\":"; dump_json_int(os, q127(a->dw_b[b]));
+            os << ",\"pw_w" << b << "\":"; dump_json_int(os, qwt(a->pw_w[b]));
+            os << ",\"pw_b" << b << "\":"; dump_json_int(os, qbs(a->pw_b[b]));
+            os << ",\"dw_w" << b << "\":"; dump_json_int(os, qwt(a->dw_w[b]));
+            os << ",\"dw_b" << b << "\":"; dump_json_int(os, qbs(a->dw_b[b]));
         }
-        os << ",\"fc_w\":"; dump_json_int(os, q127(a->fc_w));
-        os << ",\"fc_b\":"; dump_json_int(os, q127(a->fc_b));
-        os << ",\"out_w\":"; dump_json_int(os, q127(a->out_w));
-        os << ",\"out_b\":"; dump_json_int(os, q127(a->out_b, 127 * 16));
+        os << ",\"fc_w\":"; dump_json_int(os, qwt(a->fc_w));
+        os << ",\"fc_b\":"; dump_json_int(os, qbs(a->fc_b));
+        os << ",\"out_w\":"; dump_json_int(os, qwt(a->out_w));
+        os << ",\"out_b\":"; dump_json_int(os, qbs(a->out_b));
         os << "}";
     }
     os << "]}\n";

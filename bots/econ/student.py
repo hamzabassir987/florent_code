@@ -1,11 +1,12 @@
-"""Int4 student policy, deployed side: pure-Python SWAR inference that matches
+"""Int8 student policy, deployed side: pure-Python SWAR inference that matches
 rl/train/student.hpp bit for bit (rl/tests/student_exact.py checks it).
 
-Each 17x17 channel is one big integer: 16-bit slots on a 19x19 grid with a
+Inputs and activations 0..255, weights int8 (-127..127), integer biases.
+Each 17x17 channel is one big integer: 32-bit slots on a 19x19 grid with a
 zero border, so one Python int operation updates every cell. Convolutions
-accumulate positive and negative weight parts separately and finish with
-ReLU / shift / clamp per slot. Integer logits; divide by 16 for softmax.
-Only the standard library is used.
+accumulate positive and negative weight parts separately (each below 2^31 per
+slot) and finish with ReLU / shift / clamp per slot. Integer logits; divide by
+2^logit_shift for softmax. Only the standard library is used.
 """
 import json
 import sys
@@ -14,7 +15,8 @@ from array import array
 PATCH, HALF = 17, 8
 ACTOR_CH, SCALARS = 61, 50   # 60th channel: planned conveyor direction (copied as is, 1..8); 61st: rounds since hit (0..10, as is)
 COSTS = 40
-BITS = 16
+BITS = 32
+AMAX = 255                   # activations / inputs: 0..255
 # 4 residual blocks x 2 (1x1 -> depthwise 3x3) layers = 8 depthwise convs:
 # receptive field 17x17, exactly the patch.
 LAYERS = 8
@@ -42,7 +44,7 @@ class Geo:
         self.inner = inner
         self.off = self.ones * HALF_SLOT
         self.full = (1 << (n * BITS)) - 1
-        self.sixteen = self.ones * 16
+        self.amax1 = self.ones * (AMAX + 1)
         self.centre = (r + 1) * S + (r + 1)
         self.dw = [((k // 3 - 1) * S + (k % 3 - 1)) * BITS for k in range(9)]
 
@@ -60,11 +62,16 @@ GEOS = [Geo(RADIUS - 2 * b) for b in range(LAYERS // 2)]
 G0 = GEOS[0]
 WIN, S = G0.win, G0.s
 # encoder channel layout (bots/econ/encoder.py)
-C_STALE, C_VISIT, C_ATTR_STALE, C_HP, C_RAY, C_HIT = 29, 30, 31, 42, 48, 60
+C_STALE, C_VISIT, C_ATTR_STALE, C_HP, C_RAY, C_PATH, C_HIT = 29, 30, 31, 42, 48, 59, 60
+
+
+def _tdiv(a, b):
+    """C++ integer division (truncates toward zero)."""
+    return a // b if a >= 0 else -((-a) // b)
 
 
 def quantize(raw):
-    """Raw encoder ints (spatial 59x17x17 channel-major, then 40 scalars) -> 0..15."""
+    """Raw encoder ints (spatial channel-major, then the scalars) -> 0..255 (as quantize_actor in C++)."""
     P2 = PATCH * PATCH
     q = [0] * len(raw)
     for c in range(ACTOR_CH):
@@ -74,40 +81,46 @@ def quantize(raw):
             if not v:
                 continue
             if c in (C_STALE, C_VISIT, C_ATTR_STALE, C_ATTR_STALE + 1):
-                o = v >> 4
+                o = v
             elif c in (C_HP, C_HP + 1):
-                o = v * 15 // 100
+                o = _tdiv(v * 255, 100)
+            elif c == C_HIT:
+                o = v * 25
+            elif c == C_PATH:
+                o = v * 32
             elif c >= C_RAY:
-                o = (v + 1) >> 1 if (c - C_RAY) <= 1 else v
+                o = v * 8
             else:
-                o = 15
-            q[base + i] = 0 if o < 0 else (15 if o > 15 else o)
+                o = 255
+            q[base + i] = 0 if o < 0 else (AMAX if o > AMAX else o)
     s0 = ACTOR_CH * P2
     for i in range(SCALARS):
         v = raw[s0 + i]
         o = 0
         if i <= 5 or 36 <= i <= 39:
-            o = 15 if v else 0
+            o = 255 if v else 0
         elif i == 6:
-            o = v * 15 // 100
+            o = _tdiv(v * 255, 100)
         elif i in (7, 8):
-            o = v * 3
-        elif i == 9:
-            o = v // 67
-        elif i in (10, 11):
-            o = v // 100
-        elif i == 12:
-            o = v // 50
-        elif i == 14:
-            o = v // 4
+            o = v * 32
+        elif i in (9, 10, 11, 16):
+            o = _tdiv(v, 4)
+        elif i in (12, 17):
+            o = _tdiv(v, 2)
+        elif i in (13, 18):
+            o = _tdiv(v - 100, 2)
+        elif i in (14, 19):
+            o = v * 4
         elif i == 15:
-            o = v
-        elif i == 13:
-            o = (v - 100) // 25 if v >= 100 else -((100 - v) // 25)   # truncates toward 0, like C++
+            o = v * 16
         elif i >= COSTS:
-            o = v // 4
-        q[s0 + i] = 0 if o < 0 else (15 if o > 15 else o)
+            o = _tdiv(v, 2)
+        q[s0 + i] = 0 if o < 0 else (AMAX if o > AMAX else o)
     return q
+
+
+_U32 = "I" if array("I").itemsize == 4 else "L"
+assert array(_U32).itemsize == 4
 
 
 def _pack(q, c):
@@ -120,19 +133,19 @@ def _pack(q, c):
     for y in range(PATCH):
         o = (y + 1) * S + 1
         buf[o:o + PATCH] = seg[y * PATCH:(y + 1) * PATCH]
-    return int.from_bytes(array("H", buf).tobytes(), sys.byteorder)
+    return int.from_bytes(array(_U32, buf).tobytes(), sys.byteorder)
 
 
 def _finish(g, p, n, shift):
-    """clamp(floor((p - n) / 2^shift), 0, 15) per slot, border cleared."""
+    """clamp(floor((p - n) / 2^shift), 0, 255) per slot, border cleared."""
     ones = g.ones
     r = (p + g.off - n) & g.full
     sign = (r >> (BITS - 1)) & ones                     # 1 where p - n >= 0
     r &= sign * (HALF_SLOT - 1)                          # ReLU, drop the offset
     if shift:
         r = (r >> shift) & (ones * ((1 << (BITS - 1 - shift)) - 1))
-    over = (((r + g.off - g.sixteen) >> (BITS - 1)) & ones)  # 1 where r >= 16
-    r = (r & ~(over * SLOT)) | (over * 15)
+    over = (((r + g.off - g.amax1) >> (BITS - 1)) & ones)    # 1 where r > 255
+    r = (r & ~(over * SLOT)) | (over * AMAX)
     return r & g.inner
 
 
@@ -147,7 +160,7 @@ def _bias(g, p, n, b):
 class StudentPolicy:
     def __init__(self, path):
         data = json.loads(open(path).read())
-        assert data["format"] == "florent-student-v1"
+        assert data["format"] == "florent-student-v2", "student.json from an older (int4) distill"
         self.logit_shift = data["logit_shift"]
         self.hidden = data["hidden"]
         self.pol = {}
@@ -181,19 +194,19 @@ class StudentPolicy:
     # ---- SWAR trunk ----------------------------------------------------------
     @staticmethod
     def _pointwise(g, xs, W, B, shift):
-        # W[co] = (pos, neg): for each sign, input indices grouped by |w| = 7..1.
-        # sum_v v * S_v is accumulated as running sums: adds only, no multiplies.
+        # W[co] = (pos, neg): lists of (input index, |w|); zero inputs skipped
         out = []
         for co, (pos, neg) in enumerate(W):
-            pn = []
-            for groups in (pos, neg):
-                t = acc = 0
-                for idx in groups:
-                    for ci in idx:
-                        t += xs[ci]
-                    acc += t
-                pn.append(acc)
-            p, n = _bias(g, pn[0], pn[1], B[co])
+            p = n = 0
+            for ci, w in pos:
+                x = xs[ci]
+                if x:
+                    p += w * x
+            for ci, w in neg:
+                x = xs[ci]
+                if x:
+                    n += w * x
+            p, n = _bias(g, p, n, B[co])
             out.append(_finish(g, p, n, shift))
         return out
 
@@ -219,13 +232,8 @@ class StudentPolicy:
 
     @staticmethod
     def _groups(W):
-        """Dense rows -> (pos, neg) lists of 7 index groups for |w| = 7, 6, ..., 1."""
-        res = []
-        for row in W:
-            pos = [[ci for ci, w in enumerate(row) if w == v] for v in range(7, 0, -1)]
-            neg = [[ci for ci, w in enumerate(row) if w == -v] for v in range(7, 0, -1)]
-            res.append((pos, neg))
-        return res
+        """Dense rows -> (pos, neg): (input index, |w|) lists."""
+        return [([(ci, w) for ci, w in enumerate(row) if w > 0], [(ci, -w) for ci, w in enumerate(row) if w < 0]) for row in W]
 
     def features(self, policy, q):
         P = self.pol[policy]
@@ -252,7 +260,7 @@ class StudentPolicy:
                 col = fcT[i]
                 acc = [a + fi * w for a, w in zip(acc, col)]
         s9 = sh[-1]
-        return [0 if v < 0 else (15 if v > 15 else v) for v in (a >> s9 for a in acc)]
+        return [0 if v < 0 else (AMAX if v > AMAX else v) for v in (a >> s9 for a in acc)]
 
     def logits_int(self, policy, q, indices=None):
         """Integer logits (all, or only `indices`)."""
@@ -269,7 +277,7 @@ class StudentPolicy:
         return out
 
     def logits(self, policy, raw):
-        """Float logits for the head decoder (integer / 16, exactly representable)."""
+        """Float logits for the head decoder (integer / 2^logit_shift, exactly representable)."""
         d = float(1 << self.logit_shift)
         return [v / d for v in self.logits_int(policy, quantize(raw))]
 
@@ -283,7 +291,7 @@ def reference_logits(model, policy, q):
 
     def act(v, s):
         v >>= s
-        return 0 if v < 0 else (15 if v > 15 else v)
+        return 0 if v < 0 else (AMAX if v > AMAX else v)
 
     x = [[q[c * P2 + i] for i in range(P2)] for c in range(ACTOR_CH)]
     h = [[act(P["stem_b"][co] + sum(P["stem"][co][ci] * x[ci][i] for ci in range(ACTOR_CH)), sh[0]) for i in range(P2)] for co in range(C)]

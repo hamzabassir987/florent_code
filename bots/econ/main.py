@@ -174,7 +174,7 @@ class Player:
         self.known_builders = {}
         self.last_report_round = -1
         self.actor_encoder = ActorEncoder() if ActorEncoder is not None else None
-        # FLORENT_POLICY=<student.json>: the int4 student plays every unit;
+        # FLORENT_POLICY=<student.json>: the int8 student plays every unit;
         # otherwise the heuristic bot below plays.
         self.student = None
         policy_path = os.environ.get("FLORENT_POLICY")

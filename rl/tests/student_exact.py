@@ -1,4 +1,4 @@
-"""Exactness: the Python SWAR student (bots/econ/student.py) must reproduce the
+"""Exactness: the Python SWAR int8 student (bots/econ/student.py) must reproduce the
 C++ torch student's integer logits bit for bit, on vectors dumped by
 `distill` (VECTORS=...). Also cross-checks SWAR against a plain-integer
 reference on a few vectors, and times the SWAR forward.
