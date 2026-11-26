@@ -89,6 +89,8 @@ ROUND_DIV = float(os.environ.get("FLORENT_ROUND_DIV", str(OFFICIAL_ROUNDS / TRAI
 ROUND_SCALAR = 9                     # actor scalar index of the current round (encoder)
 LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "4500"))
 _STATUS_SHOWN = False
+PROF = {} if os.environ.get("FLORENT_PROF") == "1" else None   # per-phase CPU (local profiling)
+VERBOSE = os.environ.get("FLORENT_VERBOSE") == "1"   # per-turn prints (local debugging only)
 
 
 def _embedded_weights():
@@ -122,7 +124,7 @@ def _diag(ct, text):
         pass
 
 
-if os.environ.get("FLORENT_POLICY"):
+if True:
     # A cyclic-GC pause can push a turn past the 10 ms limit; reference
     # counting still frees everything, cycles just wait.
     import gc
@@ -368,7 +370,9 @@ class Player:
         p = HEADS.POLICY_OF_TYPE.get(typ)
         if p is None:
             return True
+        t0 = ct.get_cpu_time_elapsed() if PROF is not None else 0
         spatial, scalars = self.actor_encoder.encode(ct)   # memory updates every turn
+        t1 = ct.get_cpu_time_elapsed() if PROF is not None else 0
         api.plan4 = HEADS.plan4_from_obs(spatial)   # conveyor planner mask (path channel)
         mem = self.actor_encoder.memories[ct.get_id()]
         api.own_launchers = mem.own_count(HEADS.LAUNCHER)   # launcher cap
@@ -377,18 +381,29 @@ class Player:
             return True                              # only "wait" is legal: no forward
         if ct.get_cpu_time_elapsed() > LEARNED_START_LIMIT_US:
             self.fallback_turns += 1
-            print("FALLBACK", ct.get_current_round(), ct.get_cpu_time_elapsed(), file=sys.stderr)
+            if VERBOSE:
+                print("FALLBACK", ct.get_current_round(), ct.get_cpu_time_elapsed(), file=sys.stderr)
             return True    # wait: the heuristic bot's store layout clashes with the team bus
         scalars = list(scalars)
         scalars[ROUND_SCALAR] = int(scalars[ROUND_SCALAR] / ROUND_DIV)   # trained on TRAINED_ROUNDS-round games
         raw = spatial + scalars
+        t2 = ct.get_cpu_time_elapsed() if PROF is not None else 0
         actions, _ = HEADS.decide(api, lambda: self.student.logits(p, raw))
+        if PROF is not None:
+            t3 = ct.get_cpu_time_elapsed()
+            for k, v in (("pre", t0), ("encode", t1 - t0), ("masks", t2 - t1), ("decide+forward", t3 - t2), ("total", t3)):
+                PROF.setdefault((p, k), []).append(v)
+            if len(PROF[(p, "total")]) % 100 == 99:
+                for key in sorted(k for k in PROF if k[0] == p):
+                    a = sorted(PROF[key])
+                    print("PROF", key, "n", len(a), "median", a[len(a) // 2], "p90", a[int(len(a) * .9)], file=sys.stderr)
         for a in actions:
             HEADS.apply(api, a)
             if a[0] == "spawn":                     # team bus: the core's next report carries the spawn bit
                 self.actor_encoder.memories[ct.get_id()].spawned_now = True
         self.learned_turns += 1
-        print("LEARNED", ct.get_current_round(), p, actions, ct.get_cpu_time_elapsed())
+        if VERBOSE:
+            print("LEARNED", ct.get_current_round(), p, actions, ct.get_cpu_time_elapsed())
         return True
 
     # ------------------------------------------------------------------
