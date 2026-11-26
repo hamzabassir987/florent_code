@@ -68,14 +68,47 @@ _STATUS_SHOWN = False
 
 
 def _embedded_weights():
-    """The student.json text, embedded by rl/tools/make_submission.py as zlib + base85
-    split over small modules sw0, sw1, ... (the server drops a large file)."""
-    import base64
-    import importlib
-    import zlib
-    n = importlib.import_module("sw0").N
-    parts = [importlib.import_module("sw%d" % i).W for i in range(n)]
-    return zlib.decompress(base64.b85decode("".join(parts))).decode()
+    """The student.json data, embedded by rl/tools/make_submission.py over small
+    modules sw0..sw7 (the server drops a large file, and refuses importlib / zlib /
+    base64): every int8 list is a base85 string {"b85": ..., "n": len}, decoded here."""
+    import json
+    parts = []
+    for k in range(8):
+        try:
+            if k == 0: from sw0 import W
+            elif k == 1: from sw1 import W
+            elif k == 2: from sw2 import W
+            elif k == 3: from sw3 import W
+            elif k == 4: from sw4 import W
+            elif k == 5: from sw5 import W
+            elif k == 6: from sw6 import W
+            else: from sw7 import W
+        except ImportError:
+            if k == 0:
+                raise
+            break
+        parts.append(W)
+    alpha = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~"
+    val = {c: i for i, c in enumerate(alpha)}
+
+    def unb85(txt, n):
+        out = []
+        for i in range(0, len(txt), 5):
+            acc = 0
+            for c in txt[i:i + 5].ljust(5, "~"):
+                acc = acc * 85 + val[c]
+            out.extend(((acc >> 24) & 255, (acc >> 16) & 255, (acc >> 8) & 255, acc & 255))
+        return [v - 256 if v > 127 else v for v in out[:n]]
+
+    def expand(x):
+        if isinstance(x, dict):
+            if "b85" in x:
+                return unb85(x["b85"], x["n"])
+            return {k: expand(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [expand(v) for v in x]
+        return x
+    return expand(json.loads("".join(parts)))
 
 
 def _diag(ct, text):
@@ -263,7 +296,7 @@ class Player:
         if self.student is None and StudentPolicy is not None and HEADS is not None and not policy_path \
                 and not os.environ.get("FLORENT_TEACHER"):
             try:
-                self.student = StudentPolicy(text=_embedded_weights())
+                self.student = StudentPolicy(data=_embedded_weights())
             except ImportError as e:
                 IMPORT_ERRORS.append("weights: " + repr(e))
             except Exception as e:
