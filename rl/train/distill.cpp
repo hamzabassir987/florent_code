@@ -9,6 +9,8 @@
 //
 // The first games start staggered (game i at round i * game_rounds / GAMES) so
 // every phase of the game is covered from iteration 1; later games start at 0.
+// Training games use the same map mix as neural_train (entropy file: map_gen,
+// core_distance, pit_share, ore_radius, game_rounds); eval games use the map files.
 // Games advance in lockstep (game logic on OpenMP threads, one batched forward per
 // policy for teacher and student on the device), as neural_train's rollout.
 // Each iteration plays ROUNDS more rounds of GAMES persistent games (teacher
@@ -30,6 +32,7 @@
 
 #include "../sim/florent_game.hpp"
 #include "../sim/florent_heads.hpp"
+#include "../sim/map_gen.hpp"
 #include "model.hpp"
 #include "student.hpp"
 
@@ -136,7 +139,15 @@ int main(int argc, char** argv) {
     std::vector<float> gtemp(G, 1.f);
     auto new_game = [&](int i, int start_round) {
         games[i] = Match();
-        games[i].load(maps[master() % maps.size()], master());
+        // a generated map with probability map_gen (entropy file: map_gen, core_distance, pit_share), as neural_train
+        if (K.map_gen > 0.f && std::uniform_real_distribution<float>(0.f, 1.f)(master) < K.map_gen) {
+            MapGenParams P; P.core_gap = K.core_distance; P.pit_share = K.pit_share;
+            std::mt19937_64 mr(master());
+            const std::string bytes = generate_map(P, mr, nullptr);
+            if (!games[i].load_bytes(bytes, master())) { std::cerr << "generated map failed to load\n"; std::exit(3); }
+        } else {
+            games[i].load(maps[master() % maps.size()], master());
+        }
         games[i].reset();
         games[i].game.round = start_round;      // staggered first games (as neural_train): every game phase from iteration 1
         games[i].game.max_turns = K.game_rounds;
