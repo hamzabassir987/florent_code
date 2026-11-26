@@ -50,7 +50,20 @@ struct Sample {
 // lockstep game state and a waiting unit's inputs (see advance / forward_batch in main)
 struct GameStep { std::vector<int> order; size_t pos = 0; bool in_round = false; int rounds = 0; bool active = true; };
 struct Pend { int a = -1, p = -1; std::vector<float> obs; std::vector<int32_t> q; int8_t plan4[4] = {0, 0, 0, 0}; int own_l = 0; Targets tg; };
-static torch::Device g_dev(torch::kCPU);     // models live here (cuda if available, DEVICE=cpu to force)
+static torch::Device g_dev(torch::kCPU);
+// the teacher sees exactly what neural_train fed it (Match::encode_compact): spatial
+// clamped to 0..255, scalars to int16 (the student quantizes the raw values itself)
+// raw encoder values as int16 with saturation (not wrap-around): a large scalar such as
+// a team's Ti above 32767 stays large, as in the deployed bot's own quantization
+static std::vector<int16_t> to_i16(const std::vector<float>& v) {
+    std::vector<int16_t> o(v.size());
+    for (size_t i = 0; i < v.size(); i++) o[i] = int16_t(std::min(32767.f, std::max(-32768.f, v[i])));
+    return o;
+}
+static void clamp_teacher_row(float* x) {
+    for (int i = 0; i < fe::ACTOR_SPATIAL; i++) x[i] = std::min(255.f, std::max(0.f, x[i]));
+    for (int i = 0; i < fe::ACTOR_SCALARS; i++) x[fe::ACTOR_SPATIAL + i] = std::min(32767.f, std::max(-32768.f, x[fe::ACTOR_SPATIAL + i]));
+}     // models live here (cuda if available, DEVICE=cpu to force)
 static torch::Tensor raw_tensor(const std::vector<int16_t>& r) {
     std::vector<float> v(r.begin(), r.end());
     return torch::from_blob(v.data(), {1, (long)v.size()}, torch::kFloat32).clone().to(g_dev);
@@ -184,7 +197,7 @@ int main(int argc, char** argv) {
                 targets_from_memory(m.memories.at(a), pd.tg);
                 if (!has_choice(m.game, a, pd.plan4, pd.own_l, &pd.tg)) { gs.pos++; continue; }
                 pd.a = a; pd.p = p;
-                std::vector<int16_t> raw(pd.obs.begin(), pd.obs.end());
+                const std::vector<int16_t> raw = to_i16(pd.obs);
                 pd.q.resize(raw.size()); quantize_actor(raw.data(), pd.q.data());
                 return true;
             }
@@ -204,6 +217,7 @@ int main(int argc, char** argv) {
             #pragma omp parallel for
             for (long b = 0; b < n; b++) {
                 std::copy(pend[sub[b]].obs.begin(), pend[sub[b]].obs.end(), rb.begin() + b * D);
+                clamp_teacher_row(rb.data() + b * D);
                 std::copy(pend[sub[b]].q.begin(), pend[sub[b]].q.end(), qb.begin() + b * D);
             }
             auto rt = torch::from_blob(rb.data(), {n, D}, torch::kFloat32).to(g_dev);
@@ -249,7 +263,7 @@ int main(int argc, char** argv) {
                     Pend& pd = pend[gi];
                     const float* tl = TL[gi].data();
                     const float* sl = SL[gi].data();
-                    Sample smp; smp.policy = pd.p; smp.raw.assign(pd.obs.begin(), pd.obs.end()); smp.q = pd.q;
+                    Sample smp; smp.policy = pd.p; smp.raw = to_i16(pd.obs); smp.q = pd.q;
                     // agreement: greedy decode with each model on this exact state
                     Decision dt = decide(m.game, pd.a, tl, greedy(), pd.plan4, pd.own_l, &pd.tg);
                     Decision ds = decide(m.game, pd.a, sl, greedy(), pd.plan4, pd.own_l, &pd.tg);
@@ -312,6 +326,7 @@ int main(int argc, char** argv) {
                     std::vector<float> rb(idx.size() * D), qb(idx.size() * D);
                     for (size_t b = 0; b < idx.size(); b++) {
                         std::copy(data[idx[b]].raw.begin(), data[idx[b]].raw.end(), rb.begin() + b * D);
+                        clamp_teacher_row(rb.data() + b * D);
                         std::copy(data[idx[b]].q.begin(), data[idx[b]].q.end(), qb.begin() + b * D);
                     }
                     auto rt = torch::from_blob(rb.data(), {(long)idx.size(), D}, torch::kFloat32).clone().to(g_dev);
