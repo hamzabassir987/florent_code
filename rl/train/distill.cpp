@@ -2,6 +2,8 @@
 //
 //   distill TEACHER.pt OUT_STUDENT.pt OUT.json ITERATIONS MAP [MAP...]
 //   env: GAMES (4) ROUNDS (40) EPOCHS (2) LR (3e-3) VECTORS (vector dump path)
+//        EVAL_EVERY (40: every N iterations the student plays EVAL_GAMES greedy
+//        games against the teacher, sides alternating; 0: off) EVAL_GAMES (100; played in parallel over the CPU threads)
 //
 // The first games start staggered (game i at round i * game_rounds / GAMES) so
 // every phase of the game is covered from iteration 1; later games start at 0.
@@ -14,6 +16,7 @@
 // same state and counts identical actions (float/quantized agreement).
 // Writes the student checkpoint, the JSON export for bots/econ/student.py, and
 // optionally test vectors (quantized input -> integer logits) for exactness.
+#include <omp.h>
 #include <torch/torch.h>
 #include "entropy_file.hpp"
 
@@ -170,7 +173,7 @@ int main(int argc, char** argv) {
                         double u = std::uniform_real_distribution<double>(0, z)(rng), c = 0; int pick = -1;
                         for (size_t i = 0; i < mk.size(); i++) if (mk[i]) { pick = int(i); c += w[i]; if (u <= c) break; }
                         lp = 0; return pick;
-                    }, plan4, own_l);
+                    }, plan4, own_l, &tg);
                     for (auto& hr : d.records) s.heads.push_back({hr.head, hr.mask});
                     // the teacher's own decode visits heads too: label those as well
                     for (auto& hr : dt.records) s.heads.push_back({hr.head, hr.mask});
@@ -241,6 +244,57 @@ int main(int argc, char** argv) {
                   << " samples " << data.size() << " kl " << (kl_n ? kl_sum / kl_n : 0)
                   << " action_agreement " << (compared ? double(agree) / compared : 0) << " (" << agree << "/" << compared << ")"
                   << std::endl;
+        // ---- match eval: student vs teacher, greedy, full games (game_rounds), sides alternating
+        const int EV = env_int("EVAL_EVERY", 40), EG = env_int("EVAL_GAMES", 100);
+        if (EV > 0 && (it % EV == 0 || it == iters)) {
+            st->eval();
+            torch::NoGradGuard ng;
+            int sw = 0, tw = 0; long sti = 0, tti = 0;
+            std::mt19937 er(0xE7A1u + unsigned(it));
+            std::vector<uint32_t> s1(EG), s2(EG);
+            for (int e = 0; e < EG; e++) { s1[e] = er(); s2[e] = er(); }
+            const int torch_threads = torch::get_num_threads();
+            torch::set_num_threads(1);                 // one game per OpenMP thread
+            #pragma omp parallel for schedule(dynamic, 1) reduction(+ : sw, tw, sti, tti)
+            for (int e = 0; e < EG; e++) {
+                const int st_team = e & 1;
+                Match m; m.load(maps[(e / 2) % maps.size()], s1[e]); m.reset();
+                m.game.max_turns = K.game_rounds; m.game.limit_ore(K.ore_radius, s2[e]);
+                while (!m.game.over) {
+                    for (int a : m.acting_units()) {
+                        if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) continue;
+                        const int type = m.game.ents[a].type;
+                        if (type == fe::SPIKE) { const bool first = !m.memories.count(a); m.observe(a); Candidate c; if (spike_action(m.game, a, c, first)) m.act(a, c); continue; }
+                        const int p = policy_of_type(type);
+                        if (p < 0) continue;
+                        m.observe(a);
+                        std::vector<float> obs; m.encode_only(a, obs);
+                        int8_t plan4[4]; plan4_from_obs(obs.data(), plan4);
+                        const int own_l = m.memories.at(a).own_count(fe::LAUNCHER);
+                        Targets tg; targets_from_memory(m.memories.at(a), tg);
+                        if (!has_choice(m.game, a, plan4, own_l, &tg)) continue;
+                        torch::Tensor L;
+                        if (m.game.ents[a].team == st_team) {
+                            std::vector<int16_t> raw(obs.begin(), obs.end()); std::vector<int32_t> q(raw.size());
+                            quantize_actor(raw.data(), q.data());
+                            L = (st->a(p)->forward(q_tensor(q)) / double(1 << ST_LOGIT_SHIFT)).squeeze(0).contiguous();
+                        } else {
+                            std::vector<int16_t> raw(obs.begin(), obs.end());
+                            L = teacher->logits(p, raw_tensor(raw)).squeeze(0).contiguous();
+                        }
+                        Decision d = decide(m.game, a, L.data_ptr<float>(), greedy(), plan4, own_l, &tg);
+                        for (auto& c : d.actions) m.act(a, c);
+                    }
+                    m.game.end_round();
+                }
+                if (m.game.winner == st_team) sw++; else if (m.game.winner >= 0) tw++;
+                sti += m.game.teams[st_team].ti_collected; tti += m.game.teams[1 - st_team].ti_collected;
+            }
+            torch::set_num_threads(torch_threads);
+            std::cout << "eval " << it << ": student vs teacher (greedy, " << EG << " games, " << K.game_rounds << " rounds): student wins "
+                      << sw << ", teacher wins " << tw << ", mean Ti collected student " << sti / std::max(1, EG)
+                      << " teacher " << tti / std::max(1, EG) << std::endl;
+        }
         if (it % 5 == 0 || it == iters) {
             for (int p = 0; p < NUM_POLICIES; p++) st->a(p)->sync_shifts_to_buffer();
             torch::save(st, spath);
