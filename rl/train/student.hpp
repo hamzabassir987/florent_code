@@ -15,12 +15,17 @@
 #pragma once
 #include <torch/torch.h>
 
+#include <cstdlib>
+
 #include "../../engine/src/obs.hpp"
 #include "../sim/florent_heads.hpp"
 
 namespace florent_rl {
 
-constexpr int ST_CH = 16, ST_HIDDEN = 128, ST_LOGIT_SHIFT = 12;
+// trunk width: env ST_CH (default 16). 8 channels: ~4x cheaper 1x1 layers, the
+// Python forward fits the server's 10 ms turn (16 channels: ~8 ms on the server)
+inline const int ST_CH = [] { const char* v = std::getenv("ST_CH"); return v ? std::atoi(v) : 16; }();
+constexpr int ST_HIDDEN = 128, ST_LOGIT_SHIFT = 12;
 constexpr int ST_AMAX = 255;                 // activations and inputs: 0..255
 constexpr double ST_WMAX = 127, ST_WSCALE = 32, ST_BSCALE = 1024, ST_BIAS_MAX = 1 << 22;
 // 4 residual blocks x 2 (1x1 -> dw3x3) layers = 8 layers; residual after odd layers
