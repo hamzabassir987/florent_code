@@ -246,7 +246,7 @@ class Player:
             if self.student is not None:
                 print("[florent] learned policy loaded:", type(self.student).__name__, file=sys.stderr)
             else:
-                print("[florent] NO learned policy, heuristic plays; import errors:", IMPORT_ERRORS or "none", file=sys.stderr)
+                print("[florent] NO learned policy, the bot does nothing; import errors:", IMPORT_ERRORS or "none", file=sys.stderr)
         self.policy_disabled = False
         self.learned_turns = 0
         self.fallback_turns = 0
@@ -268,6 +268,10 @@ class Player:
         self.ecore = None
 
     def run(self, ct: Controller) -> None:
+        # no learned policy loaded: do nothing (no heuristic fallback), unless
+        # FLORENT_HEURISTIC=1 asks for the heuristic (local tests)
+        if self.student is None and os.environ.get("FLORENT_HEURISTIC") != "1":
+            return
         if not self.init:
             self._setup(ct)
         # Learned inference (opt-in). Heuristic handlers remain the fallback for
