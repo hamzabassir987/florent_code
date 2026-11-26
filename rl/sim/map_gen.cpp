@@ -91,6 +91,7 @@ bool try_generate(const MapGenParams& P, std::mt19937_64& rng, Map& m) {
     const bool pit = rf(rng) < P.pit_share;
     m.sym = pit ? ri(rng, 1, 2) : ri(rng, 0, 2);
     int gap = P.core_gap >= 0 ? P.core_gap : ri(rng, 7, 21);
+    gap = std::min(gap, 24);    // largest gap a 30-tile map fits (30 - 2 - (gap + 1) >= 2, parity)
     // size: as the real maps, grown if the requested gap needs it
     m.W = ri(rng, 16, 30); m.H = ri(rng, 17, 29);
     auto& span = (m.sym == 2) ? m.H : m.W;                      // the axis the cores are mirrored across
