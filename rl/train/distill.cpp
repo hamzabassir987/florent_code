@@ -4,6 +4,7 @@
 //   env: GAMES (4) ROUNDS (40) EPOCHS (2) LR (3e-3) VECTORS (vector dump path)
 //        DEVICE (cuda if available | cpu): teacher, student and the KL fit run there
 //        TEMP_MIN / TEMP_MAX (0.5 / 1.5): each game samples with its own temperature
+//        EXPORT_ONLY (with INIT=student.pt: only write OUT.json from it)
 //        BUF_PER_HEAD (16384) K_PER_HEAD (32) STEPS (400): per-head replay buffers; each of
 //        the STEPS training steps per iteration samples K_PER_HEAD records of every head
 //        (heads weigh equally in the loss). EPOCHS is unused.
@@ -154,6 +155,15 @@ int main(int argc, char** argv) {
         resumed = true;
     }
     st->to(g_dev);
+    // EXPORT_ONLY=1 with INIT=student.pt: write OUT.json (and OUT_STUDENT.pt) from it, then exit
+    if (std::getenv("EXPORT_ONLY") && resumed) {
+        torch::save(st, spath);
+        Student cpu; torch::load(cpu, spath, torch::Device(torch::kCPU));
+        for (int p = 0; p < NUM_POLICIES; p++) cpu->a(p)->sync_shifts_from_buffer();
+        export_student(cpu, jpath);
+        std::cout << "exported " << jpath << std::endl;
+        return 0;
+    }
     torch::optim::Adam opt(st->parameters(), torch::optim::AdamOptions(env_float("LR", 3e-3f)));
     // game_rounds / ore_radius from the same entropy file as neural_train (re-read every iteration)
     const std::string KNOB_PATH = std::getenv("ENTROPY_FILE") ? std::getenv("ENTROPY_FILE") : "entropy_file";
