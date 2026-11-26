@@ -27,6 +27,8 @@
 #include "entropy_file.hpp"
 
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <random>
 
@@ -238,6 +240,7 @@ int main(int argc, char** argv) {
         bool teacher_plays = it == 1 && !resumed;
         std::vector<Sample> data;
         long agree = 0, compared = 0;
+        std::vector<long> hagree(NUM_HEAD_IDS, 0), hcomp(NUM_HEAD_IDS, 0);   // per-head greedy agreement
         st->eval();
         {
             // ---- lockstep rollout (as neural_train): every game advances to its next deciding
@@ -247,6 +250,7 @@ int main(int argc, char** argv) {
             std::vector<Pend> pend(G);
             std::vector<std::vector<Sample>> gdata(G);
             std::vector<long> gagree(G, 0), gcomp(G, 0);
+            std::vector<std::vector<long>> ghagree(G, std::vector<long>(NUM_HEAD_IDS, 0)), ghcomp(G, std::vector<long>(NUM_HEAD_IDS, 0));
             std::vector<char> need(G, 0);
             for (;;) {
                 #pragma omp parallel for schedule(dynamic, 1)
@@ -274,6 +278,10 @@ int main(int argc, char** argv) {
                         same = x.kind == y.kind && x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d;
                     }
                     gagree[gi] += same;
+                    // per head: both greedy decodes visited the head -> same choice?
+                    for (auto& rt : dt.records)
+                        for (auto& rs : ds.records)
+                            if (rs.head == rt.head) { ghcomp[gi][rt.head]++; ghagree[gi][rt.head] += rs.choice == rt.choice; break; }
                     // act with a sampled decision of the playing model, at this game's temperature
                     const float* L = teacher_plays ? tl : sl;
                     std::mt19937& rng = grng[gi];
@@ -295,6 +303,7 @@ int main(int argc, char** argv) {
             }
             for (int gi = 0; gi < G; gi++) {
                 agree += gagree[gi]; compared += gcomp[gi];
+                for (int h = 0; h < NUM_HEAD_IDS; h++) { hagree[h] += ghagree[gi][h]; hcomp[h] += ghcomp[gi][h]; }
                 for (auto& x : gdata[gi]) data.push_back(std::move(x));
                 if (games[gi].game.over) new_game(gi, 0);
             }
@@ -311,6 +320,8 @@ int main(int argc, char** argv) {
         // ---- KL distillation per head record
         st->train();
         double kl_sum = 0; long kl_n = 0;
+        std::vector<torch::Tensor> hkl(NUM_HEAD_IDS);                      // per-head KL sums (device, no sync per step)
+        std::vector<long> hkn(NUM_HEAD_IDS, 0);
         std::vector<int> order(data.size());
         for (size_t i = 0; i < order.size(); i++) order[i] = int(i);
         for (int ep = 0; ep < EPOCHS; ep++) {
@@ -347,6 +358,7 @@ int main(int argc, char** argv) {
                         auto slog = torch::log_softmax(sl.index_select(0, rt2).narrow(1, head_offset(p, head), n).masked_fill(~mask, -1e9f), 1);
                         auto kl = (tlog.exp() * (tlog - slog)).masked_fill(~mask, 0.f).sum(1);
                         loss = loss + kl.sum();
+                        { auto ks = kl.sum().detach(); hkl[head] = hkl[head].defined() ? hkl[head] + ks : ks; hkn[head] += k; }
                         nrec += k;
                     }
                 }
@@ -355,6 +367,17 @@ int main(int argc, char** argv) {
                 opt.zero_grad(); loss.backward(); opt.step();
                 kl_sum += loss.item<double>() * nrec; kl_n += nrec;
             }
+        }
+        {   // per head: KL (last epoch pass included) and greedy agreement, heads with records only
+            std::ostringstream o;
+            o << "  heads:";
+            for (int h = 0; h < NUM_HEAD_IDS; h++) {
+                if (!hkn[h] && !hcomp[h]) continue;
+                o << " " << HEAD_NAMES[h] << " kl " << std::fixed << std::setprecision(2)
+                  << (hkn[h] ? hkl[h].item<double>() / double(hkn[h]) : 0.0)
+                  << " agr " << std::setprecision(0) << (hcomp[h] ? 100.0 * hagree[h] / hcomp[h] : 0.0) << "% (" << hcomp[h] << ")";
+            }
+            std::cout << o.str() << std::endl;
         }
         std::cout << "iter " << it << (teacher_plays ? " (teacher plays)" : " (student plays)")
                   << " samples " << data.size() << " kl " << (kl_n ? kl_sum / kl_n : 0)
