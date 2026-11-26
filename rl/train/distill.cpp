@@ -3,6 +3,8 @@
 //   distill TEACHER.pt OUT_STUDENT.pt OUT.json ITERATIONS MAP [MAP...]
 //   env: GAMES (4) ROUNDS (40) EPOCHS (2) LR (3e-3) VECTORS (vector dump path)
 //
+// The first games start staggered (game i at round i * game_rounds / GAMES) so
+// every phase of the game is covered from iteration 1; later games start at 0.
 // Each iteration plays ROUNDS more rounds of GAMES persistent games (teacher
 // plays on iteration 1, the student afterwards: DAgger), records every
 // decision's raw observation and its participating heads (masks from the
@@ -107,15 +109,16 @@ int main(int argc, char** argv) {
     std::mt19937 master(99);
     std::vector<Match> games(G);
     std::vector<std::mt19937> grng(G);
-    auto new_game = [&](int i) {
+    auto new_game = [&](int i, int start_round) {
         games[i] = Match();
         games[i].load(maps[master() % maps.size()], master());
         games[i].reset();
+        games[i].game.round = start_round;      // staggered first games (as neural_train): every game phase from iteration 1
         games[i].game.max_turns = K.game_rounds;
         games[i].game.limit_ore(K.ore_radius, master());
         grng[i].seed(master());
     };
-    for (int i = 0; i < G; i++) new_game(i);
+    for (int i = 0; i < G; i++) new_game(i, int(long(i) * std::max(1, K.game_rounds) / G));
 
     for (int it = 1; it <= iters; it++) {
         read_entropy_file(KNOB_PATH, K);
@@ -176,7 +179,7 @@ int main(int argc, char** argv) {
                 }
                 m.game.end_round();
             }
-            if (m.game.over) new_game(gi);
+            if (m.game.over) new_game(gi, 0);
         }
         // one-time shift calibration on the first batch
         if (it == 1 && !resumed) {
