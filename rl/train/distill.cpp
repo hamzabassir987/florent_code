@@ -2,6 +2,7 @@
 //
 //   distill TEACHER.pt OUT_STUDENT.pt OUT.json ITERATIONS MAP [MAP...]
 //   env: GAMES (4) ROUNDS (40) EPOCHS (2) LR (3e-3) VECTORS (vector dump path)
+//        DEVICE (cuda if available | cpu): teacher, student and the KL fit run there
 //        EVAL_EVERY (40: every N iterations the student plays EVAL_GAMES greedy
 //        games against the teacher, sides alternating; 0: off) EVAL_GAMES (100; played in parallel over the CPU threads)
 //
@@ -40,13 +41,14 @@ struct Sample {
     std::vector<std::pair<int, std::vector<uint8_t>>> heads;   // participating head, mask
 };
 
+static torch::Device g_dev(torch::kCPU);     // models live here (cuda if available, DEVICE=cpu to force)
 static torch::Tensor raw_tensor(const std::vector<int16_t>& r) {
     std::vector<float> v(r.begin(), r.end());
-    return torch::from_blob(v.data(), {1, (long)v.size()}, torch::kFloat32).clone();
+    return torch::from_blob(v.data(), {1, (long)v.size()}, torch::kFloat32).clone().to(g_dev);
 }
 static torch::Tensor q_tensor(const std::vector<int32_t>& r) {
     std::vector<float> v(r.begin(), r.end());
-    return torch::from_blob(v.data(), {1, (long)v.size()}, torch::kFloat32).clone();
+    return torch::from_blob(v.data(), {1, (long)v.size()}, torch::kFloat32).clone().to(g_dev);
 }
 
 static Chooser greedy() {
@@ -54,7 +56,7 @@ static Chooser greedy() {
 }
 
 static void dump_json_int(std::ostream& os, const torch::Tensor& t) {
-    auto v = t.detach().to(torch::kFloat64).contiguous().flatten();
+    auto v = t.detach().to(torch::kCPU).to(torch::kFloat64).contiguous().flatten();
     os << "[";
     for (long i = 0; i < v.numel(); i++) os << (i ? "," : "") << (long long)std::llround(v[i].item<double>());
     os << "]";
@@ -96,14 +98,24 @@ int main(int argc, char** argv) {
     const int G = env_int("GAMES", 4), R = env_int("ROUNDS", 40), EPOCHS = env_int("EPOCHS", 2), MB = 256;
     if (std::getenv("THREADS")) torch::set_num_threads(env_int("THREADS", 0));   // default: torch picks (all cores)
     torch::manual_seed(11);
-    Teacher teacher; torch::load(teacher, tpath); teacher->eval();
+    {
+        const char* d = std::getenv("DEVICE");
+        if ((!d || std::string(d) == "cuda") && torch::cuda::is_available()) g_dev = torch::Device(torch::kCUDA);
+        std::cout << "distill: device " << (g_dev.is_cuda() ? "cuda" : "cpu") << std::endl;
+        // the student's integer-exact forward must not use TF32
+        at::globalContext().setAllowTF32CuBLAS(false);
+        at::globalContext().setAllowTF32CuDNN(false);
+    }
+    // checkpoints load on the CPU whatever device saved them, then move to g_dev
+    Teacher teacher; torch::load(teacher, tpath, torch::Device(torch::kCPU)); teacher->to(g_dev); teacher->eval();
     Student st;
     bool resumed = false;
     if (const char* init = std::getenv("INIT")) {
-        torch::load(st, init);
+        torch::load(st, init, torch::Device(torch::kCPU));
         for (int p = 0; p < NUM_POLICIES; p++) st->a(p)->sync_shifts_from_buffer();
         resumed = true;
     }
+    st->to(g_dev);
     torch::optim::Adam opt(st->parameters(), torch::optim::AdamOptions(env_float("LR", 3e-3f)));
     // game_rounds / ore_radius from the same entropy file as neural_train (re-read every iteration)
     const std::string KNOB_PATH = std::getenv("ENTROPY_FILE") ? std::getenv("ENTROPY_FILE") : "entropy_file";
@@ -150,8 +162,8 @@ int main(int argc, char** argv) {
                     torch::Tensor tl, sl;
                     {
                         torch::NoGradGuard ng;
-                        tl = teacher->logits(p, raw_tensor(s.raw)).squeeze(0).contiguous();
-                        sl = (st->a(p)->forward(q_tensor(s.q)) / double(1 << ST_LOGIT_SHIFT)).squeeze(0).contiguous();
+                        tl = teacher->logits(p, raw_tensor(s.raw)).squeeze(0).to(torch::kCPU).contiguous();
+                        sl = (st->a(p)->forward(q_tensor(s.q)) / double(1 << ST_LOGIT_SHIFT)).squeeze(0).to(torch::kCPU).contiguous();
                     }
                     // agreement: greedy decode with each model on this exact state
                     Decision dt = decide(m.game, a, tl.data_ptr<float>(), greedy(), plan4, own_l, &tg);
@@ -190,7 +202,7 @@ int main(int argc, char** argv) {
                 std::vector<float> buf; long n = 0;
                 for (auto& s : data) if (s.policy == p && n < 512) { buf.insert(buf.end(), s.q.begin(), s.q.end()); n++; }
                 if (!n) continue;
-                st->a(p)->calibrate(torch::from_blob(buf.data(), {n, (long)data[0].q.size()}, torch::kFloat32).clone());
+                st->a(p)->calibrate(torch::from_blob(buf.data(), {n, (long)data[0].q.size()}, torch::kFloat32).clone().to(g_dev));
             }
         }
         // ---- KL distillation per head record
@@ -202,7 +214,7 @@ int main(int argc, char** argv) {
             std::shuffle(order.begin(), order.end(), master);
             for (size_t s0 = 0; s0 < order.size(); s0 += MB) {
                 size_t s1 = std::min(order.size(), s0 + MB);
-                torch::Tensor loss = torch::zeros({}); long nrec = 0;
+                torch::Tensor loss = torch::zeros({}, g_dev); long nrec = 0;
                 for (int p = 0; p < NUM_POLICIES; p++) {
                     std::vector<int> idx;
                     for (size_t k = s0; k < s1; k++) if (data[order[k]].policy == p) idx.push_back(order[k]);
@@ -213,8 +225,8 @@ int main(int argc, char** argv) {
                         std::copy(data[idx[b]].raw.begin(), data[idx[b]].raw.end(), rb.begin() + b * D);
                         std::copy(data[idx[b]].q.begin(), data[idx[b]].q.end(), qb.begin() + b * D);
                     }
-                    auto rt = torch::from_blob(rb.data(), {(long)idx.size(), D}, torch::kFloat32).clone();
-                    auto qt = torch::from_blob(qb.data(), {(long)idx.size(), D}, torch::kFloat32).clone();
+                    auto rt = torch::from_blob(rb.data(), {(long)idx.size(), D}, torch::kFloat32).clone().to(g_dev);
+                    auto qt = torch::from_blob(qb.data(), {(long)idx.size(), D}, torch::kFloat32).clone().to(g_dev);
                     torch::Tensor tl;
                     { torch::NoGradGuard ng; tl = teacher->logits(p, rt); }
                     auto sl = st->a(p)->forward(qt) / double(1 << ST_LOGIT_SHIFT);
@@ -225,8 +237,8 @@ int main(int argc, char** argv) {
                                 if (hm.first == head) { rows.push_back(long(b)); mk.insert(mk.end(), hm.second.begin(), hm.second.end()); }
                         if (rows.empty()) continue;
                         long k = long(rows.size());
-                        auto rt2 = torch::tensor(rows, torch::kLong);
-                        auto mask = torch::from_blob(mk.data(), {k, n}, torch::kUInt8).clone().to(torch::kBool);
+                        auto rt2 = torch::tensor(rows, torch::kLong).to(g_dev);
+                        auto mask = torch::from_blob(mk.data(), {k, n}, torch::kUInt8).clone().to(torch::kBool).to(g_dev);
                         auto tlog = torch::log_softmax(tl.index_select(0, rt2).narrow(1, head_offset(p, head), n).masked_fill(~mask, -1e9f), 1);
                         auto slog = torch::log_softmax(sl.index_select(0, rt2).narrow(1, head_offset(p, head), n).masked_fill(~mask, -1e9f), 1);
                         auto kl = (tlog.exp() * (tlog - slog)).masked_fill(~mask, 0.f).sum(1);
@@ -277,10 +289,10 @@ int main(int argc, char** argv) {
                         if (m.game.ents[a].team == st_team) {
                             std::vector<int16_t> raw(obs.begin(), obs.end()); std::vector<int32_t> q(raw.size());
                             quantize_actor(raw.data(), q.data());
-                            L = (st->a(p)->forward(q_tensor(q)) / double(1 << ST_LOGIT_SHIFT)).squeeze(0).contiguous();
+                            L = (st->a(p)->forward(q_tensor(q)) / double(1 << ST_LOGIT_SHIFT)).squeeze(0).to(torch::kCPU).contiguous();
                         } else {
                             std::vector<int16_t> raw(obs.begin(), obs.end());
-                            L = teacher->logits(p, raw_tensor(raw)).squeeze(0).contiguous();
+                            L = teacher->logits(p, raw_tensor(raw)).squeeze(0).to(torch::kCPU).contiguous();
                         }
                         Decision d = decide(m.game, a, L.data_ptr<float>(), greedy(), plan4, own_l, &tg);
                         for (auto& c : d.actions) m.act(a, c);
@@ -298,16 +310,21 @@ int main(int argc, char** argv) {
         if (it % 5 == 0 || it == iters) {
             for (int p = 0; p < NUM_POLICIES; p++) st->a(p)->sync_shifts_to_buffer();
             torch::save(st, spath);
-            export_student(st, jpath);
+            Student cpu; torch::load(cpu, spath, torch::Device(torch::kCPU));   // exports from a CPU copy (bit-exact ints)
+            for (int p = 0; p < NUM_POLICIES; p++) cpu->a(p)->sync_shifts_from_buffer();
+            export_student(cpu, jpath);
         }
         // exactness vectors: quantized input -> integer logits (student)
         if (it == iters) if (const char* vp = std::getenv("VECTORS")) {
             std::ofstream vf(vp);
             torch::NoGradGuard ng;
             int written = 0;
+            Student cpu; torch::load(cpu, spath, torch::Device(torch::kCPU));   // vectors from the exported CPU copy
+            for (int p = 0; p < NUM_POLICIES; p++) cpu->a(p)->sync_shifts_from_buffer();
             for (auto& s : data) {
                 if (written >= env_int("NVECTORS", 300)) break;
-                auto li = st->a(s.policy)->forward(q_tensor(s.q)).squeeze(0);
+                std::vector<float> qv(s.q.begin(), s.q.end());
+                auto li = cpu->a(s.policy)->forward(torch::from_blob(qv.data(), {1, (long)qv.size()}, torch::kFloat32).clone()).squeeze(0);
                 vf << "{\"policy\":" << s.policy << ",\"raw\":[";
                 for (size_t i = 0; i < s.raw.size(); i++) vf << (i ? "," : "") << s.raw[i];
                 vf << "],\"logits\":";
