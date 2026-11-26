@@ -5,10 +5,12 @@
 //        DEVICE (cuda if available | cpu): teacher, student and the KL fit run there
 //        TEMP_MIN / TEMP_MAX (0.5 / 1.5): each game samples with its own temperature
 //        EVAL_EVERY (40: every N iterations the student plays EVAL_GAMES greedy
-//        games against the teacher, sides alternating; 0: off) EVAL_GAMES (100; played in parallel over the CPU threads)
+//        games against the teacher, sides alternating; 0: off) EVAL_GAMES (100)
 //
 // The first games start staggered (game i at round i * game_rounds / GAMES) so
 // every phase of the game is covered from iteration 1; later games start at 0.
+// Games advance in lockstep (game logic on OpenMP threads, one batched forward per
+// policy for teacher and student on the device), as neural_train's rollout.
 // Each iteration plays ROUNDS more rounds of GAMES persistent games (teacher
 // plays on iteration 1, the student afterwards: DAgger), records every
 // decision's raw observation and its participating heads (masks from the
@@ -42,6 +44,9 @@ struct Sample {
     std::vector<std::pair<int, std::vector<uint8_t>>> heads;   // participating head, mask
 };
 
+// lockstep game state and a waiting unit's inputs (see advance / forward_batch in main)
+struct GameStep { std::vector<int> order; size_t pos = 0; bool in_round = false; int rounds = 0; bool active = true; };
+struct Pend { int a = -1, p = -1; std::vector<float> obs; std::vector<int32_t> q; int8_t plan4[4] = {0, 0, 0, 0}; int own_l = 0; Targets tg; };
 static torch::Device g_dev(torch::kCPU);     // models live here (cuda if available, DEVICE=cpu to force)
 static torch::Tensor raw_tensor(const std::vector<int16_t>& r) {
     std::vector<float> v(r.begin(), r.end());
@@ -141,6 +146,67 @@ int main(int argc, char** argv) {
     };
     for (int i = 0; i < G; i++) new_game(i, int(long(i) * std::max(1, K.game_rounds) / G));
 
+    // ---- lockstep stepping (shared by the rollout and the eval)
+    // advance(): plays the game until a unit needs a forward (true, pend filled) or the
+    // game is over / has played `limit` rounds this call series (false). Spikes act here.
+    auto advance = [&](Match& m, GameStep& gs, Pend& pd, int limit) -> bool {
+        for (;;) {
+            if (!gs.in_round) {
+                if (m.game.over || gs.rounds >= limit) return false;
+                gs.order = m.acting_units(); gs.pos = 0; gs.in_round = true;
+            }
+            while (gs.pos < gs.order.size()) {
+                const int a = gs.order[gs.pos];
+                if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) { gs.pos++; continue; }
+                const int type = m.game.ents[a].type;
+                if (type == fe::SPIKE) {
+                    const bool first = !m.memories.count(a); m.observe(a); Candidate c;
+                    if (spike_action(m.game, a, c, first)) m.act(a, c);
+                    gs.pos++; continue;
+                }
+                const int p = policy_of_type(type);
+                if (p < 0) { gs.pos++; continue; }
+                m.observe(a);                            // memory updates every turn, as deployed
+                m.encode_only(a, pd.obs);                // first: the conveyor planner mask reads it
+                plan4_from_obs(pd.obs.data(), pd.plan4);
+                pd.own_l = m.memories.at(a).own_count(fe::LAUNCHER);
+                targets_from_memory(m.memories.at(a), pd.tg);
+                if (!has_choice(m.game, a, pd.plan4, pd.own_l, &pd.tg)) { gs.pos++; continue; }
+                pd.a = a; pd.p = p;
+                std::vector<int16_t> raw(pd.obs.begin(), pd.obs.end());
+                pd.q.resize(raw.size()); quantize_actor(raw.data(), pd.q.data());
+                return true;
+            }
+            m.game.end_round(); gs.in_round = false; gs.rounds++;
+        }
+    };
+    // one batched forward per policy over the waiting games: teacher (raw) and student (quantized)
+    auto forward_batch = [&](const std::vector<int>& idx, std::vector<Pend>& pend,
+                             std::vector<std::vector<float>>* TL, std::vector<std::vector<float>>* SL) {
+        torch::NoGradGuard ng;
+        for (int p = 0; p < NUM_POLICIES; p++) {
+            std::vector<int> sub;
+            for (int g : idx) if (pend[g].p == p) sub.push_back(g);
+            if (sub.empty()) continue;
+            const long D = long(pend[sub[0]].obs.size()), n = long(sub.size());
+            std::vector<float> rb(n * D), qb(n * D);
+            #pragma omp parallel for
+            for (long b = 0; b < n; b++) {
+                std::copy(pend[sub[b]].obs.begin(), pend[sub[b]].obs.end(), rb.begin() + b * D);
+                std::copy(pend[sub[b]].q.begin(), pend[sub[b]].q.end(), qb.begin() + b * D);
+            }
+            auto rt = torch::from_blob(rb.data(), {n, D}, torch::kFloat32).to(g_dev);
+            auto qt = torch::from_blob(qb.data(), {n, D}, torch::kFloat32).to(g_dev);
+            auto tl = teacher->logits(p, rt).to(torch::kCPU).contiguous();
+            auto sl = (st->a(p)->forward(qt) / double(1 << ST_LOGIT_SHIFT)).to(torch::kCPU).contiguous();
+            const long nl = tl.size(1);
+            for (long b = 0; b < n; b++) {
+                (*TL)[sub[b]].assign(tl.data_ptr<float>() + b * nl, tl.data_ptr<float>() + (b + 1) * nl);
+                (*SL)[sub[b]].assign(sl.data_ptr<float>() + b * nl, sl.data_ptr<float>() + (b + 1) * nl);
+            }
+        }
+    };
+
     for (int it = 1; it <= iters; it++) {
         read_entropy_file(KNOB_PATH, K);
         for (auto& m : games) m.game.max_turns = K.game_rounds;
@@ -148,60 +214,65 @@ int main(int argc, char** argv) {
         std::vector<Sample> data;
         long agree = 0, compared = 0;
         st->eval();
-        for (int gi = 0; gi < G; gi++) {
-            Match& m = games[gi];
-            for (int r = 0; r < R && !m.game.over; r++) {
-                for (int a : m.acting_units()) {
-                    if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) continue;
-                    int type = m.game.ents[a].type;
-                    if (type == fe::SPIKE) { const bool first = !m.memories.count(a); m.observe(a); Candidate c; if (spike_action(m.game, a, c, first)) m.act(a, c); continue; }
-                    int p = policy_of_type(type);
-                    if (p < 0) continue;
-                    m.observe(a);                            // memory updates every turn, as deployed
-                    std::vector<float> obs; m.encode_only(a, obs);   // first: the conveyor planner mask reads it
-                    int8_t plan4[4]; plan4_from_obs(obs.data(), plan4);
-                    const int own_l = m.memories.at(a).own_count(fe::LAUNCHER);
-                    Targets tg; targets_from_memory(m.memories.at(a), tg);
-                    if (!has_choice(m.game, a, plan4, own_l, &tg)) continue;
-                    Sample s; s.policy = p; s.raw.assign(obs.begin(), obs.end());
-                    s.q.resize(s.raw.size()); quantize_actor(s.raw.data(), s.q.data());
-                    torch::Tensor tl, sl;
-                    {
-                        torch::NoGradGuard ng;
-                        tl = teacher->logits(p, raw_tensor(s.raw)).squeeze(0).to(torch::kCPU).contiguous();
-                        sl = (st->a(p)->forward(q_tensor(s.q)) / double(1 << ST_LOGIT_SHIFT)).squeeze(0).to(torch::kCPU).contiguous();
-                    }
+        {
+            // ---- lockstep rollout (as neural_train): every game advances to its next deciding
+            // unit in parallel (OpenMP), then ONE batched forward per policy for teacher and
+            // student over all waiting games (on the device), then the games act in parallel.
+            std::vector<GameStep> gs(G);
+            std::vector<Pend> pend(G);
+            std::vector<std::vector<Sample>> gdata(G);
+            std::vector<long> gagree(G, 0), gcomp(G, 0);
+            std::vector<char> need(G, 0);
+            for (;;) {
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (int gi = 0; gi < G; gi++) need[gi] = gs[gi].active && advance(games[gi], gs[gi], pend[gi], R);
+                std::vector<int> idx;
+                for (int gi = 0; gi < G; gi++) { if (need[gi]) idx.push_back(gi); else gs[gi].active = false; }
+                if (idx.empty()) break;
+                std::vector<std::vector<float>> TL(G), SL(G);
+                forward_batch(idx, pend, &TL, &SL);
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (size_t k = 0; k < idx.size(); k++) {
+                    const int gi = idx[k];
+                    Match& m = games[gi];
+                    Pend& pd = pend[gi];
+                    const float* tl = TL[gi].data();
+                    const float* sl = SL[gi].data();
+                    Sample smp; smp.policy = pd.p; smp.raw.assign(pd.obs.begin(), pd.obs.end()); smp.q = pd.q;
                     // agreement: greedy decode with each model on this exact state
-                    Decision dt = decide(m.game, a, tl.data_ptr<float>(), greedy(), plan4, own_l, &tg);
-                    Decision ds = decide(m.game, a, sl.data_ptr<float>(), greedy(), plan4, own_l, &tg);
-                    compared++;
+                    Decision dt = decide(m.game, pd.a, tl, greedy(), pd.plan4, pd.own_l, &pd.tg);
+                    Decision ds = decide(m.game, pd.a, sl, greedy(), pd.plan4, pd.own_l, &pd.tg);
+                    gcomp[gi]++;
                     bool same = dt.actions.size() == ds.actions.size();
-                    for (size_t k = 0; same && k < dt.actions.size(); k++) {
-                        auto &x = dt.actions[k], &y = ds.actions[k];
+                    for (size_t j = 0; same && j < dt.actions.size(); j++) {
+                        auto &x = dt.actions[j], &y = ds.actions[j];
                         same = x.kind == y.kind && x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d;
                     }
-                    agree += same;
-                    // act with a sampled decision of the playing model
-                    const float* L = teacher_plays ? tl.data_ptr<float>() : sl.data_ptr<float>();
+                    gagree[gi] += same;
+                    // act with a sampled decision of the playing model, at this game's temperature
+                    const float* L = teacher_plays ? tl : sl;
                     std::mt19937& rng = grng[gi];
                     const double T = std::max(1e-3, double(gtemp[gi]));
-                    Decision d = decide(m.game, a, L, [&](int, const float* l, const std::vector<uint8_t>& mk, float& lp) {
+                    Decision d = decide(m.game, pd.a, L, [&](int, const float* l, const std::vector<uint8_t>& mk, float& lp) {
                         double mx = -1e30; for (size_t i = 0; i < mk.size(); i++) if (mk[i]) mx = std::max(mx, double(l[i]));
                         std::vector<double> w(mk.size(), 0.0); double z = 0;
                         for (size_t i = 0; i < mk.size(); i++) if (mk[i]) { w[i] = std::exp((double(l[i]) - mx) / T); z += w[i]; }
                         double u = std::uniform_real_distribution<double>(0, z)(rng), c = 0; int pick = -1;
                         for (size_t i = 0; i < mk.size(); i++) if (mk[i]) { pick = int(i); c += w[i]; if (u <= c) break; }
                         lp = 0; return pick;
-                    }, plan4, own_l, &tg);
-                    for (auto& hr : d.records) s.heads.push_back({hr.head, hr.mask});
-                    // the teacher's own decode visits heads too: label those as well
-                    for (auto& hr : dt.records) s.heads.push_back({hr.head, hr.mask});
-                    for (auto& c : d.actions) m.act(a, c);
-                    data.push_back(std::move(s));
+                    }, pd.plan4, pd.own_l, &pd.tg);
+                    for (auto& hr : d.records) smp.heads.push_back({hr.head, hr.mask});
+                    for (auto& hr : dt.records) smp.heads.push_back({hr.head, hr.mask});   // the teacher's heads too
+                    for (auto& c : d.actions) m.act(pd.a, c);
+                    gdata[gi].push_back(std::move(smp));
+                    gs[gi].pos++;
                 }
-                m.game.end_round();
             }
-            if (m.game.over) new_game(gi, 0);
+            for (int gi = 0; gi < G; gi++) {
+                agree += gagree[gi]; compared += gcomp[gi];
+                for (auto& x : gdata[gi]) data.push_back(std::move(x));
+                if (games[gi].game.over) new_game(gi, 0);
+            }
         }
         // one-time shift calibration on the first batch
         if (it == 1 && !resumed) {
@@ -270,46 +341,40 @@ int main(int argc, char** argv) {
             torch::NoGradGuard ng;
             int sw = 0, tw = 0; long sti = 0, tti = 0;
             std::mt19937 er(0xE7A1u + unsigned(it));
-            std::vector<uint32_t> s1(EG), s2(EG);
-            for (int e = 0; e < EG; e++) { s1[e] = er(); s2[e] = er(); }
-            const int torch_threads = torch::get_num_threads();
-            torch::set_num_threads(1);                 // one game per OpenMP thread
-            #pragma omp parallel for schedule(dynamic, 1) reduction(+ : sw, tw, sti, tti)
+            std::vector<Match> ev(EG);
+            for (int e = 0; e < EG; e++) {
+                const uint32_t s1 = er(), s2 = er();
+                ev[e].load(maps[(e / 2) % maps.size()], s1); ev[e].reset();
+                ev[e].game.max_turns = K.game_rounds; ev[e].game.limit_ore(K.ore_radius, s2);
+            }
+            // lockstep, batched forwards (as the rollout); student plays team e & 1, greedy
+            std::vector<GameStep> gs(EG);
+            std::vector<Pend> pend(EG);
+            std::vector<char> need(EG, 0);
+            for (;;) {
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (int e = 0; e < EG; e++) need[e] = gs[e].active && advance(ev[e], gs[e], pend[e], 1 << 30);
+                std::vector<int> idx;
+                for (int e = 0; e < EG; e++) { if (need[e]) idx.push_back(e); else gs[e].active = false; }
+                if (idx.empty()) break;
+                std::vector<std::vector<float>> TL(EG), SL(EG);
+                forward_batch(idx, pend, &TL, &SL);
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (size_t k = 0; k < idx.size(); k++) {
+                    const int e = idx[k];
+                    Pend& pd = pend[e];
+                    const bool stu = ev[e].game.ents[pd.a].team == (e & 1);
+                    Decision d = decide(ev[e].game, pd.a, stu ? SL[e].data() : TL[e].data(), greedy(), pd.plan4, pd.own_l, &pd.tg);
+                    for (auto& c : d.actions) ev[e].act(pd.a, c);
+                    gs[e].pos++;
+                }
+            }
             for (int e = 0; e < EG; e++) {
                 const int st_team = e & 1;
-                Match m; m.load(maps[(e / 2) % maps.size()], s1[e]); m.reset();
-                m.game.max_turns = K.game_rounds; m.game.limit_ore(K.ore_radius, s2[e]);
-                while (!m.game.over) {
-                    for (int a : m.acting_units()) {
-                        if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) continue;
-                        const int type = m.game.ents[a].type;
-                        if (type == fe::SPIKE) { const bool first = !m.memories.count(a); m.observe(a); Candidate c; if (spike_action(m.game, a, c, first)) m.act(a, c); continue; }
-                        const int p = policy_of_type(type);
-                        if (p < 0) continue;
-                        m.observe(a);
-                        std::vector<float> obs; m.encode_only(a, obs);
-                        int8_t plan4[4]; plan4_from_obs(obs.data(), plan4);
-                        const int own_l = m.memories.at(a).own_count(fe::LAUNCHER);
-                        Targets tg; targets_from_memory(m.memories.at(a), tg);
-                        if (!has_choice(m.game, a, plan4, own_l, &tg)) continue;
-                        torch::Tensor L;
-                        if (m.game.ents[a].team == st_team) {
-                            std::vector<int16_t> raw(obs.begin(), obs.end()); std::vector<int32_t> q(raw.size());
-                            quantize_actor(raw.data(), q.data());
-                            L = (st->a(p)->forward(q_tensor(q)) / double(1 << ST_LOGIT_SHIFT)).squeeze(0).to(torch::kCPU).contiguous();
-                        } else {
-                            std::vector<int16_t> raw(obs.begin(), obs.end());
-                            L = teacher->logits(p, raw_tensor(raw)).squeeze(0).to(torch::kCPU).contiguous();
-                        }
-                        Decision d = decide(m.game, a, L.data_ptr<float>(), greedy(), plan4, own_l, &tg);
-                        for (auto& c : d.actions) m.act(a, c);
-                    }
-                    m.game.end_round();
-                }
-                if (m.game.winner == st_team) sw++; else if (m.game.winner >= 0) tw++;
-                sti += m.game.teams[st_team].ti_collected; tti += m.game.teams[1 - st_team].ti_collected;
+                const fe::Game& gm = ev[e].game;
+                if (gm.winner == st_team) sw++; else if (gm.winner >= 0) tw++;
+                sti += gm.teams[st_team].ti_collected; tti += gm.teams[1 - st_team].ti_collected;
             }
-            torch::set_num_threads(torch_threads);
             std::cout << "eval " << it << ": student vs teacher (greedy, " << EG << " games, " << K.game_rounds << " rounds): student wins "
                       << sw << ", teacher wins " << tw << ", mean Ti collected student " << sti / std::max(1, EG)
                       << " teacher " << tti / std::max(1, EG) << std::endl;
