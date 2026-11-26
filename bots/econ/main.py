@@ -51,7 +51,24 @@ except Exception:
 OFFICIAL_ROUNDS, TRAINED_ROUNDS = 1000, 400
 ROUND_DIV = float(os.environ.get("FLORENT_ROUND_DIV", str(OFFICIAL_ROUNDS / TRAINED_ROUNDS)))   # 2.5
 ROUND_SCALAR = 9                     # actor scalar index of the current round (encoder)
-LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "4500"))   # int8 student forward: ~3.5 ms median, p95 ~5.1 ms
+LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "4500"))
+
+
+class _TeacherPolicy:
+    """Local testing only: the float teacher through a ctypes library (same logits() as StudentPolicy)."""
+    def __init__(self, lib_path, model_path):
+        import ctypes
+        self.ct = ctypes
+        self.L = ctypes.CDLL(lib_path)
+        self.L.teacher_logits.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
+        assert self.L.teacher_load(model_path.encode()) == 0
+
+    def logits(self, policy, raw):
+        c = self.ct
+        x = (c.c_float * len(raw))(*raw)
+        out = (c.c_float * 2048)()
+        n = self.L.teacher_logits(policy, x, out)
+        return list(out[:n])   # int8 student forward: ~3.5 ms median, p95 ~5.1 ms
 if os.environ.get("FLORENT_POLICY"):
     # A cyclic-GC pause can push a turn past the 10 ms limit; reference
     # counting still frees everything, cycles just wait.
@@ -184,6 +201,14 @@ class Player:
         # otherwise the heuristic bot below plays.
         self.student = None
         policy_path = os.environ.get("FLORENT_POLICY")
+        # local testing only: FLORENT_TEACHER=<model.pt> plays the float teacher through
+        # FLORENT_TEACHER_LIB (rl/tools/teacher_capi.cpp, libtorch) instead of the student
+        if HEADS is not None and os.environ.get("FLORENT_TEACHER"):
+            try:
+                self.student = _TeacherPolicy(os.environ["FLORENT_TEACHER_LIB"], os.environ["FLORENT_TEACHER"])
+                policy_path = None
+            except Exception as e:
+                print("FLORENT_TEACHER load failed:", repr(e), file=sys.stderr)
         if StudentPolicy is not None and HEADS is not None and policy_path:
             try:
                 self.student = StudentPolicy(policy_path)
