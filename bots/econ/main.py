@@ -276,14 +276,19 @@ class Player:
             self._setup(ct)
         # Learned inference (opt-in). Heuristic handlers remain the fallback for
         # an unavailable policy, an error, or a turn without enough CPU left.
+        # Learned inference. A turn the student does not play (error, CPU too short)
+        # is skipped: no heuristic fallback unless FLORENT_HEURISTIC=1.
+        heuristic = os.environ.get("FLORENT_HEURISTIC") == "1"
         if self.student is not None and not self.policy_disabled:
             try:
                 if self.learned_turn(ct):
                     return
             except Exception as e:
-                pass
-                print("LEARNED disabled after error:", repr(e), file=sys.stderr)
-                self.policy_disabled = True
+                print("LEARNED error, turn skipped:", repr(e), file=sys.stderr)
+                if heuristic:
+                    self.policy_disabled = True
+        if not heuristic:
+            return
         t = ct.get_entity_type()
         try:
             if t == EntityType.CORE:
