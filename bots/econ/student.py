@@ -12,7 +12,7 @@ import sys
 from array import array
 
 PATCH, HALF = 17, 8
-ACTOR_CH, SCALARS = 60, 50   # 60th channel: planned conveyor direction (copied as is, 1..8)
+ACTOR_CH, SCALARS = 61, 50   # 60th channel: planned conveyor direction (copied as is, 1..8); 61st: rounds since hit (0..10, as is)
 COSTS = 40
 BITS = 16
 # 4 residual blocks x 2 (1x1 -> depthwise 3x3) layers = 8 depthwise convs:
@@ -60,7 +60,7 @@ GEOS = [Geo(RADIUS - 2 * b) for b in range(LAYERS // 2)]
 G0 = GEOS[0]
 WIN, S = G0.win, G0.s
 # encoder channel layout (bots/econ/encoder.py)
-C_STALE, C_VISIT, C_ATTR_STALE, C_HP, C_RAY = 29, 30, 31, 42, 48
+C_STALE, C_VISIT, C_ATTR_STALE, C_HP, C_RAY, C_HIT = 29, 30, 31, 42, 48, 60
 
 
 def quantize(raw):

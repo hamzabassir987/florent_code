@@ -277,6 +277,9 @@ def run_game(L, map_path, seed, rounds, rng, stats):
                 stats["units"] += 1
                 if any(pch[E.C_PATH * E.PATCH * E.PATCH:(E.C_PATH + 1) * E.PATCH * E.PATCH]):
                     stats["path_encodings"] = stats.get("path_encodings", 0) + 1
+                hb = E.C_HIT * E.PATCH * E.PATCH
+                if any(0 < 1 + v < 1 + E.HIT_CAP for v in pch[hb:hb + E.PATCH * E.PATCH] if v < E.HIT_CAP):
+                    stats["hit_encodings"] = stats.get("hit_encodings", 0) + 1
                 if bad:
                     stats["bad"] += bad
                 if play_unit(L, g, a, typ, rng, W, H) is True:
@@ -546,6 +549,7 @@ def main():
     print(f"critic checks: {stats['critic_checks']}, failures: {stats['critic_bad']}")
     print(f"visit-history checks: {stats['visit_checks']}")
     print(f"encodings with a planned conveyor path: {stats.get('path_encodings', 0)}")
+    print(f"encodings showing a recent hit (C_HIT < {E.HIT_CAP}): {stats.get('hit_encodings', 0)}")
     print(f"team reports posted: {stats.get('reports', 0)} (with the spawn bit: {stats.get('spawn_bits', 0)})")
     print(f"unit turns with the map symmetry resolved: {stats.get('sym_known', 0)} of {stats['units']}")
     print(f"turret/core reach checks: {stats['turret_core_checks']}")

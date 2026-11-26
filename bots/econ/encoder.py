@@ -16,7 +16,9 @@ CH_TERRAIN, CH_OWN, CH_ENEMY, CH_OCC = 6, 11, 10, 2
 CH_STALE, CH_VISIT, CH_ATTR_STALE = 1, 1, 2
 CH_DIR, CH_HP, CH_THREAT, CH_RAY = 9, 2, 4, 11
 CH_PATH = 1   # builders only: planned conveyor cell, value = conveyor direction (Dir 1..8), 0 none
-ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH
+CH_HIT = 1    # rounds since a unit / building on the tile was seen losing HP, cap HIT_CAP (= never)
+HIT_CAP = 10
+ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH + CH_HIT
 ACTOR_SPATIAL = ACTOR_CH * PATCH * PATCH
 ACTOR_SCALARS = 50
 ACTOR_COSTS = 40   # 40..49: current prices (conveyor, splitter, harvester, barrier, gunner,
@@ -33,6 +35,7 @@ C_HP = C_DIR + CH_DIR
 C_THREAT = C_HP + CH_HP
 C_RAY = C_THREAT + CH_THREAT
 C_PATH = C_RAY + CH_RAY
+C_HIT = C_PATH + CH_PATH
 _NXY = ((0, -1), (1, 0), (0, 1), (-1, 0))   # N, E, S, W
 _NDIR = (1, 3, 5, 7)                        # engine Dir codes of N, E, S, W
 
@@ -102,6 +105,7 @@ class ObsMemory:
         self.seen_round = [-1] * n
         self.stood = [0] * n
         self.visit_round = [-1] * n
+        self.hit_round = [-1] * n
         self.attr_seen_round = [-1] * n
         self.bus_q = [[] for _ in range(5)]
         self.snap, self.snap_ore = set(), [0] * n
@@ -453,6 +457,7 @@ class ObsMemory:
         for x, y in ad.visible_tiles():
             t = y * W + x
             old_id, old_type, old_team = self.bld_id[t], self.bld_type[t], self.bld_team[t]
+            old_bhp, old_bot, old_uhp = self.bld_hp[t], self.bot_id[t], self.bot_hp[t]
             self.terrain[t] = ad.tile_terrain(x, y)
             b = ad.building_id(x, y)
             if b is None:
@@ -475,6 +480,10 @@ class ObsMemory:
                 self.bot_team[t] = ad.entity_team(u)
                 self.bot_hp[t] = ad.entity_hp_percent(u)
                 self.attr_seen_round[t] = r
+            # seen losing HP since the last look (same entity, lower HP percentage)
+            if ((self.bld_id[t] >= 0 and self.bld_id[t] == old_id and old_bhp >= 0 and self.bld_hp[t] < old_bhp) or
+                    (self.bot_id[t] >= 0 and self.bot_id[t] == old_bot and old_uhp >= 0 and self.bot_hp[t] < old_uhp)):
+                self.hit_round[t] = r
             self.seen_round[t] = r
             self.learn_terrain(t)
             if self.bot_id[t] >= 0 and self.bot_team[t] != team and u is not None:
@@ -612,6 +621,8 @@ class ObsMemory:
                 ch[C_STALE * cs + cell] = 255 if sr < 0 else min(255, rnd - sr)
                 vr = self.visit_round[t]
                 ch[C_VISIT * cs + cell] = 255 if vr < 0 else min(255, rnd - vr)
+                hr = self.hit_round[t]
+                ch[C_HIT * cs + cell] = HIT_CAP if hr < 0 else min(HIT_CAP, rnd - hr)
                 if b >= 0:
                     d = self.bld_dir[t]
                     if 0 <= d < CH_DIR:

@@ -96,3 +96,13 @@ Maps larger than 48 in either dimension would be clipped; existing maps fit. No 
 ## Verification status
 
 On generated and pit-map simulations, the parity harness compares all actor channels/scalars from C++ and Python, checks out-of-vision perturbations, and checks critic determinism/change. Latest extended run: 8 generated/pit-map games × 250 rounds, **25,809 unit encodings**, **0 mismatches**, **0 leaks**, 8 visit-history checks, 8 critic checks, and a deterministic sentinel-to-core coverage case passed; Python encoding median 0.51 ms, p95 0.76 ms/unit. The official `fcode run --tle 10` check still requires the fcode runtime, which is not installed in this environment.
+
+## Hit channel (channel 60, `C_HIT`)
+
+Per tile: rounds since this unit saw the building or builder on it lose HP
+(same entity id, lower HP percentage than at its previous look), capped at
+`HIT_CAP` = 10; 10 also means "never seen hit". From the unit's own memory,
+identical in `bots/econ/encoder.py`. Lets the network infer recent fire, e.g.
+an enemy spike that just shot (4-round cooldown). Old 60-channel checkpoints:
+`widen_input OLD.pt NEW.pt` (rl/tools/widen_input.cpp) copies every weight and
+gives the new channel zero weights, so the converted net decides as before.

@@ -42,7 +42,9 @@ constexpr int CH_HP = 2;             // remembered building / builder HP percent
 constexpr int CH_THREAT = 4;         // own/enemy remembered turret reach: possible / confirmed
 constexpr int CH_RAY = 11;           // ray aggregates, written on boundary cells only
 constexpr int CH_PATH = 1;           // builders only: planned conveyor cell, value = conveyor direction (Dir 1..8), 0 none
-constexpr int ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH;  // 60
+constexpr int CH_HIT = 1;            // rounds since a unit / building on the tile was seen losing HP, cap HIT_CAP (= never)
+constexpr int HIT_CAP = 10;
+constexpr int ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH + CH_HIT;  // 61
 constexpr int ACTOR_SPATIAL = ACTOR_CH * PATCH * PATCH;
 // 40 base scalars, then the team's current price of each buildable type
 // (controller get_*_cost(), in ACTOR_COST_TYPES order)
@@ -61,6 +63,7 @@ constexpr int C_HP = C_DIR + CH_DIR;
 constexpr int C_THREAT = C_HP + CH_HP;
 constexpr int C_RAY = C_THREAT + CH_THREAT;
 constexpr int C_PATH = C_RAY + CH_RAY;
+constexpr int C_HIT = C_PATH + CH_PATH;
 constexpr int LINE_CAP = 4;          // conveyor planner: harvesters per line into the core
 
 // report-bus parameters (experiments: rl/tests/bus_stats.cpp); defaults = deployed
@@ -101,6 +104,7 @@ struct ObsMemory {
     std::vector<int8_t> bot_dir;
     std::vector<int16_t> bot_hp;
     std::vector<int32_t> attr_seen_round; // last round entity attributes were observed
+    std::vector<int32_t> hit_round;     // last round the building / builder on the tile was seen losing HP, -1 never
 
     // ---- team report bus (the 16-slot team store; docs/team-memory.md).
     // Each turn a unit: merge_store (apply the snapshot), update (own vision;

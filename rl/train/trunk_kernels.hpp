@@ -2,7 +2,7 @@
 #pragma once
 #include <cstdint>
 
-#define TRUNK_IN_CH 60          // fe::ACTOR_CH
+#define TRUNK_IN_CH 61          // fe::ACTOR_CH
 // flat parameter vector length (layout in trunk_kernels.cu): the stem
 // (TRUNK_IN_CH x 32 weights + 32 biases), then 4 blocks of 4800
 #define TRUNK_FLAT (TRUNK_IN_CH * 32 + 32 + 4 * 4800)

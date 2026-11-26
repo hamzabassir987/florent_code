@@ -20,6 +20,7 @@ void ObsMemory::init(const Game& g, int team_) {
     seen_round.assign(n, -1);
     stood.assign(n, 0);
     visit_round.assign(n, -1);
+    hit_round.assign(n, -1);
     bld_dir.assign(n, -1);
     bld_hp.assign(n, -1);
     bot_dir.assign(n, -1);
@@ -252,6 +253,7 @@ void ObsMemory::update(const Game& g, int actor) {
     for (int t : tiles) {
         int x = t % g.W, y = t / g.W;
         const int old_id = bld_id[t], old_type = bld_type[t], old_team = bld_team[t];
+        const int old_bhp = bld_hp[t], old_bot = bot_id[t], old_uhp = bot_hp[t];
         uint8_t e = g.env[t];
         terrain[t] = e == WALL ? T_WALL
                    : e == ORE_TI ? T_ORE_TI
@@ -291,6 +293,9 @@ void ObsMemory::update(const Game& g, int actor) {
             bot_dir[t] = -1;
             bot_hp[t] = -1;
         }
+        // seen losing HP since the last look (same entity, lower HP percentage)
+        if ((bld_id[t] >= 0 && bld_id[t] == old_id && old_bhp >= 0 && bld_hp[t] < old_bhp) ||
+            (bot_id[t] >= 0 && bot_id[t] == old_bot && old_uhp >= 0 && bot_hp[t] < old_uhp)) hit_round[t] = g.round;
         seen_round[t] = g.round;
         learn_terrain(t);
         if (bld_id[t] >= 0 && bld_team[t] != team) enemy_near = true;
@@ -588,6 +593,7 @@ void encode_actor(const Game& g, const ObsMemory& m, int actor,
             ch[(size_t)C_STALE * cs + cell] = st;
             int visit = m.visit_round[t] < 0 ? 255 : std::min(255, g.round - m.visit_round[t]);
             ch[(size_t)C_VISIT * cs + cell] = visit;
+            ch[(size_t)C_HIT * cs + cell] = m.hit_round[t] < 0 ? HIT_CAP : std::min(HIT_CAP, g.round - m.hit_round[t]);
             if (m.bld_id[t] >= 0) {
                 int dir = m.bld_dir[t];
                 if (dir >= 0 && dir < CH_DIR) ch[(size_t)(C_DIR + dir) * cs + cell] = 1;

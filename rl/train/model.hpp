@@ -39,6 +39,7 @@ inline torch::Tensor actor_channel_scale() {
     s[fe::C_HP] = s[fe::C_HP + 1] = 1.f / 100.f;
     for (int k = 0; k < fe::CH_RAY; k++) s[fe::C_RAY + k] = 1.f / 32.f;
     s[fe::C_PATH] = 1.f / 8.f;                           // planned conveyor direction (Dir 1..8)
+    s[fe::C_HIT] = 1.f / fe::HIT_CAP;                    // rounds since seen losing HP (cap 10)
     return torch::tensor(s).view({1, fe::ACTOR_CH, 1, 1});
 }
 inline torch::Tensor actor_scalar_scale() {

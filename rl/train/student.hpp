@@ -32,6 +32,7 @@ inline void quantize_actor(const int16_t* raw, int32_t* q) {
             int v = raw[c * P2 + i], o;
             if (c == C_STALE || c == C_VISIT || c == C_ATTR_STALE || c == C_ATTR_STALE + 1) o = v >> 4;
             else if (c == C_HP || c == C_HP + 1) o = v * 15 / 100;
+            else if (c == C_HIT) o = v;                                // 0..10
             else if (c >= C_RAY) o = (c - C_RAY) <= 1 ? (v + 1) >> 1 : v;
             else o = v ? 15 : 0;
             q[c * P2 + i] = o < 0 ? 0 : (o > 15 ? 15 : o);
