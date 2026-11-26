@@ -212,7 +212,7 @@ static void start_game(Slot& s, const Setup& S) {
     const bool gen = !s.real_maps_only && S.K->map_gen > 0.f && std::uniform_real_distribution<float>(0.f, 1.f)(s.rng) < S.K->map_gen;
     if (gen) {
         // a generated map (rl/sim/map_gen.hpp): core distance and pits under the entropy file's control
-        MapGenParams P; P.core_gap = S.K->core_distance; P.pit_share = S.K->pit_share;
+        MapGenParams P; P.core_gap = S.K->core_distance; P.core_gap_min = S.K->core_distance_min; P.pit_share = S.K->pit_share;
         MapGenInfo info;
         const std::string bytes = generate_map(P, s.rng, &info);
         s.map_path = "(generated)";
@@ -225,12 +225,14 @@ static void start_game(Slot& s, const Setup& S) {
         if (!s.m.load(s.map_path, s.seed)) { std::cerr << "bad map " << s.map_path << "\n"; std::exit(3); }
         s.kind = fs::path(s.map_path).stem().string();
     }
-    if (S.K->ore_radius >= 0) s.kind += "_ore" + std::to_string(S.K->ore_radius);
+    const uint64_t ore_seed = s.rng();
+    const int ore_r = pick_ore_radius(*S.K, ore_seed);
+    if (ore_r >= 0) s.kind += "_ore" + std::to_string(ore_r);
     s.m.reset();
     s.m.game.round = s.start_round;
     s.start_round = 0;              // staggered once (the games of iteration 0); every restart starts at round 0
     s.m.game.max_turns = S.K->game_rounds;
-    s.m.game.limit_ore(S.K->ore_radius, s.rng());
+    s.m.game.limit_ore(ore_r, ore_seed);
     s.started = true; s.in_round = false; s.done = false;
     s.segs.push_back(Segment());
 }

@@ -180,7 +180,7 @@ int main(int argc, char** argv) {
         games[i] = Match();
         // a generated map with probability map_gen (entropy file: map_gen, core_distance, pit_share), as neural_train
         if (K.map_gen > 0.f && std::uniform_real_distribution<float>(0.f, 1.f)(master) < K.map_gen) {
-            MapGenParams P; P.core_gap = K.core_distance; P.pit_share = K.pit_share;
+            MapGenParams P; P.core_gap = K.core_distance; P.core_gap_min = K.core_distance_min; P.pit_share = K.pit_share;
             std::mt19937_64 mr(master());
             const std::string bytes = generate_map(P, mr, nullptr);
             if (!games[i].load_bytes(bytes, master())) { std::cerr << "generated map failed to load\n"; std::exit(3); }
@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
         games[i].reset();
         games[i].game.round = start_round;      // staggered first games (as neural_train): every game phase from iteration 1
         games[i].game.max_turns = K.game_rounds;
-        games[i].game.limit_ore(K.ore_radius, master());
+        { const uint64_t os = master(); games[i].game.limit_ore(pick_ore_radius(K, os), os); }
         grng[i].seed(master());
         gtemp[i] = std::uniform_real_distribution<float>(TMIN, std::max(TMIN, TMAX))(grng[i]);
     };
@@ -446,7 +446,7 @@ int main(int argc, char** argv) {
             for (int e = 0; e < EG; e++) {
                 const uint32_t s1 = er(), s2 = er();
                 ev[e].load(maps[(e / 2) % maps.size()], s1); ev[e].reset();
-                ev[e].game.max_turns = K.game_rounds; ev[e].game.limit_ore(K.ore_radius, s2);
+                ev[e].game.max_turns = K.game_rounds; ev[e].game.limit_ore(pick_ore_radius(K, s2), s2);
             }
             // lockstep, batched forwards (as the rollout); student plays team e & 1, greedy
             std::vector<GameStep> gs(EG);

@@ -14,18 +14,22 @@ epochs 1
 # game_rounds: rounds a training game lasts (1-1000), then decided like round 1000.
 game_rounds 200
 
-# ore_radius: >= 0 moves all ore within this distance of each core (mirrored,
-# same Ti/Vo counts); -1 keeps the map's ore. Applies to games started afterwards.
+# ore_radius: >= 0 moves all ore to random tiles within this distance of each core
+# (mirrored, same Ti/Vo counts); -1 keeps the map's ore. Applies to games started afterwards.
+# ore_radius_min: each game draws its radius in ore_radius_min..ore_radius (-1: fixed ore_radius)
 ore_radius 4
+ore_radius_min -1
 
 # map generator (rl/sim/map_gen.hpp): random maps shaped like the real ones,
 # symmetric, with the core distance under control. Eval keeps the real maps.
 # map_gen: share of training games on generated maps (0: real maps only)
-# core_distance: MAX tiles between the two cores on generated maps: each map draws
-#   a random gap in 4..core_distance (capped at 24, the largest a map fits); -1: random 7..21;
+# core_distance / core_distance_min: each generated map draws its gap between the
+#   two cores in core_distance_min..core_distance (max capped at 24, the largest a map
+#   fits); core_distance -1: random 7..21;
 #   start small (~8) so fighting is learned early, then raise it
 # pit_share: share of generated maps with a pit (the cores face each other across it)
 map_gen 0
+core_distance_min 4
 core_distance -1
 pit_share 0.15
 

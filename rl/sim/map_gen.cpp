@@ -93,7 +93,7 @@ bool try_generate(const MapGenParams& P, std::mt19937_64& rng, Map& m) {
     // core_gap N >= 0: a random gap in 4..N per map (N capped at 24, the largest a
     // 30-tile map fits: 30 - 2 - (gap + 1) >= 2, parity); -1: random 7..21
     const int gmax = std::min(P.core_gap, 24);
-    int gap = P.core_gap >= 0 ? ri(rng, std::min(4, gmax), gmax) : ri(rng, 7, 21);
+    int gap = P.core_gap >= 0 ? ri(rng, std::clamp(P.core_gap_min, 0, gmax), gmax) : ri(rng, 7, 21);
     // size: as the real maps, grown if the requested gap needs it
     m.W = ri(rng, 16, 30); m.H = ri(rng, 17, 29);
     auto& span = (m.sym == 2) ? m.H : m.W;                      // the axis the cores are mirrored across

@@ -22,6 +22,7 @@
 namespace florent_rl {
 
 struct MapGenParams {
+    int core_gap_min = 4;        // min gap when core_gap >= 0
     int core_gap = -1;           // max Chebyshev tiles between the cores' footprints: random 4..core_gap (cap 24); -1 random 7..21
     float pit_share = 0.15f;     // share of maps with a pit
     float wall_lo = 0.01f, wall_hi = 0.13f;
