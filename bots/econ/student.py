@@ -158,8 +158,9 @@ def _bias(g, p, n, b):
 
 
 class StudentPolicy:
-    def __init__(self, path):
-        data = json.loads(open(path).read())
+    def __init__(self, path=None, text=None):
+        """From a student.json path, or from its text (the submission embeds it: student_weights.py)."""
+        data = json.loads(text if text is not None else open(path).read())
         assert data["format"] == "florent-student-v2", "student.json from an older (int4) distill"
         self.logit_shift = data["logit_shift"]
         self.hidden = data["hidden"]

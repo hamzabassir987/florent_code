@@ -215,6 +215,17 @@ class Player:
             except Exception as e:
                 import sys
                 print("FLORENT_POLICY load failed:", repr(e), file=sys.stderr)
+        # submission: the student's weights embedded as a module (rl/tools/make_submission.py);
+        # used when no FLORENT_POLICY / FLORENT_TEACHER is set
+        if self.student is None and StudentPolicy is not None and HEADS is not None and not policy_path \
+                and not os.environ.get("FLORENT_TEACHER"):
+            try:
+                from student_weights import STUDENT_JSON
+                self.student = StudentPolicy(text=STUDENT_JSON)
+            except ImportError:
+                pass
+            except Exception as e:
+                print("embedded student load failed:", repr(e), file=sys.stderr)
         self.policy_disabled = False
         self.learned_turns = 0
         self.fallback_turns = 0
