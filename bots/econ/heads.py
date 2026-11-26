@@ -260,7 +260,7 @@ def _launcher_opts(api):
             ok.append(row)
             botm.append(int(any(row)))
     # pit launcher: on the edge of a pit 1-2 wide it only throws our own builder
-    # across the pit, to the nearest legal tile there (as launcher_opts in C++)
+    # (the first one next to it) across the pit, to any legal tile there (as launcher_opts in C++)
     pit = _safe(lambda: ct.get_pit())
     if pit and 1 <= pit[2] <= 2:
         axis, at, w = pit
@@ -270,21 +270,16 @@ def _launcher_opts(api):
             me = ct.get_team()
             taken = False
             for b, (bx, by) in enumerate(bots):
-                best, bd = -1, 1 << 30
                 u = _safe(lambda: ct.get_tile_builder_bot_id(api.P(bx, by))) if api.inb(bx, by) else None
-                if not taken and u is not None and ct.get_team(u) == me:
-                    for k, (tx, ty) in enumerate(dests):
-                        if not ok[b][k]:
-                            continue
-                        tc = tx if axis == "x" else ty
-                        if (tc < at + w) if west else (tc >= at):
-                            continue
-                        d2 = (tx - p.x) ** 2 + (ty - p.y) ** 2
-                        if d2 < bd:
-                            best, bd = k, d2
-                ok[b] = [int(k == best) for k in range(120)]
-                botm[b] = int(best >= 0)
-                if best >= 0:
+                mine = not taken and u is not None and ct.get_team(u) == me
+                row = []
+                for k, (tx, ty) in enumerate(dests):
+                    tc = tx if axis == "x" else ty
+                    across = (tc >= at + w) if west else (tc < at)
+                    row.append(int(mine and across and ok[b][k]))
+                ok[b] = row
+                botm[b] = int(any(row))
+                if any(row):
                     taken = True
     return botm, ok, bots, dests
 

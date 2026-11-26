@@ -19,7 +19,7 @@ both make the same decisions.
 | builder build: gunner | only facing a line (3 / 2) whose first known enemy building comes before any wall | a gunner is blocked and only rotates for 10 Ti |
 | core convert | **always convert all Voltium** (100%) when legal; a single option, not recorded | Voltium has no other use: no price, no tie-break. Ammo is ready as soon as a gunner / sentinel exists |
 | builder: launcher at a pit (scripted) | on a map whose pit is 1-2 wide, a builder next to a free tile on the pit's edge builds a launcher there when the team knows no own launcher; nothing recorded | a thrown builder crosses a pit of width <= 2 alive (checked in the official engine) |
-| pit launcher | a launcher on the edge of a pit 1-2 wide only throws our own builder (first in neighbour order) across the pit to the nearest legal tile there: builder and destination have one option each, so the network only decides launch or wait | |
+| pit launcher | a launcher on the edge of a pit 1-2 wide only throws our own builder (first in neighbour order) across the pit to any legal tile there: the network decides launch or wait and where to land (a fixed landing tile was mined by the enemy) | |
 | heal | engine rule only (own units / buildings that lost HP) | with no friendly fire, heals only repair enemy damage |
 | barriers, mines | **no restriction** (keep normal) | walls around the base and mines are good play |
 | spike (scripted, no network) | fires at the first adjacent visible enemy; **on its first turn it fires once anyway** | a spike shot hits every enemy building around it, hidden enemy mines included (5 HP vs 12 damage), so a spike can be placed to clear mines; otherwise the 4-round cooldown is kept for real targets |
