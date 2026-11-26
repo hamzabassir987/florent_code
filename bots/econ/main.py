@@ -32,16 +32,28 @@ import os
 import sys
 
 from fcode import Controller, Direction, EntityType, Environment, Position, Team
+
+# The sibling modules (encoder, heads, student, student_weights) must import however
+# the runner loads this file: put this file's own folder on the import path first.
+try:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+except NameError:                     # no __file__: rely on the runner's path
+    _HERE = None
+IMPORT_ERRORS = []
 try:
     from encoder import ActorEncoder
-except Exception:
+except Exception as _e:
     ActorEncoder = None
+    IMPORT_ERRORS.append("encoder: " + repr(_e))
 try:
     import heads as HEADS
     from student import StudentPolicy
-except Exception:
+except Exception as _e:
     HEADS = None
     StudentPolicy = None
+    IMPORT_ERRORS.append("heads/student: " + repr(_e))
 
 # Learned turns start the network only while this much CPU of the turn is left
 # unused (the SWAR forward takes ~4-5 ms of the 10 ms budget).
@@ -52,6 +64,7 @@ OFFICIAL_ROUNDS, TRAINED_ROUNDS = 1000, 400
 ROUND_DIV = float(os.environ.get("FLORENT_ROUND_DIV", str(OFFICIAL_ROUNDS / TRAINED_ROUNDS)))   # 2.5
 ROUND_SCALAR = 9                     # actor scalar index of the current round (encoder)
 LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "4500"))
+_STATUS_SHOWN = False
 
 
 class _TeacherPolicy:
@@ -213,7 +226,7 @@ class Player:
             try:
                 self.student = StudentPolicy(policy_path)
             except Exception as e:
-                import sys
+                pass
                 print("FLORENT_POLICY load failed:", repr(e), file=sys.stderr)
         # submission: the student's weights embedded as a module (rl/tools/make_submission.py);
         # used when no FLORENT_POLICY / FLORENT_TEACHER is set
@@ -222,10 +235,18 @@ class Player:
             try:
                 from student_weights import STUDENT_JSON
                 self.student = StudentPolicy(text=STUDENT_JSON)
-            except ImportError:
-                pass
+            except ImportError as e:
+                IMPORT_ERRORS.append("student_weights: " + repr(e))
             except Exception as e:
-                print("embedded student load failed:", repr(e), file=sys.stderr)
+                IMPORT_ERRORS.append("embedded student: " + repr(e))
+        # say once per process which brain plays (visible in the bot output / logs)
+        global _STATUS_SHOWN
+        if not _STATUS_SHOWN:
+            _STATUS_SHOWN = True
+            if self.student is not None:
+                print("[florent] learned policy loaded:", type(self.student).__name__, file=sys.stderr)
+            else:
+                print("[florent] NO learned policy, heuristic plays; import errors:", IMPORT_ERRORS or "none", file=sys.stderr)
         self.policy_disabled = False
         self.learned_turns = 0
         self.fallback_turns = 0
@@ -256,7 +277,7 @@ class Player:
                 if self.learned_turn(ct):
                     return
             except Exception as e:
-                import sys
+                pass
                 print("LEARNED disabled after error:", repr(e), file=sys.stderr)
                 self.policy_disabled = True
         t = ct.get_entity_type()
@@ -272,7 +293,7 @@ class Player:
             elif t == EntityType.SPIKE:
                 self.spike_turn(ct)
         except Exception as e:  # never let a unit die from a bug
-            import sys
+            pass
 
             import traceback
 
