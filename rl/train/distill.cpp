@@ -4,6 +4,7 @@
 //   env: GAMES (4) ROUNDS (40) EPOCHS (2) LR (3e-3) VECTORS (vector dump path)
 //        DEVICE (cuda if available | cpu): teacher, student and the KL fit run there
 //        TEMP_MIN / TEMP_MAX (0.5 / 1.5): each game samples with its own temperature
+//        HEAD_W_MAX (50): cap of the per-head loss weight (heads weigh equally)
 //        EVAL_EVERY (40: every N iterations the student plays EVAL_GAMES greedy
 //        games against the teacher, sides alternating; 0: off) EVAL_GAMES (100)
 //
@@ -320,6 +321,18 @@ int main(int argc, char** argv) {
         // ---- KL distillation per head record
         st->train();
         double kl_sum = 0; long kl_n = 0;
+        // per-head weights: every head counts equally in the loss however rare it is (a build
+        // type is ~0.1% of the records but decides the economy); weight = total / (heads * count),
+        // capped at HEAD_W_MAX (default 50) so a head with a handful of records cannot dominate
+        std::vector<double> hw(NUM_HEAD_IDS, 0.0);
+        {
+            std::vector<long> cnt(NUM_HEAD_IDS, 0); long tot = 0; int present = 0;
+            for (auto& smp : data) for (auto& hm : smp.heads) { cnt[hm.first]++; tot++; }
+            for (int h = 0; h < NUM_HEAD_IDS; h++) present += cnt[h] > 0;
+            const double cap = env_float("HEAD_W_MAX", 50.f);
+            for (int h = 0; h < NUM_HEAD_IDS; h++)
+                if (cnt[h]) hw[h] = std::min(cap, double(tot) / (double(present) * double(cnt[h])));
+        }
         std::vector<torch::Tensor> hkl(NUM_HEAD_IDS);                      // per-head KL sums (device, no sync per step)
         std::vector<long> hkn(NUM_HEAD_IDS, 0);
         std::vector<int> order(data.size());
@@ -328,7 +341,7 @@ int main(int argc, char** argv) {
             std::shuffle(order.begin(), order.end(), master);
             for (size_t s0 = 0; s0 < order.size(); s0 += MB) {
                 size_t s1 = std::min(order.size(), s0 + MB);
-                torch::Tensor loss = torch::zeros({}, g_dev); long nrec = 0;
+                torch::Tensor loss = torch::zeros({}, g_dev), klu = torch::zeros({}, g_dev); long nrec = 0;
                 for (int p = 0; p < NUM_POLICIES; p++) {
                     std::vector<int> idx;
                     for (size_t k = s0; k < s1; k++) if (data[order[k]].policy == p) idx.push_back(order[k]);
@@ -357,7 +370,8 @@ int main(int argc, char** argv) {
                         auto tlog = torch::log_softmax(tl.index_select(0, rt2).narrow(1, head_offset(p, head), n).masked_fill(~mask, -1e9f), 1);
                         auto slog = torch::log_softmax(sl.index_select(0, rt2).narrow(1, head_offset(p, head), n).masked_fill(~mask, -1e9f), 1);
                         auto kl = (tlog.exp() * (tlog - slog)).masked_fill(~mask, 0.f).sum(1);
-                        loss = loss + kl.sum();
+                        loss = loss + kl.sum() * hw[head];
+                        klu = klu + kl.sum().detach();      // unweighted, for the logged kl
                         { auto ks = kl.sum().detach(); hkl[head] = hkl[head].defined() ? hkl[head] + ks : ks; hkn[head] += k; }
                         nrec += k;
                     }
@@ -365,7 +379,7 @@ int main(int argc, char** argv) {
                 if (!nrec) continue;
                 loss = loss / double(nrec);
                 opt.zero_grad(); loss.backward(); opt.step();
-                kl_sum += loss.item<double>() * nrec; kl_n += nrec;
+                kl_sum += klu.item<double>(); kl_n += nrec;
             }
         }
         {   // per head: KL (last epoch pass included) and greedy agreement, heads with records only
