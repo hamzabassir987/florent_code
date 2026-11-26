@@ -87,7 +87,6 @@ except ImportError as _e:
 OFFICIAL_ROUNDS, TRAINED_ROUNDS = 1000, 400
 ROUND_DIV = float(os.environ.get("FLORENT_ROUND_DIV", str(OFFICIAL_ROUNDS / TRAINED_ROUNDS)))   # 2.5
 ROUND_SCALAR = 9                     # actor scalar index of the current round (encoder)
-LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "4500"))
 _STATUS_SHOWN = False
 PROF = {} if os.environ.get("FLORENT_PROF") == "1" else None   # per-phase CPU (local profiling)
 VERBOSE = os.environ.get("FLORENT_VERBOSE") == "1"   # per-turn prints (local debugging only)
@@ -379,11 +378,8 @@ class Player:
         api.targets = mem.targets()                         # turret direction / convert masks
         if not HEADS.has_choice(api):
             return True                              # only "wait" is legal: no forward
-        if ct.get_cpu_time_elapsed() > LEARNED_START_LIMIT_US:
-            self.fallback_turns += 1
-            if VERBOSE:
-                print("FALLBACK", ct.get_current_round(), ct.get_cpu_time_elapsed(), file=sys.stderr)
-            return True    # wait: the heuristic bot's store layout clashes with the team bus
+        # no CPU start limit: the forward always runs (a turn that overruns 10 ms is cut
+        # by the server, which costs the same as skipping it, and many finish in time)
         scalars = list(scalars)
         scalars[ROUND_SCALAR] = int(scalars[ROUND_SCALAR] / ROUND_DIV)   # trained on TRAINED_ROUNDS-round games
         raw = spatial + scalars
