@@ -4,7 +4,9 @@
 //   env: GAMES (4) ROUNDS (40) EPOCHS (2) LR (3e-3) VECTORS (vector dump path)
 //        DEVICE (cuda if available | cpu): teacher, student and the KL fit run there
 //        TEMP_MIN / TEMP_MAX (0.5 / 1.5): each game samples with its own temperature
-//        HEAD_W_MAX (50): cap of the per-head loss weight (heads weigh equally)
+//        BUF_PER_HEAD (16384) K_PER_HEAD (32) STEPS (400): per-head replay buffers; each of
+//        the STEPS training steps per iteration samples K_PER_HEAD records of every head
+//        (heads weigh equally in the loss). EPOCHS is unused.
 //        EVAL_EVERY (40: every N iterations the student plays EVAL_GAMES greedy
 //        games against the teacher, sides alternating; 0: off) EVAL_GAMES (100)
 //
@@ -28,6 +30,7 @@
 #include "entropy_file.hpp"
 
 #include <fstream>
+#include <memory>
 #include <iomanip>
 #include <sstream>
 #include <iostream>
@@ -43,6 +46,15 @@ using namespace florent_rl;
 static int env_int(const char* k, int d) { const char* v = std::getenv(k); return v ? std::atoi(v) : d; }
 static float env_float(const char* k, float d) { const char* v = std::getenv(k); return v ? float(std::atof(v)) : d; }
 
+// one head record in a per-head replay buffer: the student's quantized input (shared
+// by the heads of one decision), the head's mask and the teacher's log-probabilities
+// over it (the teacher is fixed, so old records keep valid labels)
+struct HeadRec {
+    int policy = 0;
+    std::shared_ptr<const std::vector<uint8_t>> q;
+    std::vector<uint8_t> mask;
+    std::vector<float> tlog;
+};
 struct Sample {
     int policy;
     std::vector<int16_t> raw;
@@ -235,11 +247,20 @@ int main(int argc, char** argv) {
         }
     };
 
+    // per-head replay buffers (DISTILL: every training batch takes K_PER_HEAD records of every head)
+    const long BUF_CAP = env_int("BUF_PER_HEAD", 16384);
+    const int KH = env_int("K_PER_HEAD", 32), STEPS = env_int("STEPS", 400);
+    std::vector<std::vector<HeadRec>> buf(NUM_HEAD_IDS);
+    std::vector<long> bpos(NUM_HEAD_IDS, 0);
+    std::mt19937 brng(1234);
+
     for (int it = 1; it <= iters; it++) {
         read_entropy_file(KNOB_PATH, K);
         for (auto& m : games) m.game.max_turns = K.game_rounds;
         bool teacher_plays = it == 1 && !resumed;
-        std::vector<Sample> data;
+        std::vector<Sample> data;                // full positions: only for the calibration / the exactness vectors
+        const bool keep_full = (it == 1 && !resumed) || (it == iters && std::getenv("VECTORS"));
+        long nsamples = 0;
         long agree = 0, compared = 0;
         std::vector<long> hagree(NUM_HEAD_IDS, 0), hcomp(NUM_HEAD_IDS, 0);   // per-head greedy agreement
         st->eval();
@@ -250,7 +271,8 @@ int main(int argc, char** argv) {
             std::vector<GameStep> gs(G);
             std::vector<Pend> pend(G);
             std::vector<std::vector<Sample>> gdata(G);
-            std::vector<long> gagree(G, 0), gcomp(G, 0);
+            std::vector<std::vector<std::pair<int, HeadRec>>> ghr(G);   // (head, record) per game
+            std::vector<long> gagree(G, 0), gcomp(G, 0), nsamp_g(G, 0);
             std::vector<std::vector<long>> ghagree(G, std::vector<long>(NUM_HEAD_IDS, 0)), ghcomp(G, std::vector<long>(NUM_HEAD_IDS, 0));
             std::vector<char> need(G, 0);
             for (;;) {
@@ -298,7 +320,20 @@ int main(int argc, char** argv) {
                     for (auto& hr : d.records) smp.heads.push_back({hr.head, hr.mask});
                     for (auto& hr : dt.records) smp.heads.push_back({hr.head, hr.mask});   // the teacher's heads too
                     for (auto& c : d.actions) m.act(pd.a, c);
-                    gdata[gi].push_back(std::move(smp));
+                    {   // head records for the replay buffers: the teacher's masked log-softmax per head
+                        auto qv = std::make_shared<std::vector<uint8_t>>(pd.q.size());
+                        for (size_t i = 0; i < pd.q.size(); i++) (*qv)[i] = uint8_t(pd.q[i]);
+                        for (auto& hm : smp.heads) {
+                            const int head = hm.first, n = HEAD_SIZE[head], off = head_offset(pd.p, head);
+                            HeadRec hr; hr.policy = pd.p; hr.q = qv; hr.mask = hm.second; hr.tlog.assign(n, -1e9f);
+                            double mx = -1e30; for (int i = 0; i < n; i++) if (hm.second[i]) mx = std::max(mx, double(tl[off + i]));
+                            double z = 0; for (int i = 0; i < n; i++) if (hm.second[i]) z += std::exp(double(tl[off + i]) - mx);
+                            for (int i = 0; i < n; i++) if (hm.second[i]) hr.tlog[i] = float(double(tl[off + i]) - mx - std::log(z));
+                            ghr[gi].push_back({head, std::move(hr)});
+                        }
+                    }
+                    nsamp_g[gi]++;
+                    if (keep_full) gdata[gi].push_back(std::move(smp));
                     gs[gi].pos++;
                 }
             }
@@ -306,6 +341,12 @@ int main(int argc, char** argv) {
                 agree += gagree[gi]; compared += gcomp[gi];
                 for (int h = 0; h < NUM_HEAD_IDS; h++) { hagree[h] += ghagree[gi][h]; hcomp[h] += ghcomp[gi][h]; }
                 for (auto& x : gdata[gi]) data.push_back(std::move(x));
+                nsamples += nsamp_g[gi];
+                for (auto& [h, rec] : ghr[gi]) {                 // into the per-head buffers (oldest replaced)
+                    auto& b = buf[h];
+                    if (long(b.size()) < BUF_CAP) b.push_back(std::move(rec));
+                    else { b[bpos[h] % BUF_CAP] = std::move(rec); bpos[h]++; }
+                }
                 if (games[gi].game.over) new_game(gi, 0);
             }
         }
@@ -318,70 +359,56 @@ int main(int argc, char** argv) {
                 st->a(p)->calibrate(torch::from_blob(buf.data(), {n, (long)data[0].q.size()}, torch::kFloat32).clone().to(g_dev));
             }
         }
-        // ---- KL distillation per head record
+        // ---- KL distillation from the per-head buffers: each step samples K_PER_HEAD records of
+        // every head with records; loss = mean over heads of the head's mean KL (heads weigh equally)
         st->train();
         double kl_sum = 0; long kl_n = 0;
-        // per-head weights: every head counts equally in the loss however rare it is (a build
-        // type is ~0.1% of the records but decides the economy); weight = total / (heads * count),
-        // capped at HEAD_W_MAX (default 50) so a head with a handful of records cannot dominate
-        std::vector<double> hw(NUM_HEAD_IDS, 0.0);
-        {
-            std::vector<long> cnt(NUM_HEAD_IDS, 0); long tot = 0; int present = 0;
-            for (auto& smp : data) for (auto& hm : smp.heads) { cnt[hm.first]++; tot++; }
-            for (int h = 0; h < NUM_HEAD_IDS; h++) present += cnt[h] > 0;
-            const double cap = env_float("HEAD_W_MAX", 50.f);
-            for (int h = 0; h < NUM_HEAD_IDS; h++)
-                if (cnt[h]) hw[h] = std::min(cap, double(tot) / (double(present) * double(cnt[h])));
-        }
-        std::vector<torch::Tensor> hkl(NUM_HEAD_IDS);                      // per-head KL sums (device, no sync per step)
+        std::vector<torch::Tensor> hkl(NUM_HEAD_IDS);
         std::vector<long> hkn(NUM_HEAD_IDS, 0);
-        std::vector<int> order(data.size());
-        for (size_t i = 0; i < order.size(); i++) order[i] = int(i);
-        for (int ep = 0; ep < EPOCHS; ep++) {
-            std::shuffle(order.begin(), order.end(), master);
-            for (size_t s0 = 0; s0 < order.size(); s0 += MB) {
-                size_t s1 = std::min(order.size(), s0 + MB);
-                torch::Tensor loss = torch::zeros({}, g_dev), klu = torch::zeros({}, g_dev); long nrec = 0;
-                for (int p = 0; p < NUM_POLICIES; p++) {
-                    std::vector<int> idx;
-                    for (size_t k = s0; k < s1; k++) if (data[order[k]].policy == p) idx.push_back(order[k]);
-                    if (idx.empty()) continue;
-                    long D = long(data[idx[0]].raw.size());
-                    std::vector<float> rb(idx.size() * D), qb(idx.size() * D);
-                    for (size_t b = 0; b < idx.size(); b++) {
-                        std::copy(data[idx[b]].raw.begin(), data[idx[b]].raw.end(), rb.begin() + b * D);
-                        clamp_teacher_row(rb.data() + b * D);
-                        std::copy(data[idx[b]].q.begin(), data[idx[b]].q.end(), qb.begin() + b * D);
-                    }
-                    auto rt = torch::from_blob(rb.data(), {(long)idx.size(), D}, torch::kFloat32).clone().to(g_dev);
-                    auto qt = torch::from_blob(qb.data(), {(long)idx.size(), D}, torch::kFloat32).clone().to(g_dev);
-                    torch::Tensor tl;
-                    { torch::NoGradGuard ng; tl = teacher->logits(p, rt); }
-                    auto sl = st->a(p)->forward(qt) / double(1 << ST_LOGIT_SHIFT);
-                    for (int head : policy_heads(p)) {
-                        std::vector<long> rows; std::vector<uint8_t> mk; int n = HEAD_SIZE[head];
-                        for (size_t b = 0; b < idx.size(); b++)
-                            for (auto& hm : data[idx[b]].heads)
-                                if (hm.first == head) { rows.push_back(long(b)); mk.insert(mk.end(), hm.second.begin(), hm.second.end()); }
-                        if (rows.empty()) continue;
-                        long k = long(rows.size());
-                        auto rt2 = torch::tensor(rows, torch::kLong).to(g_dev);
-                        auto mask = torch::from_blob(mk.data(), {k, n}, torch::kUInt8).clone().to(torch::kBool).to(g_dev);
-                        auto tlog = torch::log_softmax(tl.index_select(0, rt2).narrow(1, head_offset(p, head), n).masked_fill(~mask, -1e9f), 1);
-                        auto slog = torch::log_softmax(sl.index_select(0, rt2).narrow(1, head_offset(p, head), n).masked_fill(~mask, -1e9f), 1);
-                        auto kl = (tlog.exp() * (tlog - slog)).masked_fill(~mask, 0.f).sum(1);
-                        loss = loss + kl.sum() * hw[head];
-                        klu = klu + kl.sum().detach();      // unweighted, for the logged kl
-                        { auto ks = kl.sum().detach(); hkl[head] = hkl[head].defined() ? hkl[head] + ks : ks; hkn[head] += k; }
-                        nrec += k;
-                    }
-                }
-                if (!nrec) continue;
-                loss = loss / double(nrec);
-                opt.zero_grad(); loss.backward(); opt.step();
-                kl_sum += klu.item<double>(); kl_n += nrec;
+        const long D = long(fe::ACTOR_SPATIAL + fe::ACTOR_SCALARS);
+        for (int step = 0; step < STEPS; step++) {
+            // sampled (head, record) per policy
+            std::vector<std::vector<std::pair<int, const HeadRec*>>> per_p(NUM_POLICIES);
+            int heads_present = 0;
+            for (int h = 0; h < NUM_HEAD_IDS; h++) {
+                if (buf[h].empty()) continue;
+                heads_present++;
+                std::uniform_int_distribution<long> pick(0, long(buf[h].size()) - 1);
+                for (int k = 0; k < KH; k++) { const HeadRec* rp = &buf[h][pick(brng)]; per_p[rp->policy].push_back({h, rp}); }
             }
+            if (!heads_present) break;
+            torch::Tensor loss = torch::zeros({}, g_dev);
+            for (int p = 0; p < NUM_POLICIES; p++) {
+                auto& v = per_p[p];
+                if (v.empty()) continue;
+                const long n = long(v.size());
+                std::vector<uint8_t> qb(n * D);
+                for (long b = 0; b < n; b++) std::copy(v[b].second->q->begin(), v[b].second->q->end(), qb.begin() + b * D);
+                auto qt = torch::from_blob(qb.data(), {n, D}, torch::kUInt8).to(g_dev).to(torch::kFloat32);
+                auto sl = st->a(p)->forward(qt) / double(1 << ST_LOGIT_SHIFT);
+                for (int head : policy_heads(p)) {
+                    std::vector<long> rows; std::vector<uint8_t> mk; std::vector<float> tg; const int nh = HEAD_SIZE[head];
+                    for (long b = 0; b < n; b++) if (v[b].first == head) {
+                        rows.push_back(b);
+                        mk.insert(mk.end(), v[b].second->mask.begin(), v[b].second->mask.end());
+                        tg.insert(tg.end(), v[b].second->tlog.begin(), v[b].second->tlog.end());
+                    }
+                    if (rows.empty()) continue;
+                    const long k = long(rows.size());
+                    auto ri = torch::tensor(rows, torch::kLong).to(g_dev);
+                    auto mask = torch::from_blob(mk.data(), {k, nh}, torch::kUInt8).to(g_dev).to(torch::kBool);
+                    auto tlog = torch::from_blob(tg.data(), {k, nh}, torch::kFloat32).to(g_dev);
+                    auto slog = torch::log_softmax(sl.index_select(0, ri).narrow(1, head_offset(p, head), nh).masked_fill(~mask, -1e9f), 1);
+                    auto kl = (tlog.exp() * (tlog - slog)).masked_fill(~mask, 0.f).sum(1);    // [k]
+                    auto hm = kl.mean();
+                    loss = loss + hm / double(heads_present);
+                    auto ks = kl.sum().detach(); hkl[head] = hkl[head].defined() ? hkl[head] + ks : ks; hkn[head] += k;
+                    kl_n += k;
+                }
+            }
+            opt.zero_grad(); loss.backward(); opt.step();
         }
+        for (int h = 0; h < NUM_HEAD_IDS; h++) if (hkn[h]) kl_sum += hkl[h].item<double>();
         {   // per head: KL (last epoch pass included) and greedy agreement, heads with records only
             std::ostringstream o;
             o << "  heads:";
@@ -394,7 +421,7 @@ int main(int argc, char** argv) {
             std::cout << o.str() << std::endl;
         }
         std::cout << "iter " << it << (teacher_plays ? " (teacher plays)" : " (student plays)")
-                  << " samples " << data.size() << " kl " << (kl_n ? kl_sum / kl_n : 0)
+                  << " samples " << nsamples << " kl " << (kl_n ? kl_sum / kl_n : 0)
                   << " action_agreement " << (compared ? double(agree) / compared : 0) << " (" << agree << "/" << compared << ")"
                   << std::endl;
         // ---- match eval: student vs teacher, greedy, full games (game_rounds), sides alternating
