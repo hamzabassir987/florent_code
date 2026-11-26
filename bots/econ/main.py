@@ -67,6 +67,25 @@ LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "4500"))
 _STATUS_SHOWN = False
 
 
+def _diag(ct, text):
+    """Server diagnostics (replays keep no prints, but keep the team store):
+    the core writes `text` into store slots 0-15, 3 ASCII bytes per word,
+    word = chunk index (top byte) + 3 bytes of text. Decode with
+    rl/tools/read_diag.py. Only the core writes, once per round."""
+    try:
+        if ct.get_entity_type() != EntityType.CORE:
+            return
+        b = text.encode("ascii", "replace")[:765]
+        rnd = ct.get_current_round()
+        n = (len(b) + 2) // 3
+        for k in range(16):                      # rotate through the message, 16 chunks per round
+            j = (rnd * 16 + k) % max(n, 1)
+            c = b[3 * j:3 * j + 3].ljust(3, b" ")
+            ct.write_store(k, (j & 0xFF) << 24 | c[0] << 16 | c[1] << 8 | c[2])
+    except Exception:
+        pass
+
+
 class _TeacherPolicy:
     """Local testing only: the float teacher through a ctypes library (same logits() as StudentPolicy)."""
     def __init__(self, lib_path, model_path):
@@ -271,6 +290,7 @@ class Player:
         # no learned policy loaded: do nothing (no heuristic fallback), unless
         # FLORENT_HEURISTIC=1 asks for the heuristic (local tests)
         if self.student is None and os.environ.get("FLORENT_HEURISTIC") != "1":
+            _diag(ct, "NOLOAD " + "; ".join(IMPORT_ERRORS))
             return
         if not self.init:
             self._setup(ct)
@@ -285,6 +305,9 @@ class Player:
                     return
             except Exception as e:
                 print("LEARNED error, turn skipped:", repr(e), file=sys.stderr)
+                import traceback as _tb
+                _diag(ct, "ERR " + repr(e) + " @ " + " < ".join(
+                    "%s:%d" % (f.name, f.lineno) for f in reversed(_tb.extract_tb(e.__traceback__))))
                 if heuristic:
                     self.policy_disabled = True
         if not heuristic:
