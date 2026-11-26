@@ -27,8 +27,9 @@ def main():
         meta["n_policies"] = len(d["policies"])
         assert meta["n_policies"] <= 8, "main.py imports at most sw0..sw7"
         files = [("sw_meta.py", "META = %r\n" % meta)]
-        for k, pol in enumerate(d["policies"]):
-            files.append(("sw%d.py" % k, "POLICY = %r\n" % pol))
+        for k in range(8):        # main.py imports sw0..sw7 at top level: unused ones hold None
+            pol = d["policies"][k] if k < len(d["policies"]) else None
+            files.append(("sw%d.py" % k, "POLICY = %r\n" % (pol,)))
         parts = files
         for name, body in files:
             zi = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))

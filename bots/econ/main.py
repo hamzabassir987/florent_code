@@ -54,6 +54,30 @@ except Exception as _e:
     HEADS = None
     StudentPolicy = None
     IMPORT_ERRORS.append("heads/student: " + repr(_e))
+# student weights (submission only; absent in the repo)
+_SW_META = None
+_SW_ERR = ""
+_SW_POLICIES = []
+try:
+    from sw_meta import META as _SW_META
+    from sw0 import POLICY as _P0
+    _SW_POLICIES.append(_P0)
+    from sw1 import POLICY as _P1
+    _SW_POLICIES.append(_P1)
+    from sw2 import POLICY as _P2
+    _SW_POLICIES.append(_P2)
+    from sw3 import POLICY as _P3
+    _SW_POLICIES.append(_P3)
+    from sw4 import POLICY as _P4
+    _SW_POLICIES.append(_P4)
+    from sw5 import POLICY as _P5
+    _SW_POLICIES.append(_P5)
+    from sw6 import POLICY as _P6
+    _SW_POLICIES.append(_P6)
+    from sw7 import POLICY as _P7
+    _SW_POLICIES.append(_P7)
+except ImportError as _e:
+    _SW_ERR = repr(_e)
 
 # Learned turns start the network only while this much CPU of the turn is left
 # unused (the SWAR forward takes ~4-5 ms of the 10 ms budget).
@@ -68,24 +92,14 @@ _STATUS_SHOWN = False
 
 
 def _embedded_weights():
-    """The student.json data as plain Python literals, written by
-    rl/tools/make_submission.py: sw_meta.py (META) and one module per policy
-    (sw0.py ... sw7.py, POLICY)."""
-    from sw_meta import META
-    pols = []
-    for k in range(META["n_policies"]):
-        if k == 0: from sw0 import POLICY
-        elif k == 1: from sw1 import POLICY
-        elif k == 2: from sw2 import POLICY
-        elif k == 3: from sw3 import POLICY
-        elif k == 4: from sw4 import POLICY
-        elif k == 5: from sw5 import POLICY
-        elif k == 6: from sw6 import POLICY
-        else: from sw7 import POLICY
-        pols.append(POLICY)
-    data = dict(META)
-    del data["n_policies"]
-    data["policies"] = pols
+    """The student.json data as plain Python literals (rl/tools/make_submission.py).
+    The weight modules are imported at module level (below): the server only
+    ships modules imported at the top level of the bot."""
+    if _SW_META is None:
+        raise ImportError("weight modules missing: " + _SW_ERR)
+    data = dict(_SW_META)
+    n = data.pop("n_policies")
+    data["policies"] = list(_SW_POLICIES[:n])
     return data
 
 
