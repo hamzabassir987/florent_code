@@ -45,6 +45,12 @@ except Exception:
 
 # Learned turns start the network only while this much CPU of the turn is left
 # unused (the SWAR forward takes ~4-5 ms of the 10 ms budget).
+# The student only saw games of TRAINED_ROUNDS rounds: its round input is scaled so the
+# official 1000-round game spans the same 0..TRAINED_ROUNDS range (ages, cooldowns and
+# every other input stay in real rounds). FLORENT_ROUND_DIV overrides the divisor.
+OFFICIAL_ROUNDS, TRAINED_ROUNDS = 1000, 400
+ROUND_DIV = float(os.environ.get("FLORENT_ROUND_DIV", str(OFFICIAL_ROUNDS / TRAINED_ROUNDS)))   # 2.5
+ROUND_SCALAR = 9                     # actor scalar index of the current round (encoder)
 LEARNED_START_LIMIT_US = int(os.environ.get("FLORENT_START_LIMIT_US", "4500"))   # int8 student forward: ~3.5 ms median, p95 ~5.1 ms
 if os.environ.get("FLORENT_POLICY"):
     # A cyclic-GC pause can push a turn past the 10 ms limit; reference
@@ -263,6 +269,8 @@ class Player:
             self.fallback_turns += 1
             print("FALLBACK", ct.get_current_round(), ct.get_cpu_time_elapsed(), file=sys.stderr)
             return True    # wait: the heuristic bot's store layout clashes with the team bus
+        scalars = list(scalars)
+        scalars[ROUND_SCALAR] = int(scalars[ROUND_SCALAR] / ROUND_DIV)   # trained on TRAINED_ROUNDS-round games
         raw = spatial + scalars
         actions, _ = HEADS.decide(api, lambda: self.student.logits(p, raw))
         for a in actions:
