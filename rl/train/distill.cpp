@@ -3,6 +3,7 @@
 //   distill TEACHER.pt OUT_STUDENT.pt OUT.json ITERATIONS MAP [MAP...]
 //   env: GAMES (4) ROUNDS (40) EPOCHS (2) LR (3e-3) VECTORS (vector dump path)
 //        DEVICE (cuda if available | cpu): teacher, student and the KL fit run there
+//        TEMP_MIN / TEMP_MAX (0.5 / 1.5): each game samples with its own temperature
 //        EVAL_EVERY (40: every N iterations the student plays EVAL_GAMES greedy
 //        games against the teacher, sides alternating; 0: off) EVAL_GAMES (100; played in parallel over the CPU threads)
 //
@@ -124,6 +125,10 @@ int main(int argc, char** argv) {
     std::mt19937 master(99);
     std::vector<Match> games(G);
     std::vector<std::mt19937> grng(G);
+    // per-game sampling temperature, uniform in [TEMP_MIN, TEMP_MAX] (drawn when the game starts):
+    // more varied states; the labels stay the teacher's T = 1 distribution
+    const float TMIN = env_float("TEMP_MIN", 0.5f), TMAX = env_float("TEMP_MAX", 1.5f);
+    std::vector<float> gtemp(G, 1.f);
     auto new_game = [&](int i, int start_round) {
         games[i] = Match();
         games[i].load(maps[master() % maps.size()], master());
@@ -132,6 +137,7 @@ int main(int argc, char** argv) {
         games[i].game.max_turns = K.game_rounds;
         games[i].game.limit_ore(K.ore_radius, master());
         grng[i].seed(master());
+        gtemp[i] = std::uniform_real_distribution<float>(TMIN, std::max(TMIN, TMAX))(grng[i]);
     };
     for (int i = 0; i < G; i++) new_game(i, int(long(i) * std::max(1, K.game_rounds) / G));
 
@@ -178,10 +184,11 @@ int main(int argc, char** argv) {
                     // act with a sampled decision of the playing model
                     const float* L = teacher_plays ? tl.data_ptr<float>() : sl.data_ptr<float>();
                     std::mt19937& rng = grng[gi];
+                    const double T = std::max(1e-3, double(gtemp[gi]));
                     Decision d = decide(m.game, a, L, [&](int, const float* l, const std::vector<uint8_t>& mk, float& lp) {
                         double mx = -1e30; for (size_t i = 0; i < mk.size(); i++) if (mk[i]) mx = std::max(mx, double(l[i]));
                         std::vector<double> w(mk.size(), 0.0); double z = 0;
-                        for (size_t i = 0; i < mk.size(); i++) if (mk[i]) { w[i] = std::exp(double(l[i]) - mx); z += w[i]; }
+                        for (size_t i = 0; i < mk.size(); i++) if (mk[i]) { w[i] = std::exp((double(l[i]) - mx) / T); z += w[i]; }
                         double u = std::uniform_real_distribution<double>(0, z)(rng), c = 0; int pick = -1;
                         for (size_t i = 0; i < mk.size(); i++) if (mk[i]) { pick = int(i); c += w[i]; if (u <= c) break; }
                         lp = 0; return pick;
