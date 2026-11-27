@@ -111,7 +111,10 @@ static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* pla
         const bool can_hit = in && g.can_attack(a, o.tx[i], o.ty[i]) == OK;
         const bool hidden_mine = can_hit && g.tile_building(a, o.tx[i], o.ty[i]) < 0;
         o.move[i] = g.can_move(a, CARD4[i]) == OK && !hidden_mine;     // never step on it
-        o.attack[i] = can_hit && (hidden_mine || enemy_building_on(g, a, o.tx[i], o.ty[i]));
+        // attack a hidden mine only where it blocks the conveyor plan (clearing every
+        // mine cost the untrained network ~1500 Ti in a game); avoiding it is free
+        const bool mine_blocks = hidden_mine && plan4 && plan4[i] != 0;
+        o.attack[i] = can_hit && (mine_blocks || enemy_building_on(g, a, o.tx[i], o.ty[i]));
         o.heal[i] = in && g.can_heal(a, o.tx[i], o.ty[i]) == OK;
         o.destroy[i] = in && g.can_destroy(a, o.tx[i], o.ty[i]) == OK;
         for (int t = 0; t < 9; t++) {

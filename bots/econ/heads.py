@@ -143,7 +143,9 @@ def _builder_opts(api):
         hidden_mine = can_hit and _safe(lambda: ct.get_tile_building_id(q)) is None
         if hidden_mine:
             move[i] = 0                          # never step on it
-        attack.append(int(can_hit and (hidden_mine or _enemy_building_on(api, x, y))))
+        # attack a hidden mine only where it blocks the conveyor plan (as in C++)
+        mine_blocks = hidden_mine and api.plan4 is not None and api.plan4[i] != 0
+        attack.append(int(can_hit and (mine_blocks or _enemy_building_on(api, x, y))))
         heal.append(int(inb and api.call("can_heal", q)))
         destroy.append(int(inb and api.call("can_destroy", q)))
         if not inb:
