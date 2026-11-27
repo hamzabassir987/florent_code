@@ -27,7 +27,6 @@ CARD4 = (N, E, S, W)
 BUILDER, CORE, GUNNER, SENTINEL, LAUNCHER, SPIKE = range(6)
 CONVEYOR, SPLITTER, HARVESTER, BARRIER, MINE = range(6, 11)
 MAX_LAUNCHERS = 3   # launcher cap (as florent_heads.hpp)
-MAX_SENTINELS = 3   # scripted sentinel builds stop there (own sentinels known)
 BUILD_ORDER = (CONVEYOR, SPLITTER, HARVESTER, GUNNER, SENTINEL, LAUNCHER, SPIKE, BARRIER, MINE)
 DIRECTIONAL = frozenset((CONVEYOR, SPLITTER, GUNNER, SENTINEL))
 CONVERT_PCT = (0, 10, 25, 50, 100)
@@ -156,9 +155,8 @@ def _builder_opts(api):
                 continue
             if typ == GUNNER:                    # gunners removed
                 continue
-            if typ == SENTINEL and (api.targets is None or api.targets["own_turrets"] >= MAX_SENTINELS
-                                    or api.targets.get("own_vo_harvesters", 0) <= 0):
-                continue                         # scripted, capped, only while harvesting Voltium (as in C++)
+            if typ == SENTINEL and api.targets is None:
+                continue                         # only aimed at a known enemy core; the gate decides (as in C++)
             if typ in DIRECTIONAL:
                 planned = api.plan4 is not None and typ in (CONVEYOR, SPLITTER)
                 for d in range(8):
@@ -323,6 +321,27 @@ def has_choice(api):
     return False
 
 
+def sentinel_gate(api):
+    """('build', SENTINEL, x, y, dir) a builder can do, aimed at a known enemy core
+    tile (the first legal tile / direction), else None. As sentinel_gate in C++."""
+    if _type(api) != BUILDER or api.targets is None:
+        return None
+    _, _, _, _, build, tiles = builder_opts(api)
+    st = BUILD_ORDER.index(SENTINEL)
+    for i, (x, y) in enumerate(tiles):
+        for dd in range(8):
+            if build[st][i][dd]:
+                return ("build", SENTINEL, x, y, dd + 1)
+    return None
+
+
+def decide_gate(gate_logits, build, choose=None):
+    """The gate's 2-option head (HS_MODE: 0 no, 1 place). Returns (actions, records). As decide_gate in C++."""
+    choose = choose or (lambda head, l, m: argmax_choice(l, m))
+    c, lp = choose(HS_MODE, list(gate_logits[:2]), [1, 1])
+    return ([build] if c == 1 else []), [(HS_MODE, [1, 1], c, lp)]
+
+
 def spike_action(api, first_turn=False):
     """Scripted turrets (as spike_action in C++). Spike: fire only when a visible
     enemy (builder or building) is on a neighbour (the shot hits every enemy
@@ -419,13 +438,10 @@ def decide(api, logits, choose=None):
                 c = x if pit[0] == "x" else y
                 if (c == pit[1] - 1 or c == pit[1] + pit[2]) and build[lt][i][0]:
                     return [("build", LAUNCHER, x, y, C)], []
-        # sentinel (scripted): one aimed at a known enemy core tile is built when
-        # possible (at most MAX_SENTINELS); nothing recorded (as in C++)
+        # sentinels are the gate's decision (decide_gate), never the builder heads' (as in C++)
         st = BUILD_ORDER.index(SENTINEL)
-        for i, (x, y) in enumerate(tiles):
-            for dd in range(8):
-                if build[st][i][dd]:
-                    return [("build", SENTINEL, x, y, dd + 1)], []
+        build = [[list(r) for r in tt] for tt in build]
+        build[st] = [[0] * 8 for _ in range(4)]
         bt = [int(any(any(r) for r in build[t2])) for t2 in range(9)]
         mode = [1, int(any(move)), int(any(bt)), int(any(attack)), int(any(heal)), int(any(destroy))]
         m = run(HB_MODE, mode)

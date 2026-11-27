@@ -38,6 +38,16 @@ int rl_decide(fe::Game* g, int a, const float* logits, int* out, const int* plan
     }
     return k;
 }
+// sentinel gate: 1 and the aimed sentinel build in out5 (kind, a, b, c, d) if a
+// builder can build one aimed at a known enemy core tile, else 0
+int rl_gate(fe::Game* g, int a, const int* plan4, int own_launchers, const int* tiles, int ncore, int nbld, int own_turrets, int own_vo, int* out5) {
+    int8_t p[4]; if (plan4) for (int i = 0; i < 4; i++) p[i] = int8_t(plan4[i]);
+    Targets t = make_tg(tiles, ncore, nbld, own_turrets, own_vo);
+    Candidate c;
+    if (!sentinel_gate(*g, a, plan4 ? p : nullptr, own_launchers, ncore < 0 ? nullptr : &t, c)) return 0;
+    out5[0] = int(c.kind); out5[1] = c.a; out5[2] = c.b; out5[3] = c.c; out5[4] = c.d;
+    return 1;
+}
 int rl_spike(fe::Game* g, int a, int* xy, int first) { Candidate c; if (!spike_action(*g, a, c, first != 0)) return 0; xy[0] = c.a; xy[1] = c.b; return 1; }
 int rl_apply(fe::Game* g, int a, int kind, int p, int q, int r, int s) { Candidate c{ActionKind(kind), p, q, r, s}; return apply_candidate(*g, a, c); }
 }

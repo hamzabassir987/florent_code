@@ -122,8 +122,9 @@ static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* pla
             if (!in) continue;
             if (type == LAUNCHER && own_launchers >= MAX_LAUNCHERS) continue;
             if (type == GUNNER) continue;                       // gunners removed
-            // sentinel: scripted, capped, and only while we harvest Voltium (its ammo source)
-            if (type == SENTINEL && (!tg || tg->own_turrets >= MAX_SENTINELS || tg->own_vo_harvesters <= 0)) continue;
+            // sentinel: only aimed at a known enemy core (aims() below, needs tg); the
+            // sentinel gate network decides whether to build it (sentinel_gate / decide_gate)
+            if (type == SENTINEL && !tg) continue;
             if (directional(type)) {
                 const bool planned = plan4 && (type == CONVEYOR || type == SPLITTER);
                 for (int d = 0; d < 8; d++)
@@ -235,6 +236,25 @@ bool has_choice(const Game& g, int a, const int8_t* plan4, int own_launchers, co
     }
 }
 
+bool sentinel_gate(const Game& g, int a, const int8_t* plan4, int own_launchers, const Targets* tg, Candidate& build) {
+    if (a < 0 || a >= int(g.ents.size()) || !g.ents[a].alive || g.ents[a].type != BUILDER || !tg) return false;
+    BuilderOpts o; builder_opts(g, a, o, plan4, own_launchers, tg);
+    const int st = 4;                                  // BUILD_ORDER index of SENTINEL
+    for (int i = 0; i < 4; i++)
+        for (int dd = 0; dd < 8; dd++)
+            if (o.build[st][i][dd]) { build = {ActionKind::Build, SENTINEL, o.tx[i], o.ty[i], dd + 1}; return true; }
+    return false;
+}
+
+Decision decide_gate(const float* gate_logits, const Chooser& choose, const Candidate& build) {
+    Decision d;
+    HeadRecord r; r.head = HS_MODE; r.mask = {1, 1};
+    r.choice = choose(HS_MODE, gate_logits, r.mask, r.logp);
+    d.records.push_back(r);
+    if (r.choice == 1) d.actions.push_back(build);
+    return d;
+}
+
 bool spike_action(const Game& g, int a, Candidate& out, bool first_turn) {
     const Entity& e = g.ents[a];
     if (e.type == SENTINEL) {
@@ -319,17 +339,8 @@ Decision decide(const Game& g, int a, const float* logits, const Chooser& choose
                 }
             }
         }
-        // sentinel (scripted): a builder that can build one aimed at a known enemy
-        // core tile builds it (aims() in builder_opts; at most MAX_SENTINELS); nothing recorded
-        {
-            const int st = 4;                          // BUILD_ORDER index of SENTINEL
-            for (int i = 0; i < 4; i++)
-                for (int dd = 0; dd < 8; dd++)
-                    if (o.build[st][i][dd]) {
-                        d.actions.push_back({ActionKind::Build, SENTINEL, o.tx[i], o.ty[i], dd + 1});
-                        return d;
-                    }
-        }
+        // sentinels are the gate's decision (decide_gate), never the builder heads'
+        for (int i = 0; i < 4; i++) for (int dd = 0; dd < 8; dd++) o.build[4][i][dd] = 0;
         uint8_t bt[9] = {0};
         for (int t = 0; t < 9; t++) bt[t] = any(&o.build[t][0][0], 4 * 8);
         uint8_t mode[6] = {1, any(o.move, 4), any(bt, 9), any(o.attack, 4), any(o.heal, 4), any(o.destroy, 4)};

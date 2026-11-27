@@ -83,7 +83,6 @@ void plan4_from_obs(const uint8_t* spatial, int8_t plan4[4]);
 // than MAX_LAUNCHERS (own launchers in the unit's memory, shared by the team
 // report bus). own_launchers < 0: no cap.
 constexpr int MAX_LAUNCHERS = 3;
-constexpr int MAX_SENTINELS = 3;   // own sentinels known (Targets::own_turrets): scripted builds stop there
 
 // What the unit knows about targets (from its memory, docs/masks.md):
 //  * sentinel: may be built only facing a line (5 straight / 4 diagonal) that
@@ -107,6 +106,15 @@ bool has_choice(const fe::Game& g, int actor, const int8_t* plan4 = nullptr, int
 // Spikes are scripted: on their first turn they fire once (clears hidden enemy
 // mines around them), then only at a visible enemy. Same in bots/econ/heads.py.
 bool spike_action(const fe::Game& g, int actor, Candidate& out, bool first_turn = false);
+
+// Sentinel gate: a builder that can build a sentinel aimed at a known enemy core
+// tile (tg needed) asks the sentinel gate first: sentinel_gate() finds that build
+// (the first legal tile / direction), decide_gate() runs the 2-option head
+// (HS_MODE: 0 no, 1 place) on the gate logits (teacher: the P_SENTINEL network on
+// the builder's observation; student: the builder's merged gate head). "No":
+// the builder decodes normally (its heads never offer a sentinel). Same in heads.py.
+bool sentinel_gate(const fe::Game& g, int actor, const int8_t* plan4, int own_launchers, const Targets* tg, Candidate& build);
+Decision decide_gate(const float* gate_logits, const Chooser& choose, const Candidate& build);
 
 // Decode one turn. `logits` is this unit's policy logit row (policy_logit_count).
 // Pit maps (pit at most 2 wide, a thrown builder survives): a builder next to

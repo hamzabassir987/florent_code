@@ -240,6 +240,23 @@ def main():
                     stats["skips"] += 1
                     continue
                 stats["turns"] += 1
+                if typ == 0:   # sentinel gate (as the trainer / bot): the aimed build, then a random gate choice
+                    g5 = (ctypes.c_int * 5)()
+                    c_gate = (tuple(g5) if L.rl_gate(g, a, cplan(plan4), -1 if own_l is None else own_l, tarr, nc, nb, ot, ov, g5) else None)
+                    pg = H.sentinel_gate(api)
+                    p_gate = py_action_tuple(pg) if pg else None
+                    if c_gate != p_gate:
+                        stats["mismatch"] += 1
+                        print("GATE mismatch", r, a, c_gate, p_gate)
+                    if c_gate is not None:
+                        stats["gates"] = stats.get("gates", 0) + 1
+                        gl = [rng.uniform(-2, 2), rng.uniform(-2, 2)]
+                        acts, _ = H.decide_gate(gl, pg)
+                        if acts:
+                            stats["built_sentinel"] = stats.get("built_sentinel", 0) + 1
+                            if L.rl_apply(g, a, *c_gate) == 0:
+                                stats["actions"] += 1
+                            continue
                 logits = [rng.uniform(-3, 3) for _ in range(L.rl_policy_logits(p))]
                 if p == H.P_BUILDER and plan4 is not None:   # tilt toward conveyors / splitters: the planner mask
                     logits[H.head_offset(p, H.HB_MODE) + 2] += 2.5
@@ -261,8 +278,7 @@ def main():
                     if act[0] == 10:
                         stats["launches"] = stats.get("launches", 0) + 1
                     if act[0] == 4 and act[1] in (2, 3):
-                        k = "built_gunner" if act[1] == 2 else "built_sentinel"
-                        stats[k] = stats.get(k, 0) + 1
+                        stats["builder_head_turret"] = stats.get("builder_head_turret", 0) + 1   # must stay 0
                 for h, _, _ in c_recs:
                     by_head[h] += 1
                 if c_recs != p_recs2 or c_acts != p_acts2:
