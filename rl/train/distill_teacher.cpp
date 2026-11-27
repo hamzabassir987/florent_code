@@ -18,6 +18,10 @@
 //        CRITIC_BUF (2048) CRITIC_BATCH (64) CRITIC_W (1) LR (1e-3) SMOOTH_MAX (0.9)
 //        TEMP_MIN / TEMP_MAX (0.5 / 1.5) DEVICE INIT (resume the new teacher)
 //        EVAL_EVERY (40) EVAL_GAMES (100): new vs old, greedy, sides alternating
+//        GATE_LABELS (0): 1 = distil the sentinel gate (P_SENTINEL) from the old
+//        teacher's P_SENTINEL too. 0 (default): no gate labels (an older teacher's
+//        P_SENTINEL learned sentinel fire, not the gate) and the new gate's output
+//        layer is zeroed when saved: PPO starts it at exactly 50/50
 // Map mix, game_rounds and ore_radius from the entropy file, as neural_train.
 // Iteration 1: the old teacher plays; afterwards the new one (DAgger), sampled
 // at each game's temperature.
@@ -101,6 +105,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> maps(argv + 4, argv + argc);
     const int G = env_int("GAMES", 64), R = env_int("ROUNDS", 10);
     const double CAP = env_float("SMOOTH_MAX", 0.9f);
+    const bool GATE_LABELS = env_int("GATE_LABELS", 0) != 0;
     torch::manual_seed(17);
     {
         const char* d = std::getenv("DEVICE");
@@ -273,9 +278,11 @@ int main(int argc, char** argv) {
                         const double T = std::max(1e-3, double(gtemp[gi]));
                         const double w1 = 1.0 / (1.0 + std::exp((double(GL[0]) - double(GL[1])) / T));
                         const bool place = std::uniform_real_distribution<double>(0, 1)(grng[gi]) < w1;
-                        HeadRec hr; hr.policy = P_SENTINEL; hr.obs = ob[gi]; hr.mask = gm;
-                        hr.tlog = smoothed_label(og, gm, CAP);
-                        ghr[gi].push_back({HS_MODE, std::move(hr)});
+                        if (GATE_LABELS) {
+                            HeadRec hr; hr.policy = P_SENTINEL; hr.obs = ob[gi]; hr.mask = gm;
+                            hr.tlog = smoothed_label(og, gm, CAP);
+                            ghr[gi].push_back({HS_MODE, std::move(hr)});
+                        }
                         if (place) { m.act(pd.a, pd.gb); gplaced[gi]++; nsamp[gi]++; gs[gi].pos++; continue; }
                     }
                     Decision dt = decide(m.game, pd.a, ol, greedy(), pd.plan4, pd.own_l, &pd.tg);
@@ -471,7 +478,14 @@ int main(int argc, char** argv) {
             std::cout << "eval " << it << ": new vs old (greedy, " << EG << " games, " << K.game_rounds << " rounds): new wins "
                       << nw << ", old wins " << ow << ", mean Ti collected new " << nti / std::max(1, EG) << " old " << oti / std::max(1, EG) << std::endl;
         }
-        if (it % 5 == 0 || it == iters) torch::save(net, npath);
+        if (it % 5 == 0 || it == iters) {
+            if (!GATE_LABELS) {                 // a fresh gate: zero output layer (50/50 for PPO)
+                torch::NoGradGuard ng;
+                auto a = net->actors[P_SENTINEL]->as<Actor>();
+                a->out->weight.zero_(); a->out->bias.zero_();
+            }
+            torch::save(net, npath);
+        }
     }
     std::cout << "DISTILL_TEACHER COMPLETE new teacher=" << npath << std::endl;
 }
