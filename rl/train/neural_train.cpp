@@ -184,6 +184,7 @@ struct Slot {
     uint8_t* in_sp = nullptr; int16_t* in_sc = nullptr;   // this slot's row of the (pinned) input stage
     const float* lg = nullptr;                            // its logits row after the forward
     bool recorded = false;                                // the last decision was recorded
+    bool gate = false; Candidate gate_build;              // the waiting builder asks the sentinel gate first
     // play setup
     int net_of[2] = {0, 0}; bool greedy = false, record = true;
     std::vector<ActionLine>* log = nullptr;
@@ -287,6 +288,11 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
             if (!has_choice(m.game, a, s.plan4, s.own_launchers, &s.tg)) { s.pos++; continue; }   // only wait: no forward
             s.oob += oob;
             s.need = true; s.ent = a; s.policy = p; s.net = s.net_of[m.game.ents[a].team];
+            // sentinel gate: a builder that can build an aimed sentinel asks the gate
+            // network (P_SENTINEL, on this builder's input) first; "no": a second
+            // forward, the builder network, on the same input (play_decision)
+            s.gate = p == P_BUILDER && sentinel_gate(m.game, a, s.plan4, s.own_launchers, &s.tg, s.gate_build);
+            if (s.gate) s.policy = P_SENTINEL;
             return;
         }
         m.game.end_round();
@@ -338,9 +344,12 @@ static int sample_masked(const float* l, const std::vector<uint8_t>& mask, std::
 static void play_decision(Slot& s, const Setup& S, bool train) {
     Match& m = s.m;
     const int a = s.ent;
-    Decision d = decide(m.game, a, s.lg, [&](int, const float* l, const std::vector<uint8_t>& mk, float& lp) {
+    const bool gate = s.gate;
+    auto chooser = [&](int, const float* l, const std::vector<uint8_t>& mk, float& lp) {
         return s.greedy ? argmax_choice(l, mk, lp) : sample_masked(l, mk, s.rng, lp);
-    }, s.plan4, s.own_launchers, &s.tg);
+    };
+    Decision d = gate ? decide_gate(s.lg + head_offset(P_SENTINEL, HS_MODE), chooser, s.gate_build)
+                      : decide(m.game, a, s.lg, chooser, s.plan4, s.own_launchers, &s.tg);
     for (auto& c : d.actions) {
         const int k = int(c.kind);
         s.tried[k]++;
@@ -366,6 +375,11 @@ static void play_decision(Slot& s, const Setup& S, bool train) {
         s.samples.push_back(std::move(smp));
         s.recorded = true;
     }
+    if (gate && d.actions.empty()) {                 // gate said no: the builder network decides, same input
+        s.gate = false; s.policy = P_BUILDER;
+        return;                                      // still waiting (need stays true)
+    }
+    s.gate = false;
     s.need = false; s.pos++;
 }
 
@@ -968,6 +982,39 @@ int main(int argc, char** argv) {
                 double a = (x.adv - adv_mean) / (adv_std + 1e-8);
                 if (std::fabs(a) > ADV_CLIP) { adv_clipped++; a = std::clamp(a, -ADV_CLIP, ADV_CLIP); }
                 x.adv = float(a);
+            }
+        }
+        // ---- sentinel gate (P_SENTINEL): its decisions are rare, so its samples are
+        // carried over iterations (inputs copied to the host) until GATE_MIN of them
+        // or GATE_EVERY iterations, then trained together (PPO's clipped ratio
+        // covers their few iterations of staleness)
+        {
+            static std::vector<Sample> carry; static torch::Tensor csp, csc; static int age = 0;
+            static const long GATE_MIN = env_int("GATE_MIN", 256); static const int GATE_EVERY = env_int("GATE_EVERY", 4);
+            std::vector<long> rows; std::vector<Sample> rest;
+            for (auto& x : samples) {
+                if (x.policy == P_SENTINEL && x.row >= 0) { rows.push_back(x.row); carry.push_back(std::move(x)); }
+                else rest.push_back(std::move(x));
+            }
+            samples.swap(rest);
+            if (!rows.empty()) {
+                auto idx = torch::tensor(rows, torch::kLong).to(g_store.sp.device());
+                auto nsp = g_store.sp.index_select(0, idx).to(torch::kCPU), nsc = g_store.sc.index_select(0, idx).to(torch::kCPU);
+                csp = csp.defined() ? torch::cat({csp, nsp}) : nsp; csc = csc.defined() ? torch::cat({csc, nsc}) : nsc;
+            }
+            age++;
+            if (!carry.empty() && (long(carry.size()) >= GATE_MIN || age >= GATE_EVERY)) {
+                const long k = long(carry.size());
+                if (g_store.reserve(g_store.n + k, g_store.sp.device())) {
+                    g_store.sp.narrow(0, g_store.n, k).copy_(csp);
+                    g_store.sc.narrow(0, g_store.n, k).copy_(csc);
+                    for (long j = 0; j < k; j++) { carry[j].row = g_store.n + j; samples.push_back(std::move(carry[j])); }
+                    g_store.n += k;
+                    std::cout << "  gate: training " << k << " sentinel-gate samples (carried " << age << " iterations)" << std::endl;
+                }
+                carry.clear(); csp = torch::Tensor(); csc = torch::Tensor(); age = 0;
+            } else if (!carry.empty()) {
+                std::cout << "  gate: " << carry.size() << " sentinel-gate samples carried (" << age << "/" << GATE_EVERY << " iterations)" << std::endl;
             }
         }
         const auto t_roll = std::chrono::steady_clock::now();
