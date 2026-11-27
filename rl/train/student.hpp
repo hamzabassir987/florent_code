@@ -27,6 +27,11 @@ namespace florent_rl {
 inline const int ST_CH = [] { const char* v = std::getenv("ST_CH"); return v ? std::atoi(v) : 16; }();
 constexpr int ST_HIDDEN = 128, ST_LOGIT_SHIFT = 12;
 constexpr int ST_AMAX = 255;                 // activations and inputs: 0..255
+// the sentinel gate (a separate P_SENTINEL network in the teacher) is merged into
+// the student's builder network as 2 extra logits after the builder heads
+// (0 no, 1 place): one forward per builder turn in the deployed bot
+constexpr int ST_GATE = 2;
+inline int student_logit_count(int p) { return policy_logit_count(p) + (p == P_BUILDER ? ST_GATE : 0); }
 constexpr double ST_WMAX = 127, ST_WSCALE = 32, ST_BSCALE = 1024, ST_BIAS_MAX = 1 << 22;
 // 4 residual blocks x 2 (1x1 -> dw3x3) layers = 8 layers; residual after odd layers
 constexpr int ST_LAYERS = 8, ST_NSHIFT = 2 + 2 * ST_LAYERS, ST_FC_SHIFT = ST_NSHIFT - 1;
@@ -81,7 +86,7 @@ struct StudentActorImpl : torch::nn::Module {
     std::vector<torch::Tensor> pw_w, pw_b, dw_w, dw_b;
     // shifts: stem, then per layer (pw, dw), then fc
     std::vector<int64_t> shifts;
-    explicit StudentActorImpl(int p) : policy(p), nlogits(policy_logit_count(p)) {
+    explicit StudentActorImpl(int p) : policy(p), nlogits(student_logit_count(p)) {
         auto u = [](std::vector<int64_t> shape, double a) { return torch::empty(shape).uniform_(-a, a); };
         stem_w = register_parameter("stem_w", u({ST_CH, fe::ACTOR_CH, 1, 1}, 0.5));
         stem_b = register_parameter("stem_b", torch::zeros({ST_CH}));

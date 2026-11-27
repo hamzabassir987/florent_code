@@ -65,7 +65,12 @@ struct Sample {
 
 // lockstep game state and a waiting unit's inputs (see advance / forward_batch in main)
 struct GameStep { std::vector<int> order; size_t pos = 0; bool in_round = false; int rounds = 0; bool active = true; };
-struct Pend { int a = -1, p = -1; std::vector<float> obs; std::vector<int32_t> q; int8_t plan4[4] = {0, 0, 0, 0}; int own_l = 0; Targets tg; };
+struct Pend { int a = -1, p = -1; std::vector<float> obs; std::vector<int32_t> q; int8_t plan4[4] = {0, 0, 0, 0}; int own_l = 0; Targets tg;
+             bool gate = false; Candidate gb; };   // gate: a builder that can build an aimed sentinel (sentinel_gate)
+// the sentinel gate as a head of the student's builder network: buffers / logs index
+// it after the real heads; its logits sit after the builder heads (student.hpp ST_GATE)
+static constexpr int GATE_H = NUM_HEAD_IDS, NHEADS = NUM_HEAD_IDS + 1;
+static const char* head_name(int h) { return h == GATE_H ? "builder_gate" : HEAD_NAMES[h]; }
 static torch::Device g_dev(torch::kCPU);
 // the teacher sees exactly what neural_train fed it (Match::encode_compact): spatial
 // clamped to 0..255, scalars to int16 (the student quantizes the raw values itself)
@@ -223,6 +228,7 @@ int main(int argc, char** argv) {
                 targets_from_memory(m.memories.at(a), pd.tg);
                 if (!has_choice(m.game, a, pd.plan4, pd.own_l, &pd.tg)) { gs.pos++; continue; }
                 pd.a = a; pd.p = p;
+                pd.gate = p == P_BUILDER && sentinel_gate(m.game, a, pd.plan4, pd.own_l, &pd.tg, pd.gb);
                 const std::vector<int16_t> raw = to_i16(pd.obs);
                 pd.q.resize(raw.size()); quantize_actor(raw.data(), pd.q.data());
                 return true;
@@ -232,7 +238,8 @@ int main(int argc, char** argv) {
     };
     // one batched forward per policy over the waiting games: teacher (raw) and student (quantized)
     auto forward_batch = [&](const std::vector<int>& idx, std::vector<Pend>& pend,
-                             std::vector<std::vector<float>>* TL, std::vector<std::vector<float>>* SL) {
+                             std::vector<std::vector<float>>* TL, std::vector<std::vector<float>>* SL,
+                             std::vector<std::vector<float>>* TG) {
         torch::NoGradGuard ng;
         for (int p = 0; p < NUM_POLICIES; p++) {
             std::vector<int> sub;
@@ -251,9 +258,20 @@ int main(int argc, char** argv) {
             auto tl = teacher->logits(p, rt).to(torch::kCPU).contiguous();
             auto sl = (st->a(p)->forward(qt) / double(1 << ST_LOGIT_SHIFT)).to(torch::kCPU).contiguous();
             const long nl = tl.size(1);
+            const long ns = sl.size(1);
             for (long b = 0; b < n; b++) {
                 (*TL)[sub[b]].assign(tl.data_ptr<float>() + b * nl, tl.data_ptr<float>() + (b + 1) * nl);
-                (*SL)[sub[b]].assign(sl.data_ptr<float>() + b * nl, sl.data_ptr<float>() + (b + 1) * nl);
+                (*SL)[sub[b]].assign(sl.data_ptr<float>() + b * ns, sl.data_ptr<float>() + (b + 1) * ns);
+            }
+            if (p == P_BUILDER) {              // gate rows: the teacher's separate gate network (P_SENTINEL) on the same input
+                std::vector<long> gi;
+                for (long b = 0; b < n; b++) if (pend[sub[b]].gate) gi.push_back(b);
+                if (!gi.empty()) {
+                    auto gl = teacher->logits(P_SENTINEL, rt.index_select(0, torch::tensor(gi, torch::kLong).to(g_dev))).to(torch::kCPU).contiguous();
+                    const long ng = gl.size(1), off = head_offset(P_SENTINEL, HS_MODE);
+                    for (size_t j = 0; j < gi.size(); j++)
+                        (*TG)[sub[gi[j]]].assign(gl.data_ptr<float>() + j * ng + off, gl.data_ptr<float>() + j * ng + off + 2);
+                }
             }
         }
     };
@@ -261,8 +279,8 @@ int main(int argc, char** argv) {
     // per-head replay buffers (DISTILL: every training batch takes K_PER_HEAD records of every head)
     const long BUF_CAP = env_int("BUF_PER_HEAD", 16384);
     const int KH = env_int("K_PER_HEAD", 32), STEPS = env_int("STEPS", 400);
-    std::vector<std::vector<HeadRec>> buf(NUM_HEAD_IDS);
-    std::vector<long> bpos(NUM_HEAD_IDS, 0);
+    std::vector<std::vector<HeadRec>> buf(NHEADS);
+    std::vector<long> bpos(NHEADS, 0);
     std::mt19937 brng(1234);
 
     for (int it = 1; it <= iters; it++) {
@@ -273,7 +291,7 @@ int main(int argc, char** argv) {
         const bool keep_full = (it == 1 && !resumed) || (it == iters && std::getenv("VECTORS"));
         long nsamples = 0;
         long agree = 0, compared = 0;
-        std::vector<long> hagree(NUM_HEAD_IDS, 0), hcomp(NUM_HEAD_IDS, 0);   // per-head greedy agreement
+        std::vector<long> hagree(NHEADS, 0), hcomp(NHEADS, 0);   // per-head greedy agreement
         st->eval();
         {
             // ---- lockstep rollout (as neural_train): every game advances to its next deciding
@@ -284,7 +302,7 @@ int main(int argc, char** argv) {
             std::vector<std::vector<Sample>> gdata(G);
             std::vector<std::vector<std::pair<int, HeadRec>>> ghr(G);   // (head, record) per game
             std::vector<long> gagree(G, 0), gcomp(G, 0), nsamp_g(G, 0);
-            std::vector<std::vector<long>> ghagree(G, std::vector<long>(NUM_HEAD_IDS, 0)), ghcomp(G, std::vector<long>(NUM_HEAD_IDS, 0));
+            std::vector<std::vector<long>> ghagree(G, std::vector<long>(NHEADS, 0)), ghcomp(G, std::vector<long>(NHEADS, 0));
             std::vector<char> need(G, 0);
             for (;;) {
                 #pragma omp parallel for schedule(dynamic, 1)
@@ -292,8 +310,8 @@ int main(int argc, char** argv) {
                 std::vector<int> idx;
                 for (int gi = 0; gi < G; gi++) { if (need[gi]) idx.push_back(gi); else gs[gi].active = false; }
                 if (idx.empty()) break;
-                std::vector<std::vector<float>> TL(G), SL(G);
-                forward_batch(idx, pend, &TL, &SL);
+                std::vector<std::vector<float>> TL(G), SL(G), TG(G);
+                forward_batch(idx, pend, &TL, &SL, &TG);
                 #pragma omp parallel for schedule(dynamic, 1)
                 for (size_t k = 0; k < idx.size(); k++) {
                     const int gi = idx[k];
@@ -302,6 +320,26 @@ int main(int argc, char** argv) {
                     const float* tl = TL[gi].data();
                     const float* sl = SL[gi].data();
                     Sample smp; smp.policy = pd.p; smp.raw = to_i16(pd.obs); smp.q = pd.q;
+                    if (pd.gate) {
+                        // sentinel gate: label = the teacher's gate network; the student's merged head
+                        const float* tg = TG[gi].data();
+                        const float* sg = sl + policy_logit_count(P_BUILDER);
+                        const std::vector<uint8_t> gm = {1, 1};
+                        float lp;
+                        const int tc = argmax_choice(tg, gm, lp), sc = argmax_choice(sg, gm, lp);
+                        ghcomp[gi][GATE_H]++; ghagree[gi][GATE_H] += tc == sc;
+                        const float* GL = teacher_plays ? tg : sg;
+                        const double T = std::max(1e-3, double(gtemp[gi]));
+                        const double w1 = 1.0 / (1.0 + std::exp((double(GL[0]) - double(GL[1])) / T));
+                        const bool place = std::uniform_real_distribution<double>(0, 1)(grng[gi]) < w1;
+                        auto qv = std::make_shared<std::vector<uint8_t>>(pd.q.size());
+                        for (size_t i = 0; i < pd.q.size(); i++) (*qv)[i] = uint8_t(pd.q[i]);
+                        HeadRec hr; hr.policy = P_BUILDER; hr.q = qv; hr.mask = gm; hr.tlog.assign(2, 0.f);
+                        const double mx = std::max(tg[0], tg[1]), z = std::exp(tg[0] - mx) + std::exp(tg[1] - mx);
+                        for (int i = 0; i < 2; i++) hr.tlog[i] = float(double(tg[i]) - mx - std::log(z));
+                        ghr[gi].push_back({GATE_H, std::move(hr)});
+                        if (place) { m.act(pd.a, pd.gb); nsamp_g[gi]++; gs[gi].pos++; continue; }
+                    }
                     // agreement: greedy decode with each model on this exact state
                     Decision dt = decide(m.game, pd.a, tl, greedy(), pd.plan4, pd.own_l, &pd.tg);
                     Decision ds = decide(m.game, pd.a, sl, greedy(), pd.plan4, pd.own_l, &pd.tg);
@@ -350,7 +388,7 @@ int main(int argc, char** argv) {
             }
             for (int gi = 0; gi < G; gi++) {
                 agree += gagree[gi]; compared += gcomp[gi];
-                for (int h = 0; h < NUM_HEAD_IDS; h++) { hagree[h] += ghagree[gi][h]; hcomp[h] += ghcomp[gi][h]; }
+                for (int h = 0; h < NHEADS; h++) { hagree[h] += ghagree[gi][h]; hcomp[h] += ghcomp[gi][h]; }
                 for (auto& x : gdata[gi]) data.push_back(std::move(x));
                 nsamples += nsamp_g[gi];
                 for (auto& [h, rec] : ghr[gi]) {                 // into the per-head buffers (oldest replaced)
@@ -374,14 +412,14 @@ int main(int argc, char** argv) {
         // every head with records; loss = mean over heads of the head's mean KL (heads weigh equally)
         st->train();
         double kl_sum = 0; long kl_n = 0;
-        std::vector<torch::Tensor> hkl(NUM_HEAD_IDS);
-        std::vector<long> hkn(NUM_HEAD_IDS, 0);
+        std::vector<torch::Tensor> hkl(NHEADS);
+        std::vector<long> hkn(NHEADS, 0);
         const long D = long(fe::ACTOR_SPATIAL + fe::ACTOR_SCALARS);
         for (int step = 0; step < STEPS; step++) {
             // sampled (head, record) per policy
             std::vector<std::vector<std::pair<int, const HeadRec*>>> per_p(NUM_POLICIES);
             int heads_present = 0;
-            for (int h = 0; h < NUM_HEAD_IDS; h++) {
+            for (int h = 0; h < NHEADS; h++) {
                 if (buf[h].empty()) continue;
                 heads_present++;
                 std::uniform_int_distribution<long> pick(0, long(buf[h].size()) - 1);
@@ -397,8 +435,12 @@ int main(int argc, char** argv) {
                 for (long b = 0; b < n; b++) std::copy(v[b].second->q->begin(), v[b].second->q->end(), qb.begin() + b * D);
                 auto qt = torch::from_blob(qb.data(), {n, D}, torch::kUInt8).to(g_dev).to(torch::kFloat32);
                 auto sl = st->a(p)->forward(qt) / double(1 << ST_LOGIT_SHIFT);
-                for (int head : policy_heads(p)) {
-                    std::vector<long> rows; std::vector<uint8_t> mk; std::vector<float> tg; const int nh = HEAD_SIZE[head];
+                std::vector<int> heads = policy_heads(p);
+                if (p == P_BUILDER) heads.push_back(GATE_H);
+                for (int head : heads) {
+                    const int nh = head == GATE_H ? ST_GATE : HEAD_SIZE[head];
+                    const long hoff = head == GATE_H ? policy_logit_count(P_BUILDER) : head_offset(p, head);
+                    std::vector<long> rows; std::vector<uint8_t> mk; std::vector<float> tg;
                     for (long b = 0; b < n; b++) if (v[b].first == head) {
                         rows.push_back(b);
                         mk.insert(mk.end(), v[b].second->mask.begin(), v[b].second->mask.end());
@@ -409,7 +451,7 @@ int main(int argc, char** argv) {
                     auto ri = torch::tensor(rows, torch::kLong).to(g_dev);
                     auto mask = torch::from_blob(mk.data(), {k, nh}, torch::kUInt8).to(g_dev).to(torch::kBool);
                     auto tlog = torch::from_blob(tg.data(), {k, nh}, torch::kFloat32).to(g_dev);
-                    auto slog = torch::log_softmax(sl.index_select(0, ri).narrow(1, head_offset(p, head), nh).masked_fill(~mask, -1e9f), 1);
+                    auto slog = torch::log_softmax(sl.index_select(0, ri).narrow(1, hoff, nh).masked_fill(~mask, -1e9f), 1);
                     auto kl = (tlog.exp() * (tlog - slog)).masked_fill(~mask, 0.f).sum(1);    // [k]
                     auto hm = kl.mean();
                     loss = loss + hm / double(heads_present);
@@ -419,13 +461,13 @@ int main(int argc, char** argv) {
             }
             opt.zero_grad(); loss.backward(); opt.step();
         }
-        for (int h = 0; h < NUM_HEAD_IDS; h++) if (hkn[h]) kl_sum += hkl[h].item<double>();
+        for (int h = 0; h < NHEADS; h++) if (hkn[h]) kl_sum += hkl[h].item<double>();
         {   // per head: KL (last epoch pass included) and greedy agreement, heads with records only
             std::ostringstream o;
             o << "  heads:";
-            for (int h = 0; h < NUM_HEAD_IDS; h++) {
+            for (int h = 0; h < NHEADS; h++) {
                 if (!hkn[h] && !hcomp[h]) continue;
-                o << " " << HEAD_NAMES[h] << " kl " << std::fixed << std::setprecision(2)
+                o << " " << head_name(h) << " kl " << std::fixed << std::setprecision(2)
                   << (hkn[h] ? hkl[h].item<double>() / double(hkn[h]) : 0.0)
                   << " agr " << std::setprecision(0) << (hcomp[h] ? 100.0 * hagree[h] / hcomp[h] : 0.0) << "% (" << hcomp[h] << ")";
             }
@@ -458,13 +500,17 @@ int main(int argc, char** argv) {
                 std::vector<int> idx;
                 for (int e = 0; e < EG; e++) { if (need[e]) idx.push_back(e); else gs[e].active = false; }
                 if (idx.empty()) break;
-                std::vector<std::vector<float>> TL(EG), SL(EG);
-                forward_batch(idx, pend, &TL, &SL);
+                std::vector<std::vector<float>> TL(EG), SL(EG), TG(EG);
+                forward_batch(idx, pend, &TL, &SL, &TG);
                 #pragma omp parallel for schedule(dynamic, 1)
                 for (size_t k = 0; k < idx.size(); k++) {
                     const int e = idx[k];
                     Pend& pd = pend[e];
                     const bool stu = ev[e].game.ents[pd.a].team == (e & 1);
+                    if (pd.gate) {                     // greedy gate: the student's merged head / the teacher's gate network
+                        const float* GL = stu ? SL[e].data() + policy_logit_count(P_BUILDER) : TG[e].data();
+                        if (GL[1] > GL[0]) { ev[e].act(pd.a, pd.gb); gs[e].pos++; continue; }
+                    }
                     Decision d = decide(ev[e].game, pd.a, stu ? SL[e].data() : TL[e].data(), greedy(), pd.plan4, pd.own_l, &pd.tg);
                     for (auto& c : d.actions) ev[e].act(pd.a, c);
                     gs[e].pos++;

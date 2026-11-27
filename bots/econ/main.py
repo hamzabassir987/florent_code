@@ -396,7 +396,27 @@ class Player:
         scalars[ROUND_SCALAR] = int(scalars[ROUND_SCALAR] / ROUND_DIV)   # trained on TRAINED_ROUNDS-round games
         raw = spatial + scalars
         t2 = ct.get_cpu_time_elapsed() if PROF is not None else 0
-        actions, _ = HEADS.decide(api, lambda: self.student.logits(p, raw))
+        gate = HEADS.sentinel_gate(api) if typ == HEADS.BUILDER else None
+        if gate is not None:
+            # sentinel gate: the student's merged head (2 logits after the builder heads);
+            # a local float teacher uses its separate gate network (P_SENTINEL)
+            lg = self.student.logits(p, raw)
+            nb = sum(HEADS.HEAD_SIZE[h] for h in HEADS.POLICY_HEADS[HEADS.P_BUILDER])
+            if len(lg) >= nb + 2:
+                gl = lg[nb:nb + 2]
+            elif not isinstance(self.student, StudentPolicy):
+                off = HEADS.head_offset(HEADS.P_SENTINEL, HEADS.HS_MODE)
+                gl = self.student.logits(HEADS.P_SENTINEL, raw)[off:off + 2]
+            else:
+                gl = [1.0, 0.0]                      # an older student has no gate head: no sentinel
+            acts, _ = HEADS.decide_gate(gl, gate)
+            if acts:
+                HEADS.apply(api, acts[0])
+                self.learned_turns += 1
+                return True
+            actions, _ = HEADS.decide(api, lg)
+        else:
+            actions, _ = HEADS.decide(api, lambda: self.student.logits(p, raw))
         if PROF is not None:
             t3 = ct.get_cpu_time_elapsed()
             for k, v in (("pre", t0), ("encode", t1 - t0), ("masks", t2 - t1), ("decide+forward", t3 - t2), ("total", t3)):

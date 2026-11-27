@@ -48,7 +48,8 @@ struct Obs { std::vector<uint8_t> sp; std::vector<int16_t> sc; };
 struct HeadRec { int policy = 0; std::shared_ptr<const Obs> obs; std::vector<uint8_t> mask; std::vector<float> tlog; };
 struct CriticRec { std::vector<uint8_t> sp; std::vector<int32_t> sc; float v = 0; };
 struct GameStep { std::vector<int> order; size_t pos = 0; bool in_round = false; int rounds = 0; bool active = true; };
-struct Pend { int a = -1, p = -1; std::vector<float> obs; int8_t plan4[4] = {0, 0, 0, 0}; int own_l = 0; Targets tg; };
+struct Pend { int a = -1, p = -1; std::vector<float> obs; int8_t plan4[4] = {0, 0, 0, 0}; int own_l = 0; Targets tg;
+             bool gate = false; Candidate gb; };   // gate: a builder that can build an aimed sentinel (sentinel_gate)
 
 static std::shared_ptr<Obs> compact(const std::vector<float>& v) {
     auto o = std::make_shared<Obs>();
@@ -177,6 +178,7 @@ int main(int argc, char** argv) {
                 targets_from_memory(m.memories.at(a), pd.tg);
                 if (!has_choice(m.game, a, pd.plan4, pd.own_l, &pd.tg)) { gs.pos++; continue; }
                 pd.a = a; pd.p = p;
+                pd.gate = p == P_BUILDER && sentinel_gate(m.game, a, pd.plan4, pd.own_l, &pd.tg, pd.gb);
                 return true;
             }
             m.game.end_round(); gs.in_round = false; gs.rounds++;
@@ -184,7 +186,8 @@ int main(int argc, char** argv) {
     };
     // batched forwards per policy: old (labels) and new logits on the same compact inputs
     auto forward_batch = [&](const std::vector<int>& idx, std::vector<Pend>& pend, std::vector<std::shared_ptr<Obs>>& ob,
-                             std::vector<std::vector<float>>& OL, std::vector<std::vector<float>>& NL) {
+                             std::vector<std::vector<float>>& OL, std::vector<std::vector<float>>& NL,
+                             std::vector<std::vector<float>>& OG, std::vector<std::vector<float>>& NG) {
         torch::NoGradGuard ng;
         for (int p = 0; p < NUM_POLICIES; p++) {
             std::vector<int> sub; std::vector<const Obs*> rows;
@@ -197,6 +200,20 @@ int main(int argc, char** argv) {
             for (size_t b = 0; b < sub.size(); b++) {
                 OL[sub[b]].assign(ol.data_ptr<float>() + b * k, ol.data_ptr<float>() + (b + 1) * k);
                 NL[sub[b]].assign(nl.data_ptr<float>() + b * k, nl.data_ptr<float>() + (b + 1) * k);
+            }
+            if (p == P_BUILDER) {              // gate rows: both gate networks (P_SENTINEL) on the builder's input
+                std::vector<long> gi;
+                for (size_t b = 0; b < sub.size(); b++) if (pend[sub[b]].gate) gi.push_back(long(b));
+                if (!gi.empty()) {
+                    auto gr = rt.index_select(0, torch::tensor(gi, torch::kLong).to(g_dev));
+                    auto og = old_t->logits(P_SENTINEL, gr).to(torch::kCPU).contiguous();
+                    auto ng = net->logits(P_SENTINEL, gr).to(torch::kCPU).contiguous();
+                    const long w = og.size(1);
+                    for (size_t j = 0; j < gi.size(); j++) {
+                        OG[sub[gi[j]]].assign(og.data_ptr<float>() + j * w, og.data_ptr<float>() + (j + 1) * w);
+                        NG[sub[gi[j]]].assign(ng.data_ptr<float>() + j * w, ng.data_ptr<float>() + (j + 1) * w);
+                    }
+                }
             }
         }
     };
@@ -226,6 +243,7 @@ int main(int argc, char** argv) {
             std::vector<long> gagree(G, 0), gcomp(G, 0), nsamp(G, 0);
             std::vector<std::vector<long>> gha(G, std::vector<long>(NUM_HEAD_IDS, 0)), ghc(G, std::vector<long>(NUM_HEAD_IDS, 0));
             std::vector<char> need(G, 0);
+            std::vector<long> gplaced(G, 0);
             for (;;) {
                 #pragma omp parallel for schedule(dynamic, 1)
                 for (int gi = 0; gi < G; gi++) {
@@ -235,8 +253,8 @@ int main(int argc, char** argv) {
                 std::vector<int> idx;
                 for (int gi = 0; gi < G; gi++) { if (need[gi]) idx.push_back(gi); else gs[gi].active = false; }
                 if (idx.empty()) break;
-                std::vector<std::vector<float>> OL(G), NL(G);
-                forward_batch(idx, pend, ob, OL, NL);
+                std::vector<std::vector<float>> OL(G), NL(G), OG(G), NG(G);
+                forward_batch(idx, pend, ob, OL, NL, OG, NG);
                 #pragma omp parallel for schedule(dynamic, 1)
                 for (size_t k = 0; k < idx.size(); k++) {
                     const int gi = idx[k];
@@ -244,6 +262,22 @@ int main(int argc, char** argv) {
                     Pend& pd = pend[gi];
                     const float* ol = OL[gi].data();
                     const float* nl = NL[gi].data();
+                    if (pd.gate) {
+                        // sentinel gate: label = the old gate network's (smoothed) distribution, for the new gate network
+                        const int off = head_offset(P_SENTINEL, HS_MODE);
+                        const float* og = OG[gi].data() + off;
+                        const float* ng = NG[gi].data() + off;
+                        const std::vector<uint8_t> gm = {1, 1};
+                        ghc[gi][HS_MODE]++; gha[gi][HS_MODE] += (og[1] > og[0]) == (ng[1] > ng[0]);
+                        const float* GL = old_plays ? og : ng;
+                        const double T = std::max(1e-3, double(gtemp[gi]));
+                        const double w1 = 1.0 / (1.0 + std::exp((double(GL[0]) - double(GL[1])) / T));
+                        const bool place = std::uniform_real_distribution<double>(0, 1)(grng[gi]) < w1;
+                        HeadRec hr; hr.policy = P_SENTINEL; hr.obs = ob[gi]; hr.mask = gm;
+                        hr.tlog = smoothed_label(og, gm, CAP);
+                        ghr[gi].push_back({HS_MODE, std::move(hr)});
+                        if (place) { m.act(pd.a, pd.gb); gplaced[gi]++; nsamp[gi]++; gs[gi].pos++; continue; }
+                    }
                     Decision dt = decide(m.game, pd.a, ol, greedy(), pd.plan4, pd.own_l, &pd.tg);
                     Decision ds = decide(m.game, pd.a, nl, greedy(), pd.plan4, pd.own_l, &pd.tg);
                     gcomp[gi]++;
@@ -412,13 +446,17 @@ int main(int argc, char** argv) {
                 std::vector<int> idx;
                 for (int e = 0; e < EG; e++) { if (need[e]) idx.push_back(e); else gs[e].active = false; }
                 if (idx.empty()) break;
-                std::vector<std::vector<float>> OL(EG), NL(EG);
-                forward_batch(idx, pend, ob, OL, NL);
+                std::vector<std::vector<float>> OL(EG), NL(EG), OG(EG), NG(EG);
+                forward_batch(idx, pend, ob, OL, NL, OG, NG);
                 #pragma omp parallel for schedule(dynamic, 1)
                 for (size_t k = 0; k < idx.size(); k++) {
                     const int e = idx[k];
                     Pend& pd = pend[e];
                     const bool mine = ev[e].game.ents[pd.a].team == (e & 1);
+                    if (pd.gate) {                     // greedy gate, each side its own gate network
+                        const float* GL = (mine ? NG[e].data() : OG[e].data()) + head_offset(P_SENTINEL, HS_MODE);
+                        if (GL[1] > GL[0]) { ev[e].act(pd.a, pd.gb); gs[e].pos++; continue; }
+                    }
                     Decision d = decide(ev[e].game, pd.a, mine ? NL[e].data() : OL[e].data(), greedy(), pd.plan4, pd.own_l, &pd.tg);
                     for (auto& c : d.actions) ev[e].act(pd.a, c);
                     gs[e].pos++;
