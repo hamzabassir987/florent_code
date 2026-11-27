@@ -131,11 +131,19 @@ def _builder_opts(api):
     tiles = [(p.x + DXY[d][0], p.y + DXY[d][1]) for d in CARD4]
     move = [int(api.call("can_move", api.D[d])) for d in CARD4]
     attack, heal, destroy = [], [], []
+    ct = api.ct
     build = [[[0] * 8 for _ in range(4)] for _ in range(9)]
     for i, (x, y) in enumerate(tiles):
         inb = api.inb(x, y)
         q = api.P(x, y)
-        attack.append(int(inb and _enemy_building_on(api, x, y) and api.call("can_fire", q)))
+        # hidden enemy mine: no building visible to us, yet can_fire is True (the
+        # official can_fire only needs a building on the tile; checked in fcode).
+        # Probed before acting (can_fire needs a builder that can still act and 2 Ti).
+        can_hit = inb and api.call("can_fire", q)
+        hidden_mine = can_hit and _safe(lambda: ct.get_tile_building_id(q)) is None
+        if hidden_mine:
+            move[i] = 0                          # never step on it
+        attack.append(int(can_hit and (hidden_mine or _enemy_building_on(api, x, y))))
         heal.append(int(inb and api.call("can_heal", q)))
         destroy.append(int(inb and api.call("can_destroy", q)))
         if not inb:

@@ -104,9 +104,14 @@ static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* pla
     const Entity& e = g.ents[a];
     for (int i = 0; i < 4; i++) {
         o.tx[i] = e.x + DX[CARD4[i]]; o.ty[i] = e.y + DY[CARD4[i]];
-        o.move[i] = g.can_move(a, CARD4[i]) == OK;
         bool in = g.inb(o.tx[i], o.ty[i]);
-        o.attack[i] = in && enemy_building_on(g, a, o.tx[i], o.ty[i]) && g.can_attack(a, o.tx[i], o.ty[i]) == OK;
+        // hidden enemy mine: no building visible to us, yet an attack there is legal
+        // (the official can_fire only needs a building on the tile; checked in fcode).
+        // Probed before acting (can_attack needs a builder that can still act and 2 Ti).
+        const bool can_hit = in && g.can_attack(a, o.tx[i], o.ty[i]) == OK;
+        const bool hidden_mine = can_hit && g.tile_building(a, o.tx[i], o.ty[i]) < 0;
+        o.move[i] = g.can_move(a, CARD4[i]) == OK && !hidden_mine;     // never step on it
+        o.attack[i] = can_hit && (hidden_mine || enemy_building_on(g, a, o.tx[i], o.ty[i]));
         o.heal[i] = in && g.can_heal(a, o.tx[i], o.ty[i]) == OK;
         o.destroy[i] = in && g.can_destroy(a, o.tx[i], o.ty[i]) == OK;
         for (int t = 0; t < 9; t++) {
