@@ -985,12 +985,14 @@ int main(int argc, char** argv) {
             }
         }
         // ---- sentinel gate (P_SENTINEL): its decisions are rare, so its samples are
-        // carried over iterations (inputs copied to the host) until GATE_MIN of them
-        // or GATE_EVERY iterations, then trained together (PPO's clipped ratio
-        // covers their few iterations of staleness)
+        // carried over iterations (inputs copied to the host) until GATE_MB (800) of
+        // them, then the gate gets its OWN PPO update (after the main one) in
+        // minibatches of GATE_MB. The gate network changes only in that update, so
+        // carried samples stay exactly on-policy however long they wait.
+        std::vector<Sample> gate_batch; torch::Tensor gate_sp, gate_sc;
+        static const long GATE_MB = env_int("GATE_MB", 800);
         {
             static std::vector<Sample> carry; static torch::Tensor csp, csc; static int age = 0;
-            static const long GATE_MIN = env_int("GATE_MIN", 256); static const int GATE_EVERY = env_int("GATE_EVERY", 4);
             std::vector<long> rows; std::vector<Sample> rest;
             for (auto& x : samples) {
                 if (x.policy == P_SENTINEL && x.row >= 0) { rows.push_back(x.row); carry.push_back(std::move(x)); }
@@ -1003,18 +1005,12 @@ int main(int argc, char** argv) {
                 csp = csp.defined() ? torch::cat({csp, nsp}) : nsp; csc = csc.defined() ? torch::cat({csc, nsc}) : nsc;
             }
             age++;
-            if (!carry.empty() && (long(carry.size()) >= GATE_MIN || age >= GATE_EVERY)) {
-                const long k = long(carry.size());
-                if (g_store.reserve(g_store.n + k, g_store.sp.device())) {
-                    g_store.sp.narrow(0, g_store.n, k).copy_(csp);
-                    g_store.sc.narrow(0, g_store.n, k).copy_(csc);
-                    for (long j = 0; j < k; j++) { carry[j].row = g_store.n + j; samples.push_back(std::move(carry[j])); }
-                    g_store.n += k;
-                    std::cout << "  gate: training " << k << " sentinel-gate samples (carried " << age << " iterations)" << std::endl;
-                }
+            if (long(carry.size()) >= GATE_MB) {
+                gate_batch.swap(carry); gate_sp = csp; gate_sc = csc;
+                std::cout << "  gate: training " << gate_batch.size() << " sentinel-gate samples (collected over " << age << " iterations)" << std::endl;
                 carry.clear(); csp = torch::Tensor(); csc = torch::Tensor(); age = 0;
             } else if (!carry.empty()) {
-                std::cout << "  gate: " << carry.size() << " sentinel-gate samples carried (" << age << "/" << GATE_EVERY << " iterations)" << std::endl;
+                std::cout << "  gate: " << carry.size() << "/" << GATE_MB << " sentinel-gate samples collected (" << age << " iterations)" << std::endl;
             }
         }
         const auto t_roll = std::chrono::steady_clock::now();
@@ -1262,6 +1258,56 @@ int main(int argc, char** argv) {
                 t_pol += std::chrono::duration<double>(tq1 - tq0).count();
                 t_val += std::chrono::duration<double>(tq2 - tq1).count();
             }
+        }
+        // ---- the sentinel gate's own PPO update: minibatches of GATE_MB, the same
+        // clipped surrogate and epochs, entropy weight from the entropy file
+        // (sentinel_mode), its own Adam on the gate network only
+        if (!gate_batch.empty()) {
+            static std::unique_ptr<torch::optim::Adam> gopt;
+            auto gate_params = net->actors[P_SENTINEL]->parameters();
+            if (!gopt) gopt = std::make_unique<torch::optim::Adam>(gate_params, torch::optim::AdamOptions(K.lr));
+            for (auto& g : gopt->param_groups()) static_cast<torch::optim::AdamOptions&>(g.options()).lr(K.lr);
+            const long n = long(gate_batch.size());
+            std::vector<long> ch(n); std::vector<float> olp(n), adv(n);
+            for (long i = 0; i < n; i++) {
+                const Rec& rc = gate_batch[i].recs[0];
+                ch[i] = rc.choice; olp[i] = rc.old_logp; adv[i] = gate_batch[i].adv;
+            }
+            auto GSP = gate_sp.to(dev), GSC = gate_sc.to(dev);
+            auto GCH = torch::tensor(ch, torch::kLong).to(dev), GOLP = torch::tensor(olp).to(dev), GADV = torch::tensor(adv).to(dev);
+            std::vector<long> ord(n); std::iota(ord.begin(), ord.end(), 0);
+            std::mt19937 gshuf(uint32_t(it) * 40503u + 7u);
+            double gsurr = 0, gent = 0, gkl = 0; long gsteps = 0;
+            const double coef = K.head_entropy[HS_MODE];
+            for (int ep = 0; ep < EPOCHS; ep++) {
+                std::shuffle(ord.begin(), ord.end(), gshuf);
+                for (long b0 = 0; b0 < n; b0 += GATE_MB) {
+                    const long b1 = std::min(n, b0 + GATE_MB);
+                    auto ix = torch::tensor(std::vector<long>(ord.begin() + b0, ord.begin() + b1), torch::kLong).to(dev);
+                    auto lg = net->logits_split(P_SENTINEL, GSP.index_select(0, ix), GSC.index_select(0, ix))
+                                  .narrow(1, head_offset(P_SENTINEL, HS_MODE), 2);
+                    auto lsm = torch::log_softmax(lg, 1);
+                    auto new_lp = lsm.gather(1, GCH.index_select(0, ix).view({-1, 1})).squeeze(1);
+                    auto log_ratio = new_lp - GOLP.index_select(0, ix);
+                    auto ratio = torch::exp(log_ratio);
+                    auto A = GADV.index_select(0, ix);
+                    auto surr = torch::min(ratio * A, torch::clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * A).mean();
+                    auto H = -(lsm.exp() * lsm).sum(1).mean();
+                    auto loss = -surr - coef * H;
+                    gopt->zero_grad();
+                    loss.backward();
+                    torch::nn::utils::clip_grad_norm_(gate_params, CLIP_POL);
+                    gopt->step();
+                    gsurr += surr.item<double>(); gent += H.item<double>();
+                    gkl += ((ratio - 1) - log_ratio).mean().item<double>(); gsteps++;
+                }
+            }
+            torch::NoGradGuard ng;
+            auto pl = torch::softmax(net->logits_split(P_SENTINEL, GSP, GSC).narrow(1, head_offset(P_SENTINEL, HS_MODE), 2), 1);
+            std::cout << "  gate: update " << gsteps << " steps x " << GATE_MB << ": surrogate " << gsurr / std::max(1L, gsteps)
+                      << "  entropy " << gent / std::max(1L, gsteps) << "  kl " << gkl / std::max(1L, gsteps)
+                      << "  P(place) now " << pl.select(1, 1).mean().item<double>() << " (placed in the batch: "
+                      << std::count(ch.begin(), ch.end(), 1L) << "/" << n << ")" << std::endl;
         }
         const auto t_upd = std::chrono::steady_clock::now();
         const double s_roll = std::chrono::duration<double>(t_roll - t_start).count();
