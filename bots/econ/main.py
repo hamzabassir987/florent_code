@@ -88,6 +88,8 @@ OFFICIAL_ROUNDS, TRAINED_ROUNDS = 1000, 400
 ROUND_DIV = float(os.environ.get("FLORENT_ROUND_DIV", str(OFFICIAL_ROUNDS / TRAINED_ROUNDS)))   # 2.5
 ROUND_SCALAR = 9                     # actor scalar index of the current round (encoder)
 _STATUS_SHOWN = False
+ANTI_STUCK = int(os.environ.get("FLORENT_ANTI_STUCK", "2"))   # 0: off
+_OPPOSITE = {1: 5, 5: 1, 3: 7, 7: 3, 2: 6, 6: 2, 4: 8, 8: 4}
 PROF = {} if os.environ.get("FLORENT_PROF") == "1" else None   # per-phase CPU (local profiling)
 VERBOSE = os.environ.get("FLORENT_VERBOSE") == "1"   # per-turn prints (local debugging only)
 
@@ -226,6 +228,8 @@ def unpack_report(v):
 class Player:
     def __init__(self):
         self.init = False
+        self.last_move = -1      # anti-stuck: this builder's last move direction (Dir code)
+        self.reversals = 0       # consecutive moves that undid the previous one
         # core
         self.spawned = 0
         # builder
@@ -376,6 +380,14 @@ class Player:
         mem = self.actor_encoder.memories[ct.get_id()]
         api.own_launchers = mem.own_count(HEADS.LAUNCHER)   # launcher cap
         api.targets = mem.targets()                         # turret direction / convert masks
+        if typ == HEADS.BUILDER and ANTI_STUCK and self.reversals >= ANTI_STUCK and self.last_move > 0:
+            # greedy anti-stuck: after N back-and-forth moves, the move undoing the
+            # last one is not allowed this turn (the network takes its next best)
+            move = HEADS.builder_opts(api)[0]
+            back = _OPPOSITE[self.last_move]
+            for i, d in enumerate(HEADS.CARD4):
+                if d == back:
+                    move[i] = 0
         if not HEADS.has_choice(api):
             return True                              # only "wait" is legal: no forward
         # no CPU start limit: the forward always runs (a turn that overruns 10 ms is cut
@@ -394,6 +406,10 @@ class Player:
                     a = sorted(PROF[key])
                     print("PROF", key, "n", len(a), "median", a[len(a) // 2], "p90", a[int(len(a) * .9)], file=sys.stderr)
         for a in actions:
+            if a[0] == "move":
+                d = a[1]
+                self.reversals = self.reversals + 1 if self.last_move > 0 and d == _OPPOSITE[self.last_move] else 0
+                self.last_move = d
             HEADS.apply(api, a)
             if a[0] == "spawn":                     # team bus: the core's next report carries the spawn bit
                 self.actor_encoder.memories[ct.get_id()].spawned_now = True
