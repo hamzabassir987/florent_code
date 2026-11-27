@@ -18,7 +18,8 @@ CH_DIR, CH_HP, CH_THREAT, CH_RAY = 9, 2, 4, 11
 CH_PATH = 1   # builders only: planned conveyor cell, value = conveyor direction (Dir 1..8), 0 none
 CH_HIT = 1    # rounds since a unit / building on the tile was seen losing HP, cap HIT_CAP (= never)
 HIT_CAP = 10
-ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH + CH_HIT
+CH_MINE = 1   # known hidden enemy mine (detected by a builder's attack probe, or reported): 1
+ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH + CH_HIT + CH_MINE
 ACTOR_SPATIAL = ACTOR_CH * PATCH * PATCH
 ACTOR_SCALARS = 50
 ACTOR_COSTS = 40   # 40..49: current prices (conveyor, splitter, harvester, barrier, gunner,
@@ -36,6 +37,7 @@ C_THREAT = C_HP + CH_HP
 C_RAY = C_THREAT + CH_THREAT
 C_PATH = C_RAY + CH_RAY
 C_HIT = C_PATH + CH_PATH
+C_MINE = C_HIT + CH_HIT
 _NXY = ((0, -1), (1, 0), (0, 1), (-1, 0))   # N, E, S, W
 _NDIR = (1, 3, 5, 7)                        # engine Dir codes of N, E, S, W
 
@@ -65,6 +67,7 @@ SLOT_GROUP = [g for g in range(5) for _ in range(BUS_SIZE[g])]
 W_MARK, W_SPAWN, W_ALARM, W_REMOVE = 1 << 31, 1 << 30, 1 << 27, 1 << 14
 TAG_CORE = 63
 EATK_TYPES = (CORE, GUNNER, SENTINEL, LAUNCHER, SPIKE)
+EATK_MINE_CODE = 5   # G_EATK code 5: a known hidden enemy mine (ObsMemory.emine)
 MINE_TYPES = (LAUNCHER, SPIKE, GUNNER, SENTINEL, MINE, HARVESTER)
 REFRESH, REFRESH_FACTS, REFRESH_GATE = 4, 16, 4
 SPAWN_COOLDOWN, QUIET_AFTER, QUIET_ROUNDS, ENEMY_BOT_TTL = 4, 40, 4, 10
@@ -106,6 +109,7 @@ class ObsMemory:
         self.stood = [0] * n
         self.visit_round = [-1] * n
         self.hit_round = [-1] * n
+        self.emine = [0] * n   # known hidden enemy mines (as ObsMemory::emine in C++)
         self.attr_seen_round = [-1] * n
         self.bus_q = [[] for _ in range(5)]
         self.snap, self.snap_ore = set(), [0] * n
@@ -289,6 +293,9 @@ class ObsMemory:
             else:
                 eatk = grp == G_EATK
                 code = (v >> 11) & 7
+                if eatk and code == EATK_MINE_CODE:   # a reported hidden mine
+                    self.emine[t] = 0 if v & W_REMOVE else 1
+                    continue
                 if code >= (5 if eatk else 6):
                     continue
                 typ = (EATK_TYPES if eatk else MINE_TYPES)[code]
@@ -310,7 +317,7 @@ class ObsMemory:
                 self._clear_bot(t)
             self.rep_bot_tile[idx] = -1
 
-    def _bus_after_update(self, ad, rnd, gone_eatk, gone_mine, enemy_bots, enemy_near):
+    def _bus_after_update(self, ad, rnd, gone_eatk, gone_mine, enemy_bots, enemy_near, gone_emine=()):
         W, n, team = self.W, self.W * self.H, self.team
         enemy = 1 - team
         typ, hp = ad.actor_state()[:2]
@@ -357,6 +364,10 @@ class ObsMemory:
                 key = t | ((1 << 11) if ter == T_ORE_VO else 0)
                 want(G_ORE, key, key, False)
                 keep[G_ORE].add(key)
+            if self.emine[t]:
+                key = t | (EATK_MINE_CODE << 11)
+                want(G_EATK, key, key, False)
+                keep[G_EATK].add(key)
             if bid[t] < 0:
                 continue
             if btm[t] == enemy:
@@ -371,6 +382,10 @@ class ObsMemory:
                     keep[G_MINE].add(key)
         for t, c in gone_eatk:
             key = t | (c << 11) | W_REMOVE
+            want(G_EATK, key, key, True)
+            keep[G_EATK].add(key)
+        for t in gone_emine:
+            key = t | (EATK_MINE_CODE << 11) | W_REMOVE
             want(G_EATK, key, key, True)
             keep[G_EATK].add(key)
         for t, c in gone_mine:
@@ -498,8 +513,31 @@ class ObsMemory:
                         gone_eatk.append((t, EATK_TYPES.index(old_type)))
                     if old_team == team and old_type in MINE_TYPES:
                         gone_mine.append((t, MINE_TYPES.index(old_type)))
+        # hidden enemy mines: the attack probe (as in C++, see emine in obs.hpp); a
+        # visible building or our own builder on a tile means no hidden mine there
+        gone_emine = []
+        typ, _, _, acd, _ = ad.actor_state()
+        if typ == BUILDER and acd == 0 and ad.team_resources(team)[0] >= 2:
+            ax, ay = ad.actor_pos()
+            for dx, dy in _NXY:
+                x, y = ax + dx, ay + dy
+                if not (0 <= x < W and 0 <= y < self.H):
+                    continue
+                t = y * W + x
+                if ad.building_id(x, y) is not None:
+                    continue
+                if ad.can_attack(x, y):
+                    self.emine[t] = 1
+                elif self.emine[t]:
+                    self.emine[t] = 0
+                    gone_emine.append(t)
+        for x, y in ad.visible_tiles():
+            t = y * W + x
+            if self.emine[t] and (self.bld_id[t] >= 0 or (self.bot_id[t] >= 0 and self.bot_team[t] == team)):
+                self.emine[t] = 0
+                gone_emine.append(t)
         self.resolve_symmetry()
-        self._bus_after_update(ad, r, gone_eatk, gone_mine, enemy_bots, enemy_near)
+        self._bus_after_update(ad, r, gone_eatk, gone_mine, enemy_bots, enemy_near, gone_emine)
 
     def plan_paths(self):
         """Conveyor planner, identical to ObsMemory::plan_paths (engine/src/obs.cpp):
@@ -623,6 +661,7 @@ class ObsMemory:
                 ch[C_VISIT * cs + cell] = 255 if vr < 0 else min(255, rnd - vr)
                 hr = self.hit_round[t]
                 ch[C_HIT * cs + cell] = HIT_CAP if hr < 0 else min(HIT_CAP, rnd - hr)
+                ch[C_MINE * cs + cell] = self.emine[t]
                 if b >= 0:
                     d = self.bld_dir[t]
                     if 0 <= d < CH_DIR:
@@ -877,6 +916,14 @@ class ControllerAdapter:
 
     def store(self, i):
         return self.ct.read_store(i)
+
+    def can_attack(self, x, y):
+        """Builder attack probe (official can_fire: needs a building, hidden enemy mines included)."""
+        from fcode import Position
+        try:
+            return bool(self.ct.can_fire(Position(x, y)))
+        except Exception:
+            return False
 
 
 class ActorEncoder:

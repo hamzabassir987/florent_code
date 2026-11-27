@@ -106,3 +106,17 @@ identical in `bots/econ/encoder.py`. Lets the network infer recent fire, e.g.
 an enemy spike that just shot (4-round cooldown). Old 60-channel checkpoints:
 `widen_input OLD.pt NEW.pt` (rl/tools/widen_input.cpp) copies every weight and
 gives the new channel zero weights, so the converted net decides as before.
+
+## Mine channel (C_MINE, channel 61; ACTOR_CH 62)
+
+Known hidden enemy mines, 1 on the tile. A builder that can still act (action
+cooldown 0, team Ti >= 2) probes its 4 orthogonal neighbours at the start of its
+turn: an attack is legal on a tile with no visible building only if a hidden
+enemy mine is there (the official `can_fire` only needs a building; checked in
+fcode). A failed probe there, a visible building or our own builder on the tile
+clears it. Known mines are shared on the team bus in G_EATK with code 5 (removal
+with W_REMOVE). Same in engine/src/obs.cpp and bots/econ/encoder.py
+(engine/tools/obs_parity.py counts encodings showing a mine). The student
+quantizes it as a one-hot (255). A 61-channel checkpoint is converted with
+`widen_input OLD.pt NEW.pt` (zero weights for the new channel: same decisions);
+a 61-channel student.json still runs (the bot drops the last channel).

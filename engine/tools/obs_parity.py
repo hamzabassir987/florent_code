@@ -133,6 +133,10 @@ class EngineAdapter:
         o = team(self.L, self.g, t)
         return o[0], o[1], o[2], o[5], o[6]
 
+    def can_attack(self, x, y):
+        """Builder attack probe (as the official can_fire: hidden enemy mines included)."""
+        return self.L.fe_can_attack(self.g, self.actor, x, y) == 0
+
     # engine BASE_COST (conveyor, splitter, harvester, barrier, gunner, sentinel,
     # launcher, spike, mine, builder bot) x team scale / 100
     _BASE = (3, 6, 20, 3, 20, 30, 20, 20, 6, 30)
@@ -280,6 +284,9 @@ def run_game(L, map_path, seed, rounds, rng, stats):
                 hb = E.C_HIT * E.PATCH * E.PATCH
                 if any(0 < 1 + v < 1 + E.HIT_CAP for v in pch[hb:hb + E.PATCH * E.PATCH] if v < E.HIT_CAP):
                     stats["hit_encodings"] = stats.get("hit_encodings", 0) + 1
+                mb = E.C_MINE * E.PATCH * E.PATCH
+                if any(pch[mb:mb + E.PATCH * E.PATCH]):
+                    stats["mine_encodings"] = stats.get("mine_encodings", 0) + 1
                 if bad:
                     stats["bad"] += bad
                 if play_unit(L, g, a, typ, rng, W, H) is True:
@@ -550,6 +557,7 @@ def main():
     print(f"visit-history checks: {stats['visit_checks']}")
     print(f"encodings with a planned conveyor path: {stats.get('path_encodings', 0)}")
     print(f"encodings showing a recent hit (C_HIT < {E.HIT_CAP}): {stats.get('hit_encodings', 0)}")
+    print(f"encodings showing a known hidden enemy mine (C_MINE): {stats.get('mine_encodings', 0)}")
     print(f"team reports posted: {stats.get('reports', 0)} (with the spawn bit: {stats.get('spawn_bits', 0)})")
     print(f"unit turns with the map symmetry resolved: {stats.get('sym_known', 0)} of {stats['units']}")
     print(f"turret/core reach checks: {stats['turret_core_checks']}")

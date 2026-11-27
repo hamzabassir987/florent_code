@@ -12,6 +12,7 @@ void ObsMemory::init(const Game& g, int team_) {
     team = team_;
     size_t n = size_t(W) * H;
     terrain.assign(n, T_UNKNOWN);
+    emine.assign(n, 0);
     bld_id.assign(n, -1);
     bld_type.assign(n, -1);
     bld_team.assign(n, -1);
@@ -59,6 +60,7 @@ BusConfig g_bus;
 static constexpr uint32_t W_MARK = 1u << 31, W_SPAWN = 1u << 30, W_ALARM = 1u << 27, W_REMOVE = 1u << 14;
 static constexpr int TAG_CORE = 63;
 static const int EATK_TYPES[5] = {CORE, GUNNER, SENTINEL, LAUNCHER, SPIKE};
+static const int EATK_MINE_CODE = 5;   // G_EATK code 5: a known hidden enemy mine (ObsMemory::emine)
 static const int MINE_TYPES[6] = {LAUNCHER, SPIKE, GUNNER, SENTINEL, MINE, HARVESTER};
 static int code_of(const int* types, int n, int type) { for (int i = 0; i < n; i++) if (types[i] == type) return i; return -1; }
 static uint32_t content(uint32_t w) { return w & ~(W_MARK | W_SPAWN | (3u << 28)); }
@@ -215,6 +217,7 @@ void ObsMemory::merge_store(const int64_t* store, int round) {
         } else {
             const bool eatk = grp == G_EATK;
             const int code = (w >> 11) & 7;
+            if (eatk && code == EATK_MINE_CODE) { emine[t] = (w & W_REMOVE) ? 0 : 1; continue; }   // a reported hidden mine
             if (code >= (eatk ? 5 : 6)) continue;
             const int type = eatk ? EATK_TYPES[code] : MINE_TYPES[code], owner = eatk ? enemy : team;
             if (w & W_REMOVE) {
@@ -308,6 +311,22 @@ void ObsMemory::update(const Game& g, int actor) {
             }
         }
     }
+    // hidden enemy mines: the attack probe (see emine in obs.hpp); a visible
+    // building or our own builder on a tile means no hidden mine is there
+    std::vector<int> gone_emine;
+    if (me.type == BUILDER && me.acd == 0 && !me.moved && !me.acted && g.teams[team].ti >= 2) {
+        static const int PX[4] = {0, 1, 0, -1}, PY[4] = {-1, 0, 1, 0};   // N E S W
+        for (int k = 0; k < 4; k++) {
+            const int x = me.x + PX[k], y = me.y + PY[k];
+            if (!g.inb(x, y)) continue;
+            const int t = y * W + x;
+            if (g.tile_building(actor, x, y) >= 0) continue;
+            if (g.can_attack(actor, x, y) == OK) emine[t] = 1;
+            else if (emine[t]) { emine[t] = 0; gone_emine.push_back(t); }
+        }
+    }
+    for (int t : tiles)
+        if (emine[t] && (bld_id[t] >= 0 || (bot_id[t] >= 0 && bot_team[t] == team))) { emine[t] = 0; gone_emine.push_back(t); }
     resolve_symmetry();
     // the core's status: under attack when its HP dropped or an enemy is in view
     if (me.type == CORE) {
@@ -361,6 +380,7 @@ void ObsMemory::update(const Game& g, int actor) {
             const uint32_t key = uint32_t(t) | (terrain[t] == T_ORE_VO ? 1u << 11 : 0u);
             want(G_ORE, key, key, false); keep[G_ORE].insert(key);
         }
+        if (emine[t]) { const uint32_t key = uint32_t(t) | uint32_t(EATK_MINE_CODE) << 11; want(G_EATK, key, key, false); keep[G_EATK].insert(key); }
         if (bld_id[t] < 0) continue;
         if (bld_team[t] == enemy) {
             const int c = code_of(EATK_TYPES, 5, bld_type[t]);
@@ -371,6 +391,7 @@ void ObsMemory::update(const Game& g, int actor) {
         }
     }
     for (auto& [t, c] : gone_eatk) { const uint32_t key = uint32_t(t) | uint32_t(c) << 11 | W_REMOVE; want(G_EATK, key, key, true); keep[G_EATK].insert(key); }
+    for (int t : gone_emine) { const uint32_t key = uint32_t(t) | uint32_t(EATK_MINE_CODE) << 11 | W_REMOVE; want(G_EATK, key, key, true); keep[G_EATK].insert(key); }
     for (auto& [t, c] : gone_mine) { const uint32_t key = uint32_t(t) | uint32_t(c) << 11 | W_REMOVE; want(G_MINE, key, key, true); keep[G_MINE].insert(key); }
     for (int grp : {G_ORE, G_EATK, G_MINE}) {
         std::vector<BusItem> q;
@@ -594,6 +615,7 @@ void encode_actor(const Game& g, const ObsMemory& m, int actor,
             int visit = m.visit_round[t] < 0 ? 255 : std::min(255, g.round - m.visit_round[t]);
             ch[(size_t)C_VISIT * cs + cell] = visit;
             ch[(size_t)C_HIT * cs + cell] = m.hit_round[t] < 0 ? HIT_CAP : std::min(HIT_CAP, g.round - m.hit_round[t]);
+            ch[(size_t)C_MINE * cs + cell] = m.emine[t];
             if (m.bld_id[t] >= 0) {
                 int dir = m.bld_dir[t];
                 if (dir >= 0 && dir < CH_DIR) ch[(size_t)(C_DIR + dir) * cs + cell] = 1;

@@ -43,7 +43,7 @@ inline void quantize_actor(const int16_t* raw, int32_t* q) {
             else if (c == C_HP || c == C_HP + 1) o = v * 255 / 100;                                 // HP percent
             else if (c == C_HIT) o = v * 25;                                                        // 0..10
             else if (c == C_PATH) o = v * 32;                                                       // Dir 1..8
-            else if (c >= C_RAY) o = v * 8;                                                         // rays 0..32
+            else if (c >= C_RAY && c < C_RAY + CH_RAY) o = v * 8;                                   // rays 0..32
             else o = v ? 255 : 0;                                                                   // one-hot
             q[c * P2 + i] = o < 0 ? 0 : (o > ST_AMAX ? ST_AMAX : o);
         }

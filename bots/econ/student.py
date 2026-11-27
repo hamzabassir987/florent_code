@@ -13,7 +13,7 @@ import sys
 from array import array
 
 PATCH, HALF = 17, 8
-ACTOR_CH, SCALARS = 61, 50   # 60th channel: planned conveyor direction (copied as is, 1..8); 61st: rounds since hit (0..10, as is)
+ACTOR_CH, SCALARS = 62, 50   # 60th channel: planned conveyor direction (1..8); 61st: rounds since hit (0..10); 62nd: known hidden enemy mine (one-hot)
 COSTS = 40
 BITS = 32
 AMAX = 255                   # activations / inputs: 0..255
@@ -74,7 +74,8 @@ def quantize(raw):
     """Raw encoder ints (spatial channel-major, then the scalars) -> 0..255 (as quantize_actor in C++)."""
     P2 = PATCH * PATCH
     q = [0] * len(raw)
-    for c in range(ACTOR_CH):
+    nch = (len(raw) - SCALARS) // P2          # the input's channel count (61 or 62)
+    for c in range(nch):
         base = c * P2
         for i in range(P2):
             v = raw[base + i]
@@ -88,12 +89,12 @@ def quantize(raw):
                 o = v * 25
             elif c == C_PATH:
                 o = v * 32
-            elif c >= C_RAY:
+            elif C_RAY <= c < C_RAY + 11:   # the 11 ray channels
                 o = v * 8
             else:
                 o = 255
             q[base + i] = 0 if o < 0 else (AMAX if o > AMAX else o)
-    s0 = ACTOR_CH * P2
+    s0 = nch * P2
     for i in range(SCALARS):
         v = raw[s0 + i]
         o = 0
@@ -167,11 +168,14 @@ class StudentPolicy:
         self.hidden = data["hidden"]
         self.pol = {}
         C = data["channels"]
+        # input channels the student was trained on: 61 (before the mine channel) or 62;
+        # extra encoder channels (appended last) are dropped in logits()
+        self.actor_ch = AC = data.get("actor_ch", 61)
         for pd in data["policies"]:
             p = pd["policy"]
             P = {"shifts": pd["shifts"], "n": pd["nlogits"]}
-            sw = pd["stem_w"]                      # [C][ACTOR_CH][1][1]
-            P["stem"] = [[sw[co * ACTOR_CH + ci] for ci in range(ACTOR_CH)] for co in range(C)]
+            sw = pd["stem_w"]                      # [C][actor_ch][1][1]
+            P["stem"] = [[sw[co * AC + ci] for ci in range(AC)] for co in range(C)]
             P["stem_b"] = pd["stem_b"]
             for b in range(LAYERS):
                 pw = pd[f"pw_w{b}"]
@@ -240,7 +244,8 @@ class StudentPolicy:
     def features(self, policy, q):
         P = self.pol[policy]
         sh = P["shifts"]
-        xs = [_pack(q, c) for c in range(ACTOR_CH)]
+        nch = (len(q) - SCALARS) // (PATCH * PATCH)
+        xs = [_pack(q, c) for c in range(nch)]
         g = G0
         h = self._pointwise(g, xs, P["stem_g"], P["stem_b"], sh[0])
         for blk in range(LAYERS // 2):
@@ -253,7 +258,7 @@ class StudentPolicy:
                 t = self._pointwise(g, h, P[f"pwg{b}"], P[f"pwb{b}"], sh[1 + 2 * b])
                 h = self._depthwise(g, t, hb if b % 2 else None, P[f"dw{b}"], P[f"dwb{b}"], sh[2 + 2 * b])
         centre = [(v >> (g.centre * BITS)) & SLOT for v in h]
-        s0 = ACTOR_CH * PATCH * PATCH
+        s0 = nch * PATCH * PATCH
         f = centre + list(q[s0:s0 + SCALARS])
         acc = list(P["fc_b"])
         fcT = P["fcT"]
@@ -281,6 +286,10 @@ class StudentPolicy:
     def logits(self, policy, raw):
         """Float logits for the head decoder (integer / 2^logit_shift, exactly representable)."""
         d = float(1 << self.logit_shift)
+        P2 = PATCH * PATCH
+        nch = (len(raw) - SCALARS) // P2
+        if nch > self.actor_ch:                  # an older student: drop the channels it never saw (appended last)
+            raw = list(raw[:self.actor_ch * P2]) + list(raw[nch * P2:])
         return [v / d for v in self.logits_int(policy, quantize(raw))]
 
 
@@ -295,8 +304,9 @@ def reference_logits(model, policy, q):
         v >>= s
         return 0 if v < 0 else (AMAX if v > AMAX else v)
 
-    x = [[q[c * P2 + i] for i in range(P2)] for c in range(ACTOR_CH)]
-    h = [[act(P["stem_b"][co] + sum(P["stem"][co][ci] * x[ci][i] for ci in range(ACTOR_CH)), sh[0]) for i in range(P2)] for co in range(C)]
+    nch = (len(q) - SCALARS) // P2
+    x = [[q[c * P2 + i] for i in range(P2)] for c in range(nch)]
+    h = [[act(P["stem_b"][co] + sum(P["stem"][co][ci] * x[ci][i] for ci in range(nch)), sh[0]) for i in range(P2)] for co in range(C)]
     hb = h
     for b in range(LAYERS):
         t = [[act(P[f"pwb{b}"][co] + sum(P[f"pw{b}"][co][ci] * h[ci][i] for ci in range(C)), sh[1 + 2 * b]) for i in range(P2)] for co in range(C)]
@@ -318,7 +328,7 @@ def reference_logits(model, policy, q):
         if b % 2:
             hb = h
     centre = [h[c][HALF * PATCH + HALF] for c in range(C)]
-    s0 = ACTOR_CH * P2
+    s0 = nch * P2
     f = centre + list(q[s0:s0 + SCALARS])
     hid = [act(P["fc_b"][j] + sum(w * f[i] for i, w in enumerate(P["fc"][j])), sh[-1]) for j in range(len(P["fc"]))]
     return [P["out_b"][j] + sum(w * hid[i] for i, w in enumerate(P["out"][j])) for j in range(P["n"])]

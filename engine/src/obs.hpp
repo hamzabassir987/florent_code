@@ -44,7 +44,8 @@ constexpr int CH_RAY = 11;           // ray aggregates, written on boundary cell
 constexpr int CH_PATH = 1;           // builders only: planned conveyor cell, value = conveyor direction (Dir 1..8), 0 none
 constexpr int CH_HIT = 1;            // rounds since a unit / building on the tile was seen losing HP, cap HIT_CAP (= never)
 constexpr int HIT_CAP = 10;
-constexpr int ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH + CH_HIT;  // 61
+constexpr int CH_MINE = 1;           // known hidden enemy mine (detected by a builder's attack probe, or reported): 1
+constexpr int ACTOR_CH = CH_TERRAIN + CH_OWN + CH_ENEMY + CH_OCC + CH_STALE + CH_VISIT + CH_ATTR_STALE + CH_DIR + CH_HP + CH_THREAT + CH_RAY + CH_PATH + CH_HIT + CH_MINE;  // 62
 constexpr int ACTOR_SPATIAL = ACTOR_CH * PATCH * PATCH;
 // 40 base scalars, then the team's current price of each buildable type
 // (controller get_*_cost(), in ACTOR_COST_TYPES order)
@@ -64,6 +65,7 @@ constexpr int C_THREAT = C_HP + CH_HP;
 constexpr int C_RAY = C_THREAT + CH_THREAT;
 constexpr int C_PATH = C_RAY + CH_RAY;
 constexpr int C_HIT = C_PATH + CH_PATH;
+constexpr int C_MINE = C_HIT + CH_HIT;
 constexpr int LINE_CAP = 4;          // conveyor planner: harvesters per line into the core
 
 // report-bus parameters (experiments: rl/tests/bus_stats.cpp); defaults = deployed
@@ -105,6 +107,11 @@ struct ObsMemory {
     std::vector<int16_t> bot_hp;
     std::vector<int32_t> attr_seen_round; // last round entity attributes were observed
     std::vector<int32_t> hit_round;     // last round the building / builder on the tile was seen losing HP, -1 never
+    // known hidden enemy mines: a builder that can still act (off cooldown,
+    // team Ti >= 2) probes its 4 neighbours at the start of its turn: an attack
+    // is legal on a tile with no visible building only if a hidden enemy mine is
+    // there (official can_fire; checked in fcode). Shared on the bus (G_EATK, code 5).
+    std::vector<uint8_t> emine;
 
     // ---- team report bus (the 16-slot team store; docs/team-memory.md).
     // Each turn a unit: merge_store (apply the snapshot), update (own vision;
