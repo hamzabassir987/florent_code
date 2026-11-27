@@ -1304,7 +1304,7 @@ int main(int argc, char** argv) {
             }
             torch::NoGradGuard ng;
             auto pl = torch::softmax(net->logits_split(P_SENTINEL, GSP, GSC).narrow(1, head_offset(P_SENTINEL, HS_MODE), 2), 1);
-            std::cout << "  gate: update " << gsteps << " steps x " << GATE_MB << ": surrogate " << gsurr / std::max(1L, gsteps)
+            std::cout << std::defaultfloat << std::setprecision(4) << "  gate: update " << gsteps << " steps x " << GATE_MB << ": surrogate " << gsurr / std::max(1L, gsteps)
                       << "  entropy " << gent / std::max(1L, gsteps) << "  kl " << gkl / std::max(1L, gsteps)
                       << "  P(place) now " << pl.select(1, 1).mean().item<double>() << " (placed in the batch: "
                       << std::count(ch.begin(), ch.end(), 1L) << "/" << n << ")" << std::endl;
