@@ -200,7 +200,7 @@ def main():
                     continue
                 typ = ct.e[1]
                 api = H.Api(ct)
-                if typ == H.SPIKE:
+                if typ in (H.SPIKE, H.SENTINEL):    # scripted turrets
                     xy = (ctypes.c_int * 2)()
                     eid = ct.e[0]
                     first = eid not in spikes_seen

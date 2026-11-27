@@ -121,6 +121,8 @@ static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* pla
             int type = BUILD_ORDER[t];
             if (!in) continue;
             if (type == LAUNCHER && own_launchers >= MAX_LAUNCHERS) continue;
+            if (type == GUNNER) continue;                       // gunners removed
+            if (type == SENTINEL && (!tg || tg->own_turrets >= MAX_SENTINELS)) continue;   // scripted, capped
             if (directional(type)) {
                 const bool planned = plan4 && (type == CONVEYOR || type == SPLITTER);
                 for (int d = 0; d < 8; d++)
@@ -234,25 +236,28 @@ bool has_choice(const Game& g, int a, const int8_t* plan4, int own_launchers, co
 
 bool spike_action(const Game& g, int a, Candidate& out, bool first_turn) {
     const Entity& e = g.ents[a];
+    if (e.type == SENTINEL) {
+        // sentinel (scripted): fire only at a visible enemy core tile on its line
+        LineOpts lo; line_opts(g, a, lo);
+        for (int k = 0; k < 5; k++) {
+            if (!lo.fire[k]) continue;
+            const int b = g.tile_building(a, lo.fx[k], lo.fy[k]);
+            if (b >= 0 && g.ents[b].type == CORE && g.ents[b].team != e.team) { out = {ActionKind::Fire, lo.fx[k], lo.fy[k]}; return true; }
+        }
+        return false;
+    }
     if (e.type != SPIKE) return false;
-    // first turn: fire once whatever is visible (a shot hits every enemy
-    // building around it, hidden mines included), so a spike can be placed to
-    // clear mines; afterwards only at a visible enemy (the 4-round cooldown is
-    // kept for real targets)
-    if (first_turn)
-        for (int dy = -1; dy <= 1; dy++)
-            for (int dx = -1; dx <= 1; dx++) {
-                if (!dx && !dy) continue;
-                const int x = e.x + dx, y = e.y + dy;
-                if (g.inb(x, y) && g.can_fire(a, x, y) == OK) { out = {ActionKind::Fire, x, y}; return true; }
-            }
+    // spike: fire only when a visible enemy (builder or building) is on one of
+    // the 8 neighbours (the shot then hits every enemy around, hidden mines
+    // included); first_turn is no longer used (kept for the ABI)
+    (void)first_turn;
     for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++) {
             if (!dx && !dy) continue;
-            int x = e.x + dx, y = e.y + dy;
+            const int x = e.x + dx, y = e.y + dy;
             if (!g.inb(x, y)) continue;
-            int u = g.bot[g.idx(x, y)], b = g.tile_building(a, x, y);
-            bool enemy = (u >= 0 && g.ents[u].team != e.team) || (b >= 0 && g.ents[b].team != e.team);
+            const int u = g.bot[g.idx(x, y)], b = g.tile_building(a, x, y);
+            const bool enemy = (u >= 0 && g.ents[u].team != e.team) || (b >= 0 && g.ents[b].team != e.team);
             if (enemy && g.can_fire(a, x, y) == OK) { out = {ActionKind::Fire, x, y}; return true; }
         }
     return false;
@@ -306,6 +311,17 @@ Decision decide(const Game& g, int a, const float* logits, const Chooser& choose
                     return d;
                 }
             }
+        }
+        // sentinel (scripted): a builder that can build one aimed at a known enemy
+        // core tile builds it (aims() in builder_opts; at most MAX_SENTINELS); nothing recorded
+        {
+            const int st = 4;                          // BUILD_ORDER index of SENTINEL
+            for (int i = 0; i < 4; i++)
+                for (int dd = 0; dd < 8; dd++)
+                    if (o.build[st][i][dd]) {
+                        d.actions.push_back({ActionKind::Build, SENTINEL, o.tx[i], o.ty[i], dd + 1});
+                        return d;
+                    }
         }
         uint8_t bt[9] = {0};
         for (int t = 0; t < 9; t++) bt[t] = any(&o.build[t][0][0], 4 * 8);

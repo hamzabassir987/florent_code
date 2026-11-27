@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
                 const int a = gs.order[gs.pos];
                 if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) { gs.pos++; continue; }
                 const int type = m.game.ents[a].type;
-                if (type == fe::SPIKE) {
+                if (type == fe::SPIKE || type == fe::SENTINEL) {   // scripted turrets
                     const bool first = !m.memories.count(a); m.observe(a); Candidate c;
                     if (spike_action(m.game, a, c, first)) m.act(a, c);
                     gs.pos++; continue;

@@ -363,7 +363,7 @@ class Player:
         Returns False to hand this turn to the heuristic (CPU too short)."""
         api = HEADS.Api(ct)
         typ = api.Tinv[ct.get_entity_type()]
-        if typ == HEADS.SPIKE:                       # deterministic, as in training
+        if typ in (HEADS.SPIKE, HEADS.SENTINEL):     # scripted turrets, as in training
             first = ct.get_id() not in self.actor_encoder.memories   # its first turn: fires once (clears mines)
             self.actor_encoder.observe(ct)           # its memory + the team report bus
             act = HEADS.spike_action(api, first)

@@ -269,7 +269,7 @@ static void advance(Slot& s, const Setup& S, int stretch, bool restart, bool tra
             const int a = s.order[s.pos];
             if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) { s.pos++; continue; }
             const int type = m.game.ents[a].type;
-            if (type == fe::SPIKE) {                   // deterministic, as deployed
+            if (type == fe::SPIKE || type == fe::SENTINEL) {                   // deterministic, as deployed
                 const bool first = !m.memories.count(a);   // its first turn (no memory yet): fires once
                 m.observe(a);                          // its memory + the team report bus, as every unit
                 Candidate c;

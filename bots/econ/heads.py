@@ -27,6 +27,7 @@ CARD4 = (N, E, S, W)
 BUILDER, CORE, GUNNER, SENTINEL, LAUNCHER, SPIKE = range(6)
 CONVEYOR, SPLITTER, HARVESTER, BARRIER, MINE = range(6, 11)
 MAX_LAUNCHERS = 3   # launcher cap (as florent_heads.hpp)
+MAX_SENTINELS = 3   # scripted sentinel builds stop there (own sentinels known)
 BUILD_ORDER = (CONVEYOR, SPLITTER, HARVESTER, GUNNER, SENTINEL, LAUNCHER, SPIKE, BARRIER, MINE)
 DIRECTIONAL = frozenset((CONVEYOR, SPLITTER, GUNNER, SENTINEL))
 CONVERT_PCT = (0, 10, 25, 50, 100)
@@ -153,6 +154,10 @@ def _builder_opts(api):
         for t, typ in enumerate(BUILD_ORDER):
             if typ == LAUNCHER and api.own_launchers is not None and api.own_launchers >= MAX_LAUNCHERS:
                 continue
+            if typ == GUNNER:                    # gunners removed
+                continue
+            if typ == SENTINEL and (api.targets is None or api.targets["own_turrets"] >= MAX_SENTINELS):
+                continue                         # scripted, capped (as in C++)
             if typ in DIRECTIONAL:
                 planned = api.plan4 is not None and typ in (CONVEYOR, SPLITTER)
                 for d in range(8):
@@ -318,20 +323,25 @@ def has_choice(api):
 
 
 def spike_action(api, first_turn=False):
-    """('fire', x, y) at the first neighbour with a visible enemy, else None.
-    On its first turn a spike fires once anyway (a shot hits every enemy
-    building around it, hidden mines included). As spike_action in C++."""
+    """Scripted turrets (as spike_action in C++). Spike: fire only when a visible
+    enemy (builder or building) is on a neighbour (the shot hits every enemy
+    around, hidden mines included). Sentinel: fire only at a visible enemy core
+    tile on its line.
+    Returns ('fire', x, y) or None; first_turn is kept for the call sites."""
     ct = api.ct
+    if _type(api) == SENTINEL:
+        fire, fxy, _ = line_opts(api, SENTINEL)
+        me = ct.get_team()
+        for k in range(5):
+            if not fire[k]:
+                continue
+            x, y = fxy[k]
+            b = _safe(lambda: ct.get_tile_building_id(api.P(x, y)))
+            if b is not None and ct.get_team(b) != me and api.Tinv.get(ct.get_entity_type(b)) == CORE:
+                return ("fire", x, y)
+        return None
     p = ct.get_position()
     me = ct.get_team()
-    if first_turn:
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if not dx and not dy:
-                    continue
-                x, y = p.x + dx, p.y + dy
-                if api.inb(x, y) and api.call("can_fire", api.P(x, y)):
-                    return ("fire", x, y)
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
             if not dx and not dy:
@@ -400,6 +410,13 @@ def decide(api, logits, choose=None):
                 c = x if pit[0] == "x" else y
                 if (c == pit[1] - 1 or c == pit[1] + pit[2]) and build[lt][i][0]:
                     return [("build", LAUNCHER, x, y, C)], []
+        # sentinel (scripted): one aimed at a known enemy core tile is built when
+        # possible (at most MAX_SENTINELS); nothing recorded (as in C++)
+        st = BUILD_ORDER.index(SENTINEL)
+        for i, (x, y) in enumerate(tiles):
+            for dd in range(8):
+                if build[st][i][dd]:
+                    return [("build", SENTINEL, x, y, dd + 1)], []
         bt = [int(any(any(r) for r in build[t2])) for t2 in range(9)]
         mode = [1, int(any(move)), int(any(bt)), int(any(attack)), int(any(heal)), int(any(destroy))]
         m = run(HB_MODE, mode)

@@ -83,6 +83,7 @@ void plan4_from_obs(const uint8_t* spatial, int8_t plan4[4]);
 // than MAX_LAUNCHERS (own launchers in the unit's memory, shared by the team
 // report bus). own_launchers < 0: no cap.
 constexpr int MAX_LAUNCHERS = 3;
+constexpr int MAX_SENTINELS = 3;   // own sentinels known (Targets::own_turrets): scripted builds stop there
 
 // What the unit knows about targets (from its memory, docs/masks.md):
 //  * sentinel: may be built only facing a line (5 straight / 4 diagonal) that

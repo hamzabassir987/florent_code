@@ -70,7 +70,7 @@ inline void play_greedy(Match& m, LogitsFn logits, std::vector<ActionLine>& log)
         for (int a : m.acting_units()) {
             if (a >= int(m.game.ents.size()) || !m.game.ents[a].alive) continue;
             const int type = m.game.ents[a].type, id = m.game.ents[a].id;
-            if (type == fe::SPIKE) {
+            if (type == fe::SPIKE || type == fe::SENTINEL) {   // scripted turrets
                 const bool first = !m.memories.count(a);   // its first turn (no memory yet)
                 m.observe(a);                          // its memory + the team report bus
                 Candidate c;
