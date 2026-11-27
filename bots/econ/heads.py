@@ -326,8 +326,8 @@ def spike_action(api, first_turn=False):
     """Scripted turrets (as spike_action in C++). Spike: fire only when a visible
     enemy (builder or building) is on a neighbour (the shot hits every enemy
     around, hidden mines included). Sentinel: fire only at a visible enemy core
-    tile on its line.
-    Returns ('fire', x, y) or None; first_turn is kept for the call sites."""
+    tile on its line. On its first turn a spike fires once anyway.
+    Returns ('fire', x, y) or None."""
     ct = api.ct
     if _type(api) == SENTINEL:
         fire, fxy, _ = line_opts(api, SENTINEL)
@@ -342,6 +342,14 @@ def spike_action(api, first_turn=False):
         return None
     p = ct.get_position()
     me = ct.get_team()
+    if first_turn:                               # first turn: fire once anyway (clears hidden mines)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not dx and not dy:
+                    continue
+                x, y = p.x + dx, p.y + dy
+                if api.inb(x, y) and api.call("can_fire", api.P(x, y)):
+                    return ("fire", x, y)
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
             if not dx and not dy:

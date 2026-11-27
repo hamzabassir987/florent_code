@@ -247,10 +247,16 @@ bool spike_action(const Game& g, int a, Candidate& out, bool first_turn) {
         return false;
     }
     if (e.type != SPIKE) return false;
-    // spike: fire only when a visible enemy (builder or building) is on one of
-    // the 8 neighbours (the shot then hits every enemy around, hidden mines
-    // included); first_turn is no longer used (kept for the ABI)
-    (void)first_turn;
+    // spike: on its first turn it fires once anyway (a shot hits every enemy on
+    // the 8 neighbours, hidden mines included: a spike can be placed to clear
+    // mines); afterwards only when a visible enemy (builder or building) is next to it
+    if (first_turn)
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                if (!dx && !dy) continue;
+                const int x = e.x + dx, y = e.y + dy;
+                if (g.inb(x, y) && g.can_fire(a, x, y) == OK) { out = {ActionKind::Fire, x, y}; return true; }
+            }
     for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++) {
             if (!dx && !dy) continue;

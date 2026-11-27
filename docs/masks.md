@@ -21,7 +21,7 @@ both make the same decisions.
 | pit launcher | a launcher on the edge of a pit 1-2 wide only throws our own builder (first in neighbour order) across the pit to any legal tile there: the network decides launch or wait and where to land (a fixed landing tile was mined by the enemy) | |
 | heal | engine rule only (own units / buildings that lost HP) | with no friendly fire, heals only repair enemy damage |
 | barriers, mines | **no restriction** (keep normal) | walls around the base and mines are good play |
-| spike (scripted, no network) | fires only when a visible enemy (builder or building) is on one of its 8 neighbours; the shot hits every enemy around, hidden mines included | a spike shot hits every enemy building around it, hidden enemy mines included (5 HP vs 12 damage), so a spike can be placed to clear mines; otherwise the 4-round cooldown is kept for real targets |
+| spike (scripted, no network) | **on its first turn it fires once anyway**; afterwards only when a visible enemy (builder or building) is on one of its 8 neighbours; a shot hits every enemy around, hidden mines included | a spike shot hits every enemy building around it, hidden enemy mines included (5 HP vs 12 damage), so a spike can be placed to clear mines; otherwise the 4-round cooldown is kept for real targets |
 | gunner / sentinel surgery | tool: `surgery IN.pt OUT.pt` (rl/tools/surgery.cpp) copies the spike row of `builder_build_type` to gunner / sentinel and zeroes the gunner / sentinel policies' output layers (uniform heads) | run once on a checkpoint, then resume from OUT.pt |
 | single-choice heads (trainer) | a head with only one legal option is not recorded | no gradient; it diluted the loss and the logs |
 
