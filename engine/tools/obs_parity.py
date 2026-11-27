@@ -92,6 +92,13 @@ class EngineAdapter:
         n = self.L.fe_vis_tiles(self.g, self.actor, -1, buf, 4000)
         return [(buf[2 * i], buf[2 * i + 1]) for i in range(n)]
 
+    def visible_info(self):
+        out = []
+        for x, y in self.visible_tiles():
+            o = self._tile(x, y)
+            out.append((x, y, TERRAIN[o[4]], None if o[2] < 0 else o[2], None if o[3] < 0 else o[3]))
+        return out
+
     def _tile(self, x, y):
         o = (ctypes.c_int * 5)()
         self.L.fe_vis_tile(self.g, self.actor, x, y, o)

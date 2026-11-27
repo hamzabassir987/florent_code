@@ -6,6 +6,8 @@ Mirrors engine/src/obs.cpp; engine/tools/obs_parity.py compares every output.
 No numpy is used.
 """
 import math
+from array import array
+from itertools import compress
 
 PATCH, HALF, RAY_LEN = 17, 8, 32
 T_UNKNOWN, T_EMPTY, T_WALL, T_ORE_TI, T_ORE_VO, T_VOID = range(6)
@@ -40,6 +42,36 @@ C_HIT = C_PATH + CH_PATH
 C_MINE = C_HIT + CH_HIT
 _NXY = ((0, -1), (1, 0), (0, 1), (-1, 0))   # N, E, S, W
 _NDIR = (1, 3, 5, 7)                        # engine Dir codes of N, E, S, W
+
+
+_NB = {}
+
+
+def _neighbours(W, H):
+    """Per tile, its in-bounds neighbours as (k, tile) in _NXY order (N E S W), cached per map size."""
+    nb = _NB.get((W, H))
+    if nb is None:
+        nb = _NB[(W, H)] = tuple(tuple((k, (y + dy) * W + x + dx) for k, (dx, dy) in enumerate(_NXY)
+                                       if 0 <= x + dx < W and 0 <= y + dy < H)
+                                 for y in range(H) for x in range(W))
+    return nb
+
+
+_RAY_OFF = {}
+_ORE_SET = frozenset((T_ORE_TI, T_ORE_VO))
+_TURRET_SET = frozenset((GUNNER, SENTINEL, SPIKE))
+_ETYPE, _ETEAM = {}, {}     # entity id -> type / team index (fixed for an entity)
+_DIRS = None                # fcode Direction -> Dir code
+
+
+def ray_offsets(dx, dy):
+    """ray_path(x0, y0, dx, dy) relative to (x0, y0), cached. Exact: a boundary
+    ray has max(|dx|, |dy|) = HALF = 8, so its steps dx/8, dy/8 and every partial
+    sum are exact binary fractions and the path does not depend on (x0, y0)."""
+    o = _RAY_OFF.get((dx, dy))
+    if o is None:
+        o = _RAY_OFF[(dx, dy)] = tuple(ray_path(0, 0, dx, dy))
+    return o
 
 
 def ray_path(x0, y0, dx, dy, maxlen=RAY_LEN):
@@ -110,6 +142,7 @@ class ObsMemory:
         self.visit_round = [-1] * n
         self.hit_round = [-1] * n
         self.emine = [0] * n   # known hidden enemy mines (as ObsMemory::emine in C++)
+        self._plan_sig, self._plan = None, None   # plan_paths cache
         self.attr_seen_round = [-1] * n
         self.bus_q = [[] for _ in range(5)]
         self.snap, self.snap_ore = set(), [0] * n
@@ -332,13 +365,19 @@ class ObsMemory:
             if self.core_alarm_now:
                 self.core_alarm_round = rnd
 
+        index = {}                       # group -> {key: item}, built on first use (keys are unique per group)
+
         def want(grp, key, word, remove):
-            for it in self.bus_q[grp]:
-                if it.key == key:
-                    it.word = word
-                    return it
+            d = index.get(grp)
+            if d is None:
+                d = index[grp] = {it.key: it for it in self.bus_q[grp]}
+            it = d.get(key)
+            if it is not None:
+                it.word = word
+                return it
             it = BusItem(key, word, rnd, remove)
             self.bus_q[grp].append(it)
+            d[key] = it
             return it
 
         r6 = (rnd & 63) << 17
@@ -361,7 +400,10 @@ class ObsMemory:
                 it.due = min(it.due, rnd)
         keep = [set() for _ in range(5)]
         terrain, bid, bty, btm = self.terrain, self.bld_id, self.bld_type, self.bld_team
-        for t in range(n):
+        cand = set(compress(range(n), map(_ORE_SET.__contains__, terrain)))
+        cand.update(compress(range(n), self.emine))
+        cand.update(compress(range(n), map((-1).__lt__, bid)))
+        for t in sorted(cand):
             ter = terrain[t]
             if ter == T_ORE_TI or ter == T_ORE_VO:
                 key = t | ((1 << 11) if ter == T_ORE_VO else 0)
@@ -472,12 +514,13 @@ class ObsMemory:
             self.born = r
         self.is_builder = ad.actor_state()[0] == BUILDER
         gone_eatk, gone_mine, enemy_bots, enemy_near = [], [], [], False
-        for x, y in ad.visible_tiles():
+        vis_t = []
+        for x, y, ter, b, u in ad.visible_info():
             t = y * W + x
+            vis_t.append(t)
             old_id, old_type, old_team = self.bld_id[t], self.bld_type[t], self.bld_team[t]
             old_bhp, old_bot, old_uhp = self.bld_hp[t], self.bot_id[t], self.bot_hp[t]
-            self.terrain[t] = ad.tile_terrain(x, y)
-            b = ad.building_id(x, y)
+            self.terrain[t] = ter
             if b is None:
                 self.bld_id[t] = self.bld_type[t] = self.bld_team[t] = -1
                 self.bld_dir[t] = self.bld_hp[t] = -1
@@ -488,7 +531,6 @@ class ObsMemory:
                 self.bld_dir[t] = ad.entity_direction(b)
                 self.bld_hp[t] = ad.entity_hp_percent(b)
                 self.attr_seen_round[t] = r
-            u = ad.builder_id(x, y)
             if u is None:
                 self.bot_id[t] = self.bot_team[t] = self.bot_hp[t] = -1
             else:
@@ -534,8 +576,7 @@ class ObsMemory:
                 elif self.emine[t]:
                     self.emine[t] = 0
                     gone_emine.append(t)
-        for x, y in ad.visible_tiles():
-            t = y * W + x
+        for t in vis_t:
             if self.emine[t] and (self.bld_id[t] >= 0 or (self.bot_id[t] >= 0 and self.bot_team[t] == team)):
                 self.emine[t] = 0
                 gone_emine.append(t)
@@ -543,6 +584,15 @@ class ObsMemory:
         self._bus_after_update(ad, r, gone_eatk, gone_mine, enemy_bots, enemy_near, gone_emine)
 
     def plan_paths(self):
+        """plan_paths_uncached, reused while the planner's inputs (remembered
+        terrain, building types and teams) are unchanged since the last call."""
+        sig = (array("b", self.terrain).tobytes(), array("b", self.bld_type).tobytes(),
+               array("b", self.bld_team).tobytes())
+        if sig != self._plan_sig:
+            self._plan_sig, self._plan = sig, self.plan_paths_uncached()
+        return self._plan
+
+    def plan_paths_uncached(self):
         """Conveyor planner, identical to ObsMemory::plan_paths (engine/src/obs.cpp):
         per tile the planned conveyor direction (Dir code), 0 = not on a path.
         A line (the path's last tile before the core) takes at most LINE_CAP
@@ -551,7 +601,8 @@ class ObsMemory:
         W, H, team = self.W, self.H, self.team
         N = W * H
         terrain, bid, bty, btm = self.terrain, self.bld_id, self.bld_type, self.bld_team
-        cores = [t for t in range(N) if bid[t] >= 0 and btm[t] == team and bty[t] == CORE]
+        nb = _neighbours(W, H)                 # per tile: ((k, neighbour), ...) in N E S W order, in bounds
+        cores = [t for t in compress(range(N), map((-1).__lt__, bid)) if btm[t] == team and bty[t] == CORE]
         blocked = [False] * N
         free = [terrain[t] == T_EMPTY and (bid[t] < 0 or (btm[t] == team and (bty[t] == CONVEYOR or bty[t] == SPLITTER)))
                 for t in range(N)]
@@ -562,39 +613,32 @@ class ObsMemory:
             for t in q:
                 dist[t] = 0
             h = 0
+            append = q.append
             while h < len(q):
                 t = q[h]; h += 1
-                x, y = t % W, t // W
-                for dx, dy in _NXY:
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < W and 0 <= ny < H:
-                        nt = ny * W + nx
-                        if dist[nt] < 0 and free[nt] and not blocked[nt]:
-                            dist[nt] = dist[t] + 1
-                            q.append(nt)
+                d1 = dist[t] + 1
+                for _, nt in nb[t]:
+                    if dist[nt] < 0 and free[nt] and not blocked[nt]:
+                        dist[nt] = d1
+                        append(nt)
             return dist
 
         dist = bfs()
         plan = [0] * N
         owner = [-1] * N
         load = [0] * N
+        ores = list(compress(range(N), map(_ORE_SET.__contains__, terrain)))
         for pas in (0, 1):
-            for s in range(N):
-                if terrain[s] != T_ORE_TI and terrain[s] != T_ORE_VO:
-                    continue
+            for s in ores:
                 harv = bid[s] >= 0 and btm[s] == team and bty[s] == HARVESTER
                 if bid[s] >= 0 and not harv:
                     continue
                 if harv != (pas == 0):
                     continue
-                sx, sy = s % W, s // W
                 best, bd = -1, 1 << 30
-                for dx, dy in _NXY:
-                    nx, ny = sx + dx, sy + dy
-                    if 0 <= nx < W and 0 <= ny < H:
-                        nt = ny * W + nx
-                        if 0 <= dist[nt] < bd:
-                            best, bd = nt, dist[nt]
+                for _, nt in nb[s]:
+                    if 0 <= dist[nt] < bd:
+                        best, bd = nt, dist[nt]
                 if best < 0 or bd == 0:
                     continue
                 path = []
@@ -602,16 +646,15 @@ class ObsMemory:
                 while dist[c] > 0:
                     if plan[c] != 0 and joined < 0:
                         joined = owner[c]
-                    x, y = c % W, c // W
-                    for k, (dx, dy) in enumerate(_NXY):
-                        nx, ny = x + dx, y + dy
-                        if 0 <= nx < W and 0 <= ny < H and dist[ny * W + nx] == dist[c] - 1:
+                    want = dist[c] - 1
+                    for k, nt in nb[c]:
+                        if dist[nt] == want:
                             if plan[c] == 0:
                                 plan[c] = _NDIR[k]
                                 path.append(c)
                             if dist[c] == 1 and joined < 0:
                                 joined = c
-                            c = ny * W + nx
+                            c = nt
                             break
                 for t in path:
                     owner[t] = joined
@@ -633,6 +676,9 @@ class ObsMemory:
         out = [0] * ACTOR_SPATIAL
         ch = out
         terrain = self.terrain
+        bld_id, bld_type, bld_team, bot_id, bot_team = self.bld_id, self.bld_type, self.bld_team, self.bot_id, self.bot_team
+        seen_round, visit_round, hit_round, emine = self.seen_round, self.visit_round, self.hit_round, self.emine
+        bld_dir, bld_hp, bot_hp, attr_seen = self.bld_dir, self.bld_hp, self.bot_hp, self.attr_seen_round
 
         for dy in range(-HALF, HALF + 1):
             y = ay + dy
@@ -647,34 +693,34 @@ class ObsMemory:
                 ter = terrain[t]
                 tc = CH_TERRAIN - 1 if ter == T_UNKNOWN else ter - 1
                 ch[(C_TERRAIN + tc) * cs + cell] = 1
-                b = self.bld_id[t]
+                b = bld_id[t]
                 if b >= 0:
-                    bt = self.bld_type[t]
-                    if self.bld_team[t] == team:
+                    bt = bld_type[t]
+                    if bld_team[t] == team:
                         ch[(C_OWN + bt) * cs + cell] = 1
                     elif bt != MINE:
                         ch[(C_ENEMY + bt) * cs + cell] = 1
-                if self.bot_id[t] >= 0:
-                    own = self.bot_team[t] == team
+                if bot_id[t] >= 0:
+                    own = bot_team[t] == team
                     ch[((C_OWN if own else C_ENEMY) + BUILDER) * cs + cell] = 1
                     ch[(C_OCC + (0 if own else 1)) * cs + cell] = 1
-                sr = self.seen_round[t]
+                sr = seen_round[t]
                 ch[C_STALE * cs + cell] = 255 if sr < 0 else min(255, rnd - sr)
-                vr = self.visit_round[t]
+                vr = visit_round[t]
                 ch[C_VISIT * cs + cell] = 255 if vr < 0 else min(255, rnd - vr)
-                hr = self.hit_round[t]
+                hr = hit_round[t]
                 ch[C_HIT * cs + cell] = HIT_CAP if hr < 0 else min(HIT_CAP, rnd - hr)
-                ch[C_MINE * cs + cell] = self.emine[t]
+                ch[C_MINE * cs + cell] = emine[t]
                 if b >= 0:
-                    d = self.bld_dir[t]
+                    d = bld_dir[t]
                     if 0 <= d < CH_DIR:
                         ch[(C_DIR + d) * cs + cell] = 1
-                    ch[C_HP * cs + cell] = self.bld_hp[t]
-                    ar = self.attr_seen_round[t]
+                    ch[C_HP * cs + cell] = bld_hp[t]
+                    ar = attr_seen[t]
                     ch[C_ATTR_STALE * cs + cell] = 255 if ar < 0 else min(255, rnd - ar)
-                if self.bot_id[t] >= 0:
-                    ch[(C_HP + 1) * cs + cell] = self.bot_hp[t]
-                    ar = self.attr_seen_round[t]
+                if bot_id[t] >= 0:
+                    ch[(C_HP + 1) * cs + cell] = bot_hp[t]
+                    ar = attr_seen[t]
                     ch[(C_ATTR_STALE + 1) * cs + cell] = 255 if ar < 0 else min(255, rnd - ar)
 
         # Possible / confirmed reach of remembered friendly and enemy turrets.
@@ -683,7 +729,9 @@ class ObsMemory:
         enemy_reaches_own_core = enemy_core_confirmed = False
         seen_turrets = set()
         delta = (None, (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1))
-        for t, tid in enumerate(self.bld_id):
+        bld_id = self.bld_id
+        for t in compress(range(len(bld_id)), map(_TURRET_SET.__contains__, self.bld_type)):
+            tid = bld_id[t]
             bt, d = self.bld_type[t], self.bld_dir[t]
             if tid < 0 or d <= 0 or d > 8:
                 continue
@@ -737,6 +785,7 @@ class ObsMemory:
                         ch[(C_THREAT + (2 if friendly else 3)) * cs + cell] = 1
 
         # Rays originate on boundary cells and begin one step outside each.
+        bld_id, bld_team, bld_type, bot_id, bot_team = self.bld_id, self.bld_team, self.bld_type, self.bot_id, self.bot_team
         for dy in range(-HALF, HALF + 1):
             for dx in range(-HALF, HALF + 1):
                 if abs(dx) != HALF and abs(dy) != HALF:
@@ -745,7 +794,8 @@ class ObsMemory:
                 bx, by = ax + dx, ay + dy
                 if 0 <= bx < W and 0 <= by < H:
                     seen_b, seen_u, step = set(), set(), 0
-                    for px, py in ray_path(bx, by, dx, dy):
+                    for ox, oy in ray_offsets(dx, dy):
+                        px, py = bx + ox, by + oy
                         if not (0 <= px < W and 0 <= py < H):
                             break
                         step += 1
@@ -761,20 +811,20 @@ class ObsMemory:
                             v[3] += 1
                         if ter == T_UNKNOWN:
                             v[10] += 1
-                        bid = self.bld_id[t]
+                        bid = bld_id[t]
                         if bid >= 0 and bid not in seen_b:
                             seen_b.add(bid)
-                            own = self.bld_team[t] == team
+                            own = bld_team[t] == team
                             v[4 if own else 5] += 1
-                            bt = self.bld_type[t]
+                            bt = bld_type[t]
                             if bt in UNIT_TYPES:
                                 v[6 if own else 7] += 1
                             if bt == HARVESTER:
                                 v[8 if own else 9] += 1
-                        uid = self.bot_id[t]
+                        uid = bot_id[t]
                         if uid >= 0 and uid not in seen_u:
                             seen_u.add(uid)
-                            v[6 if self.bot_team[t] == team else 7] += 1
+                            v[6 if bot_team[t] == team else 7] += 1
                 cell = (dy + HALF) * PATCH + dx + HALF
                 for k, value in enumerate(v):
                     ch[(C_RAY + k) * cs + cell] = value
@@ -854,6 +904,13 @@ class ControllerAdapter:
     def visible_tiles(self):
         return ((p.x, p.y) for p in self.ct.get_nearby_tiles())
 
+    def visible_info(self):
+        """(x, y, terrain, building id or None, builder id or None) per visible tile,
+        with one Position per tile (the controller's own)."""
+        ct, env = self.ct, self.env
+        get_env, get_b, get_u = ct.get_tile_env, ct.get_tile_building_id, ct.get_tile_builder_bot_id
+        return [(p.x, p.y, env[get_env(p)], get_b(p), get_u(p)) for p in ct.get_nearby_tiles()]
+
     def tile_terrain(self, x, y):
         from fcode import Position
         return self.env[self.ct.get_tile_env(Position(x, y))]
@@ -867,24 +924,29 @@ class ControllerAdapter:
         return self.ct.get_tile_builder_bot_id(Position(x, y))
 
     def entity_type(self, eid):
-        return _TYPE_INDEX[self.ct.get_entity_type(eid)]
+        v = _ETYPE.get(eid)
+        if v is None:
+            v = _ETYPE[eid] = _TYPE_INDEX[self.ct.get_entity_type(eid)]
+        return v
 
     def entity_team(self, eid):
-        return _team_index(self.ct.get_team(eid))
+        v = _ETEAM.get(eid)
+        if v is None:
+            v = _ETEAM[eid] = _team_index(self.ct.get_team(eid))
+        return v
 
     def entity_direction(self, eid):
-        from fcode import Direction as D
+        global _DIRS
         try:
             value = self.ct.get_direction(eid)
         except Exception:
             # C++ memory records non-facing entities as centre/unavailable.
             return 0
-        dirs = (D.CENTRE, D.NORTH, D.NORTHEAST, D.EAST, D.SOUTHEAST,
-                D.SOUTH, D.SOUTHWEST, D.WEST, D.NORTHWEST)
-        for i, d in enumerate(dirs):
-            if value == d:
-                return i
-        return -1
+        if _DIRS is None:
+            from fcode import Direction as D
+            _DIRS = {d: i for i, d in enumerate((D.CENTRE, D.NORTH, D.NORTHEAST, D.EAST, D.SOUTHEAST,
+                                                  D.SOUTH, D.SOUTHWEST, D.WEST, D.NORTHWEST))}
+        return _DIRS.get(value, -1)
 
     def entity_hp_percent(self, eid):
         maximum = self.ct.get_max_hp(eid)
