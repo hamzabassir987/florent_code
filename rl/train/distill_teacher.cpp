@@ -6,16 +6,15 @@
 // OLD_TEACHER.pt must have the current input size: convert an older checkpoint
 // first (widen_input OLD.pt OLD62.pt: zero weights for new channels, same decisions).
 //
-// Labels: per head, the old teacher's masked distribution with its top action
-// capped at SMOOTH_MAX (0.9): the mass above the cap goes to the other legal
-// actions in proportion to their old probabilities (uniformly when they had
-// none), so the alternatives keep at least 1 - SMOOTH_MAX together. A head whose
-// top action is already below the cap is unchanged. SMOOTH_MAX=1 disables it.
+// Labels: per head, the old teacher's masked distribution mixed with the uniform
+// one (ranks kept) just enough that the top action is <= SMOOTH_MAX (0.9) and the
+// lowest legal action >= min(SMOOTH_MIN (0.1), 0.5 / n) (see smoothed_label).
+// SMOOTH_MAX=1 SMOOTH_MIN=0 disables it.
 // Critic: the new critic regresses the old critic's value (MSE) on the critic
 // observation of the states the rollout visits (one per game per round).
 //
 //   env: GAMES (64) ROUNDS (10) STEPS (400) K_PER_HEAD (32) BUF_PER_HEAD (16384)
-//        CRITIC_BUF (2048) CRITIC_BATCH (64) CRITIC_W (1) LR (1e-3) SMOOTH_MAX (0.9)
+//        CRITIC_BUF (2048) CRITIC_BATCH (64) CRITIC_W (1) LR (1e-3) SMOOTH_MAX (0.9) SMOOTH_MIN (0.1)
 //        TEMP_MIN / TEMP_MAX (0.5 / 1.5) DEVICE INIT (resume the new teacher)
 //        EVAL_EVERY (40) EVAL_GAMES (100): new vs old, greedy, sides alternating
 //        GATE_LABELS (0): 1 = distil the sentinel gate (P_SENTINEL) from the old
@@ -75,23 +74,28 @@ static torch::Tensor batch_raw(const std::vector<const Obs*>& v) {
 static Chooser greedy() {
     return [](int, const float* l, const std::vector<uint8_t>& m, float& lp) { return argmax_choice(l, m, lp); };
 }
-// smoothed label (log-probabilities over the mask; -1e9 off the mask)
-static std::vector<float> smoothed_label(const float* l, const std::vector<uint8_t>& mk, double cap) {
+// smoothed label (log-probabilities over the mask; -1e9 off the mask): the old
+// distribution mixed with the uniform one, p' = (1 - e) p + e / n (n legal
+// options): every action gets the same extra mass, so the ranks are kept. e is
+// the smallest value with the top action <= cap and the lowest >= floor, where
+// floor = min(FLOOR, 0.5 / n) (a 0.1 floor each is impossible above 10 options:
+// large heads mix at most half way to uniform). cap >= 1 and floor <= 0: no smoothing.
+static std::vector<float> smoothed_label(const float* l, const std::vector<uint8_t>& mk, double cap, double floor_) {
     const int n = int(mk.size());
     std::vector<double> p(n, 0.0);
     double mx = -1e30; int legal = 0;
     for (int i = 0; i < n; i++) if (mk[i]) { mx = std::max(mx, double(l[i])); legal++; }
     double z = 0;
     for (int i = 0; i < n; i++) if (mk[i]) { p[i] = std::exp(double(l[i]) - mx); z += p[i]; }
-    for (int i = 0; i < n; i++) p[i] /= z;
-    int top = -1; for (int i = 0; i < n; i++) if (mk[i] && (top < 0 || p[i] > p[top])) top = i;
-    if (legal >= 2 && cap < 1.0 && p[top] > cap) {
-        const double rest = 1.0 - p[top];          // old mass of the alternatives
-        for (int i = 0; i < n; i++) {
-            if (!mk[i] || i == top) continue;
-            p[i] = rest > 1e-12 ? p[i] / rest * (1.0 - cap) : (1.0 - cap) / (legal - 1);
-        }
-        p[top] = cap;
+    double pmax = 0, pmin = 1;
+    for (int i = 0; i < n; i++) if (mk[i]) { p[i] /= z; pmax = std::max(pmax, p[i]); pmin = std::min(pmin, p[i]); }
+    if (legal >= 2) {
+        const double u = 1.0 / legal, fl = std::min(floor_, 0.5 * u);
+        double e = 0;
+        if (cap < 1.0 && pmax > cap && pmax > u) e = std::max(e, (pmax - cap) / (pmax - u));
+        if (fl > 0 && pmin < fl && u > pmin) e = std::max(e, (fl - pmin) / (u - pmin));
+        e = std::min(1.0, e);
+        for (int i = 0; i < n; i++) if (mk[i]) p[i] = (1.0 - e) * p[i] + e * u;
     }
     std::vector<float> out(n, -1e9f);
     for (int i = 0; i < n; i++) if (mk[i]) out[i] = float(std::log(std::max(p[i], 1e-30)));
@@ -104,13 +108,13 @@ int main(int argc, char** argv) {
     const int iters = std::atoi(argv[3]);
     std::vector<std::string> maps(argv + 4, argv + argc);
     const int G = env_int("GAMES", 64), R = env_int("ROUNDS", 10);
-    const double CAP = env_float("SMOOTH_MAX", 0.9f);
+    const double CAP = env_float("SMOOTH_MAX", 0.9f), FLOOR = env_float("SMOOTH_MIN", 0.1f);
     const bool GATE_LABELS = env_int("GATE_LABELS", 0) != 0;
     torch::manual_seed(17);
     {
         const char* d = std::getenv("DEVICE");
         if ((!d || std::string(d) == "cuda") && torch::cuda::is_available()) g_dev = torch::Device(torch::kCUDA);
-        std::cout << "distill_teacher: device " << (g_dev.is_cuda() ? "cuda" : "cpu") << ", label cap " << CAP << std::endl;
+        std::cout << "distill_teacher: device " << (g_dev.is_cuda() ? "cuda" : "cpu") << ", labels: top <= " << CAP << ", lowest >= min(" << FLOOR << ", 0.5/n)" << std::endl;
     }
     Teacher old_t;
     try { torch::load(old_t, opath, torch::Device(torch::kCPU)); }
@@ -280,7 +284,7 @@ int main(int argc, char** argv) {
                         const bool place = std::uniform_real_distribution<double>(0, 1)(grng[gi]) < w1;
                         if (GATE_LABELS) {
                             HeadRec hr; hr.policy = P_SENTINEL; hr.obs = ob[gi]; hr.mask = gm;
-                            hr.tlog = smoothed_label(og, gm, CAP);
+                            hr.tlog = smoothed_label(og, gm, CAP, FLOOR);
                             ghr[gi].push_back({HS_MODE, std::move(hr)});
                         }
                         if (place) { m.act(pd.a, pd.gb); gplaced[gi]++; nsamp[gi]++; gs[gi].pos++; continue; }
@@ -316,7 +320,7 @@ int main(int argc, char** argv) {
                     std::shared_ptr<const Obs> o = ob[gi];
                     for (auto& hm : heads) {
                         HeadRec hr; hr.policy = pd.p; hr.obs = o; hr.mask = hm.second;
-                        hr.tlog = smoothed_label(ol + head_offset(pd.p, hm.first), hm.second, CAP);
+                        hr.tlog = smoothed_label(ol + head_offset(pd.p, hm.first), hm.second, CAP, FLOOR);
                         ghr[gi].push_back({hm.first, std::move(hr)});
                     }
                     nsamp[gi]++;
