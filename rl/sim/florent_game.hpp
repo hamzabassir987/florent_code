@@ -18,6 +18,9 @@ inline void targets_from_memory(const fe::ObsMemory& m, Targets& t) {
         if (m.bld_type[i] == fe::CORE) t.core.push_back(i);
     }
     t.own_turrets = m.own_count(fe::GUNNER) + m.own_count(fe::SENTINEL);
+    t.own_vo_harvesters = 0;
+    for (int i = 0; i < m.W * m.H; i++)
+        if (m.bld_id[i] >= 0 && m.bld_team[i] == m.team && m.bld_type[i] == fe::HARVESTER && m.terrain[i] == fe::T_ORE_VO) t.own_vo_harvesters++;
 }
 
 struct Match {

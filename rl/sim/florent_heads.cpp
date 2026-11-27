@@ -122,7 +122,8 @@ static void builder_opts(const Game& g, int a, BuilderOpts& o, const int8_t* pla
             if (!in) continue;
             if (type == LAUNCHER && own_launchers >= MAX_LAUNCHERS) continue;
             if (type == GUNNER) continue;                       // gunners removed
-            if (type == SENTINEL && (!tg || tg->own_turrets >= MAX_SENTINELS)) continue;   // scripted, capped
+            // sentinel: scripted, capped, and only while we harvest Voltium (its ammo source)
+            if (type == SENTINEL && (!tg || tg->own_turrets >= MAX_SENTINELS || tg->own_vo_harvesters <= 0)) continue;
             if (directional(type)) {
                 const bool planned = plan4 && (type == CONVEYOR || type == SPLITTER);
                 for (int d = 0; d < 8; d++)

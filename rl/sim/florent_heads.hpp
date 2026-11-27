@@ -96,6 +96,7 @@ struct Targets {   // (fill with targets_from_memory, rl/sim/florent_game.hpp)
     std::vector<int> core;      // known enemy core tiles (y * W + x)
     std::vector<int> bld;       // known enemy building tiles (core included)
     int own_turrets = 0;        // own gunners + sentinels known
+    int own_vo_harvesters = 0;  // own harvesters known on Voltium ore (sentinels need ammo: built only while > 0)
 };
 
 // Does the unit have any legal action besides waiting? (if not: no forward)

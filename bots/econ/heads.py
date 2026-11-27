@@ -156,8 +156,9 @@ def _builder_opts(api):
                 continue
             if typ == GUNNER:                    # gunners removed
                 continue
-            if typ == SENTINEL and (api.targets is None or api.targets["own_turrets"] >= MAX_SENTINELS):
-                continue                         # scripted, capped (as in C++)
+            if typ == SENTINEL and (api.targets is None or api.targets["own_turrets"] >= MAX_SENTINELS
+                                    or api.targets.get("own_vo_harvesters", 0) <= 0):
+                continue                         # scripted, capped, only while harvesting Voltium (as in C++)
             if typ in DIRECTIONAL:
                 planned = api.plan4 is not None and typ in (CONVEYOR, SPLITTER)
                 for d in range(8):

@@ -228,7 +228,10 @@ class ObsMemory:
             bld.add((t % W, t // W))
             if self.bld_type[t] == CORE:
                 core.add((t % W, t // W))
-        return {"core": core, "bld": bld, "own_turrets": self.own_count(GUNNER) + self.own_count(SENTINEL)}
+        vo = sum(1 for t in range(W * self.H) if self.bld_id[t] >= 0 and self.bld_team[t] == team
+                 and self.bld_type[t] == HARVESTER and self.terrain[t] == T_ORE_VO)
+        return {"core": core, "bld": bld, "own_turrets": self.own_count(GUNNER) + self.own_count(SENTINEL),
+                "own_vo_harvesters": vo}
 
     def extra_bits(self):
         return (self.sym + 1) << 28 if self.sym >= 0 else 0

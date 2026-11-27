@@ -120,13 +120,13 @@ def cplan(plan4):
 
 
 def ctargets(tg, W):
-    """(tiles array, ncore, nbld, own_turrets) for the C API from a Python targets dict."""
+    """(tiles array, ncore, nbld, own_turrets, own_vo_harvesters) for the C API from a Python targets dict."""
     if tg is None:
-        return None, -1, 0, 0
+        return None, -1, 0, 0, 0
     core = sorted(y * W + x for x, y in tg["core"])
     bld = sorted(y * W + x for x, y in tg["bld"])
     arr = (ctypes.c_int * max(1, len(core) + len(bld)))(*(core + bld))
-    return arr, len(core), len(bld), tg["own_turrets"]
+    return arr, len(core), len(bld), tg["own_turrets"], tg.get("own_vo_harvesters", 0)
 
 
 def random_targets(L, g, team, rng):
@@ -145,14 +145,14 @@ def random_targets(L, g, team, rng):
                 core.update(tiles)
         if rng.random() < 0.8:
             bld.update(tiles)
-    return {"core": core, "bld": bld, "own_turrets": rng.choice((0, 0, 1, 2))}
+    return {"core": core, "bld": bld, "own_turrets": rng.choice((0, 0, 1, 2)), "own_vo_harvesters": rng.choice((0, 1))}
 
 
 def cpp_decide(L, g, a, logits, plan4=None, own_l=None, tg=None):
     out = (ctypes.c_int * 8192)()
     arr = (ctypes.c_float * len(logits))(*logits)
-    tarr, nc, nb, ot = ctargets(tg, L.fe_width(g))
-    L.rl_decide(g, a, arr, out, cplan(plan4), -1 if own_l is None else own_l, tarr, nc, nb, ot)
+    tarr, nc, nb, ot, ov = ctargets(tg, L.fe_width(g))
+    L.rl_decide(g, a, arr, out, cplan(plan4), -1 if own_l is None else own_l, tarr, nc, nb, ot, ov)
     k = 0
     n = out[k]; k += 1
     acts = []
@@ -230,8 +230,8 @@ def main():
                 api.own_launchers = own_l
                 tg = random_targets(L, g, ct.e[2], rng)
                 api.targets = tg
-                tarr, nc, nb, ot = ctargets(tg, L.fe_width(g))
-                c_has = L.rl_has_choice(g, a, cplan(plan4), -1 if own_l is None else own_l, tarr, nc, nb, ot) == 1
+                tarr, nc, nb, ot, ov = ctargets(tg, L.fe_width(g))
+                c_has = L.rl_has_choice(g, a, cplan(plan4), -1 if own_l is None else own_l, tarr, nc, nb, ot, ov) == 1
                 p_has = H.has_choice(api)
                 if c_has != p_has:
                     stats["mismatch"] += 1
